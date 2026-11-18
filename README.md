@@ -23,7 +23,7 @@ currently establishes an opaque bidirectional TCP tunnel. TLS termination/interc
 TLS SNI application, plain HTTP absolute-form proxying, reverse-proxy rules, statistics, and
 certificate management are not yet implemented.
 
-The active configuration layer preserves the original `TlsSni` semantics: SNI is omitted only
+A bounded TLS ClientHello parser now extracts the SNI host name across fragmented TLS handshake records. It is groundwork for selecting per-host certificates; the CONNECT path does not yet invoke it and still forwards TLS bytes unchanged.\n\nThe active configuration layer preserves the original `TlsSni` semantics: SNI is omitted only
 when `TlsSni=false`; otherwise an empty pattern defaults to `@domain`. The pattern supports
 case-insensitive `@domain`, `@ipaddress`, and `@random` tokens. The random token currently
 uses Linux system uptime milliseconds from `/proc/uptime`, corresponding to the original changing tick
