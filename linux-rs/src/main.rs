@@ -1,6 +1,7 @@
 mod address_service;
 mod config;
 mod dns;
+mod dnscrypt;
 mod persistence;
 mod resolver;
 mod service;
@@ -51,17 +52,37 @@ async fn main() -> Result<()> {
             let config = config::AppConfig::load(&config_path)?;
             let (host, port) = endpoint.rsplit_once(':').context("endpoint must be host:port")?;
             let port: u16 = port.parse().context("invalid endpoint port")?;
-            let dns = dns::DnsClient::new(config.fast_github.fallback_dns);
+            let proxy = dnscrypt::DnscryptProxy::discover().ok();
+            let mut upstreams = Vec::new();
+            if let Some(proxy) = proxy.as_ref() {
+                match proxy.start().await {
+                    Ok(endpoint) => { upstreams.push(endpoint); upstreams.push(endpoint); }
+                    Err(error) => tracing::warn!(%error, "dnscrypt-proxy unavailable; using fallback DNS"),
+                }
+            }
+            upstreams.extend(config.fast_github.fallback_dns);
+            let dns = dns::DnsClient::new(upstreams);
             let persistence = persistence::Persistence::new("dnsendpoints.json");
             let resolver = resolver::DomainResolver::new(dns, persistence).await?;
             for address in resolver.resolve(host, port).await? { println!("{address}"); }
+            if let Some(proxy) = proxy { proxy.stop().await; }
         }
         Some(Command::TestDns) => {
             let config = config::AppConfig::load(&config_path)?;
-            let dns = dns::DnsClient::new(config.fast_github.fallback_dns);
+            let proxy = dnscrypt::DnscryptProxy::discover().ok();
+            let mut upstreams = Vec::new();
+            if let Some(proxy) = proxy.as_ref() {
+                match proxy.start().await {
+                    Ok(endpoint) => { upstreams.push(endpoint); upstreams.push(endpoint); }
+                    Err(error) => tracing::warn!(%error, "dnscrypt-proxy unavailable; using fallback DNS"),
+                }
+            }
+            upstreams.extend(config.fast_github.fallback_dns);
+            let dns = dns::DnsClient::new(upstreams);
             let persistence = persistence::Persistence::new("dnsendpoints.json");
             let resolver = resolver::DomainResolver::new(dns, persistence).await?;
             resolver.test_speed().await?;
+            if let Some(proxy) = proxy { proxy.stop().await; }
         }
         Some(Command::Check) => {
             let config = config::AppConfig::load(&config_path)?;
