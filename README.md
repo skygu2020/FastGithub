@@ -26,7 +26,7 @@ certificate management are not yet implemented.
 The active configuration layer preserves the original `TlsSni` semantics: SNI is omitted only
 when `TlsSni=false`; otherwise an empty pattern defaults to `@domain`. The pattern supports
 case-insensitive `@domain`, `@ipaddress`, and `@random` tokens. The random token currently
-uses monotonic milliseconds since process start, corresponding to the original changing tick
+uses Linux system uptime milliseconds from `/proc/uptime`, corresponding to the original changing tick
 count. This is configuration groundwork; the CONNECT tunnel does not consume it yet.
 
 The DNS client queries A and AAAA records, merges upstream answers, caches bounded DNS TTLs, and
