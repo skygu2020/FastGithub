@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use std::{env, fs, net::{IpAddr, Ipv4Addr, SocketAddr}, path::{Path, PathBuf}, process::{Child, Command, Stdio}, sync::Arc, time::Duration};
+use std::{env, fs, net::{IpAddr, Ipv4Addr, SocketAddr}, path::{Path, PathBuf}, process::{Child, Command, Stdio}, time::Duration};
 use tokio::{net::{TcpListener, TcpStream}, sync::Mutex, time::{sleep, timeout}};
 use toml_edit::{value, Array, DocumentMut};
 
@@ -41,6 +41,8 @@ impl DnscryptProxy {
         if let Some(mut child) = guard.take() { let _ = child.kill(); let _ = child.wait(); }
         let child = Command::new(&self.executable)
             .current_dir(self.executable.parent().context("dnscrypt-proxy has no parent directory")?)
+            .arg("-config")
+            .arg(&self.config)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -100,17 +102,6 @@ impl DnscryptProxy {
             let _ = child.wait();
         }
         *self.endpoint.lock().await = None;
-    }
-}
-
-impl Drop for DnscryptProxy {
-    fn drop(&mut self) {
-        if let Ok(guard) = self.child.try_lock() {
-            if let Some(child) = guard.as_ref() {
-                // The async owner should call stop; Drop is a final best-effort safeguard.
-                let _ = child.id();
-            }
-        }
     }
 }
 
