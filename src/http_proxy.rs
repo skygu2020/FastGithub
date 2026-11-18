@@ -6,7 +6,7 @@ use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{lookup_host, TcpListener, T
 const HEADER_LIMIT: usize = 16 * 1024;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const BAD_REQUEST_RESPONSE: &[u8] = BAD_REQUEST_RESPONSE;
+const BAD_REQUEST_RESPONSE: &[u8] = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
 
 pub async fn run(config: crate::config::AppConfig, upstreams: Vec<SocketAddr>) -> Result<()> {
     let port = config.fast_github.http_proxy_port;
