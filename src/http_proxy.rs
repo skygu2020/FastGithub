@@ -125,7 +125,6 @@ impl TlsProxy {
                 .map_err(|_| SniError::ALERT_FATAL)?;
             ssl.set_certificate(&certificate.certificate).map_err(|_| SniError::ALERT_FATAL)?;
             ssl.set_private_key(&certificate.private_key).map_err(|_| SniError::ALERT_FATAL)?;
-            ssl.check_private_key().map_err(|_| SniError::ALERT_FATAL)?;
             Ok(())
         });
         let connector = SslConnector::builder(SslMethod::tls())
@@ -139,7 +138,6 @@ impl TlsProxy {
         let mut ssl = Ssl::new(self.acceptor.context()).context("creating inbound TLS session")?;
         ssl.set_certificate(&default_certificate.certificate)?;
         ssl.set_private_key(&default_certificate.private_key)?;
-        ssl.check_private_key()?;
         let mut client_tls = SslStream::new(ssl, client).context("wrapping inbound TLS stream")?;
         timeout(CONNECT_TIMEOUT, Pin::new(&mut client_tls).accept())
             .await.context("inbound TLS handshake timed out")??;
