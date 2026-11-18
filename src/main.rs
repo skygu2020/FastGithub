@@ -1,5 +1,6 @@
 mod address_service;
 mod config;
+mod cert;
 mod dns;
 mod dnscrypt;
 mod http_proxy;
