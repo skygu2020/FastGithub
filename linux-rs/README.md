@@ -29,7 +29,8 @@ management, a native DNS-over-TCP/UDP client, and an initial HTTP CONNECT forwar
 The CONNECT listener accepts local proxy clients, resolves configured FastGithub domains through
 the project's DNS resolver, and establishes bidirectional TCP tunnels. Plain HTTP absolute-form
 requests, TLS interception/SNI rewriting, reverse proxy rules, statistics, and certificate
-management remain incomplete; this stage is not yet feature-parity with the original application. The DNS client queries A and AAAA records, merges
+management remain incomplete; this stage is not yet feature-parity with the original application.
+The DNS client queries A and AAAA records, merges
 upstream answers, caches them using bounded DNS TTLs, and can promote the fastest TCP-reachable
 address. The resolver persists discovered `host:port` entries in `dnsendpoints.json`, keeps the
 original 10-minute domain/IP history and TCP health cache policy (5-minute normal / 1-minute local

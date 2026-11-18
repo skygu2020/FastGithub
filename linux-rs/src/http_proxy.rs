@@ -56,7 +56,13 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, doma
         client.write_all(b"HTTP/1.1 501 Not Implemented\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").await?;
         bail!("only HTTP CONNECT is implemented in this migration stage");
     }
-    let (host, port) = parse_authority(authority)?;
+    let (host, port) = match parse_authority(authority) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = client.write_all(b"HTTP/1.1 400 Bad Request\\r\\nConnection: close\\r\\n\\r\\n").await;
+            return Err(error);
+        }
+    };
     let mut upstream = match connect_target(&host, port, &resolver, domains).await {
         Ok(stream) => stream,
         Err(error) => {
