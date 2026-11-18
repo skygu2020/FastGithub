@@ -1,7 +1,8 @@
 mod config;
+mod dns;
 mod service;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
@@ -25,6 +26,8 @@ enum Command {
     Stop,
     /// Print the effective Linux configuration.
     Check,
+    /// Resolve a host:port using configured DNS upstreams.
+    Resolve { endpoint: String },
 }
 
 #[tokio::main]
@@ -45,6 +48,13 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Start) => service::install_and_start(&executable).await?,
         Some(Command::Stop) => service::stop_and_remove(&executable).await?,
+        Some(Command::Resolve { endpoint }) => {
+            let config = config::AppConfig::load(&config_path)?;
+            let (host, port) = endpoint.rsplit_once(':').context("endpoint must be host:port")?;
+            let port: u16 = port.parse().context("invalid endpoint port")?;
+            let client = dns::DnsClient::new(config.fast_github.fallback_dns);
+            for address in client.resolve(host, port, true).await? { println!("{address}"); }
+        }
         Some(Command::Check) => {
             let config = config::AppConfig::load(&config_path)?;
             println!("{}", serde_json::to_string_pretty(&config)?);
