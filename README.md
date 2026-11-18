@@ -20,18 +20,19 @@ The Rust implementation includes JSON5 configuration loading and sorted
 `appsettings/appsettings.*.json` overlays, label-safe domain wildcard matching, systemd unit
 management, a native DNS-over-TCP/UDP client, endpoint persistence/health ordering, bundled
 DNSCrypt process management, and an initial HTTP CONNECT forward-proxy listener. CONNECT
-currently establishes an opaque bidirectional TCP tunnel. TLS termination/interception, upstream
-TLS SNI application, plain HTTP absolute-form proxying, reverse-proxy rules, and statistics are
-not yet implemented. The local CA lifecycle is implemented: `fastgithub cert` creates or loads
+supports opaque TCP tunnels for non-TLS CONNECT traffic and an initial TLS interception path for
+TLS CONNECT traffic. TLS interception uses generated per-host leaf certificates and verifies the
+upstream certificate chain and hostname. Plain HTTP absolute-form proxying, reverse-proxy rules,
+and statistics are not yet implemented. The local CA lifecycle is implemented: `fastgithub cert` creates or loads
 `certs/fastgithub.crt` and `certs/fastgithub.key` beside the selected configuration file. Normal
 proxy startup also creates or loads this CA and logs both paths. The CA is not automatically
 installed into the operating-system trust store.
 
-A bounded TLS ClientHello parser now extracts the SNI host name across fragmented TLS handshake records. It is groundwork for selecting per-host certificates; the CONNECT path does not yet invoke it and still forwards TLS bytes unchanged.\n\nThe active configuration layer preserves the original `TlsSni` semantics: SNI is omitted only
+A bounded TLS ClientHello parser is retained for protocol analysis; the active TLS interception path uses OpenSSL's ClientHello/SNI callback to select per-host certificates.\n\nThe active configuration layer preserves the original `TlsSni` semantics: SNI is omitted only
 when `TlsSni=false`; otherwise an empty pattern defaults to `@domain`. The pattern supports
 case-insensitive `@domain`, `@ipaddress`, and `@random` tokens. The random token currently
 uses Linux system uptime milliseconds from `/proc/uptime`, corresponding to the original changing tick
-count. This is configuration groundwork; the CONNECT tunnel does not consume it yet.
+count. The upstream TLS connection applies the configured SNI override while continuing to verify the certificate against the original CONNECT/SNI hostname.
 
 The DNS client queries A and AAAA records, merges upstream answers, caches bounded DNS TTLs, and
 can promote the fastest TCP-reachable address. The resolver persists discovered `host:port`

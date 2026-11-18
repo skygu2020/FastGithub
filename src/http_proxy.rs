@@ -1,17 +1,21 @@
-use crate::{dns::DnsClient, persistence::Persistence, resolver::DomainResolver};
+use crate::{cert::CertificateService, config::AppConfig, dns::DnsClient, persistence::Persistence, resolver::DomainResolver};
 use anyhow::{bail, Context, Result};
-use std::{net::{IpAddr, SocketAddr}, time::Duration};
+use openssl::ssl::{NameType, SniError, Ssl, SslAcceptor, SslConnector, SslMethod};
+use std::{net::{IpAddr, SocketAddr}, pin::Pin, sync::Arc, time::Duration};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{lookup_host, TcpListener, TcpStream}, time::timeout};
+use tokio_openssl::SslStream;
 
 const HEADER_LIMIT: usize = 16 * 1024;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const BAD_REQUEST_RESPONSE: &[u8] = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
 
-pub async fn run(config: crate::config::AppConfig, upstreams: Vec<SocketAddr>) -> Result<()> {
+pub async fn run(config: AppConfig, upstreams: Vec<SocketAddr>, certificates: Arc<CertificateService>) -> Result<()> {
     let port = config.fast_github.http_proxy_port;
     let configured_domains = config.fast_github.domain_configs.keys().cloned().collect::<Vec<_>>();
     let resolver = DomainResolver::new(DnsClient::new(upstreams), Persistence::new("dnsendpoints.json")).await?;
+    let tls_proxy = Arc::new(TlsProxy::new(certificates)?);
+    let config = Arc::new(config);
     let listener = TcpListener::bind(("127.0.0.1", port)).await
         .with_context(|| format!("binding HTTP proxy 127.0.0.1:{port}"))?;
     tracing::info!(address = %listener.local_addr()?, "HTTP CONNECT proxy listening");
@@ -21,8 +25,10 @@ pub async fn run(config: crate::config::AppConfig, upstreams: Vec<SocketAddr>) -
                 let (stream, peer) = accepted.context("accepting proxy connection")?;
                 let resolver = resolver.clone();
                 let domains = configured_domains.clone();
+                let tls_proxy = Arc::clone(&tls_proxy);
+                let config = Arc::clone(&config);
                 tokio::spawn(async move {
-                    if let Err(error) = handle_connection(stream, resolver, &domains, peer).await {
+                    if let Err(error) = handle_connection(stream, resolver, &domains, config, tls_proxy, peer).await {
                         tracing::debug!(%peer, %error, "proxy connection ended");
                     }
                 });
@@ -37,7 +43,7 @@ pub async fn run(config: crate::config::AppConfig, upstreams: Vec<SocketAddr>) -
     Ok(())
 }
 
-async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, domains: &[String], peer: SocketAddr) -> Result<()> {
+async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, domains: &[String], config: Arc<AppConfig>, tls_proxy: Arc<TlsProxy>, peer: SocketAddr) -> Result<()> {
     let header = match timeout(HEADER_TIMEOUT, read_header(&mut client)).await {
         Ok(Ok(header)) => header,
         Ok(Err(error)) => return Err(error),
@@ -73,9 +79,80 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, doma
     };
     client.write_all(b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: FastGithub-Rust\r\n\r\n").await?;
     tracing::debug!(%peer, %host, port, "HTTP CONNECT tunnel established");
-    let (up, down) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
-    tracing::debug!(%peer, %host, port, client_to_upstream = up, upstream_to_client = down, "HTTP CONNECT tunnel closed");
+    let mut first_bytes = [0u8; 5];
+    let is_tls = match timeout(HEADER_TIMEOUT, client.peek(&mut first_bytes)).await {
+        Ok(Ok(count)) => count >= 3 && first_bytes[0] == 22 && first_bytes[1] == 3,
+        Ok(Err(error)) => return Err(error.into()),
+        Err(_) => bail!("timed out waiting for CONNECT tunnel data"),
+    };
+    let (up, down) = if is_tls {
+        tls_proxy.intercept(client, upstream, &host, &config).await?
+    } else {
+        tokio::io::copy_bidirectional(&mut client, &mut upstream).await?
+    };
+    tracing::debug!(%peer, %host, port, client_to_upstream = up, upstream_to_client = down, tls_intercepted = is_tls, "HTTP CONNECT tunnel closed");
     Ok(())
+}
+
+
+struct TlsProxy {
+    acceptor: SslAcceptor,
+    connector: SslConnector,
+    certificates: Arc<CertificateService>,
+}
+
+impl TlsProxy {
+    fn new(certificates: Arc<CertificateService>) -> Result<Self> {
+        let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls())
+            .context("creating inbound TLS acceptor")?;
+        let callback_certificates = Arc::clone(&certificates);
+        acceptor.set_servername_callback(move |ssl, _alert| {
+            let Some(host) = ssl.servername(NameType::HOST_NAME) else {
+                return Err(SniError::ALERT_FATAL);
+            };
+            let certificate = callback_certificates.server_certificate(host)
+                .map_err(|_| SniError::ALERT_FATAL)?;
+            ssl.set_certificate(&certificate.certificate).map_err(|_| SniError::ALERT_FATAL)?;
+            ssl.set_private_key(&certificate.private_key).map_err(|_| SniError::ALERT_FATAL)?;
+            ssl.check_private_key().map_err(|_| SniError::ALERT_FATAL)?;
+            Ok(())
+        });
+        let connector = SslConnector::builder(SslMethod::tls())
+            .context("creating upstream TLS connector")?
+            .build();
+        Ok(Self { acceptor: acceptor.build(), connector, certificates })
+    }
+
+    async fn intercept(&self, client: TcpStream, upstream: TcpStream, connect_host: &str, config: &AppConfig) -> Result<(u64, u64)> {
+        let default_certificate = self.certificates.server_certificate(connect_host)?;
+        let mut ssl = Ssl::new(self.acceptor.context()).context("creating inbound TLS session")?;
+        ssl.set_certificate(&default_certificate.certificate)?;
+        ssl.set_private_key(&default_certificate.private_key)?;
+        ssl.check_private_key()?;
+        let mut client_tls = SslStream::new(ssl, client).context("wrapping inbound TLS stream")?;
+        timeout(CONNECT_TIMEOUT, Pin::new(&mut client_tls).accept())
+            .await.context("inbound TLS handshake timed out")??;
+        let requested_host = client_tls.ssl().servername(NameType::HOST_NAME).unwrap_or(connect_host).to_owned();
+
+        let domain_config = config.fast_github.domain_configs.iter()
+            .find(|(pattern, _)| crate::config::domain_matches(pattern, &requested_host))
+            .map(|(_, value)| value);
+        let configured_sni = domain_config.and_then(|value| {
+            let address = upstream.peer_addr().ok()?.ip();
+            value.tls_sni_value(&requested_host, address)
+        });
+        let mut connect_config = self.connector.configure()?;
+        connect_config.set_use_server_name_indication(configured_sni.is_some());
+        let mut upstream_ssl = connect_config.into_ssl(&requested_host)?;
+        if let Some(sni) = configured_sni.as_deref() {
+            upstream_ssl.set_hostname(sni)?;
+        }
+        let mut upstream_tls = SslStream::new(upstream_ssl, upstream).context("wrapping upstream TLS stream")?;
+        timeout(CONNECT_TIMEOUT, Pin::new(&mut upstream_tls).connect())
+            .await.context("upstream TLS handshake timed out")??;
+        let (sent, received) = tokio::io::copy_bidirectional(&mut client_tls, &mut upstream_tls).await?;
+        Ok((sent, received))
+    }
 }
 
 async fn read_header(stream: &mut TcpStream) -> Result<Vec<u8>> {

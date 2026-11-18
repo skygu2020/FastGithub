@@ -11,7 +11,7 @@ mod tls;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -134,8 +134,8 @@ async fn main() -> Result<()> {
         None => {
             let config = config::AppConfig::load(&config_path)?;
             let certificate_directory = certificate_directory(&config_path);
-            let certificates = cert::CertificateService::load_or_create(&certificate_directory)
-                .context("initializing FastGithub CA certificate")?;
+            let certificates = Arc::new(cert::CertificateService::load_or_create(&certificate_directory)
+                .context("initializing FastGithub CA certificate")?);
             tracing::info!(
                 certificate = %certificates.ca_certificate_path().display(),
                 private_key = %certificates.ca_private_key_path().display(),
@@ -163,7 +163,7 @@ async fn main() -> Result<()> {
                 }
             }
             upstreams.extend(config.fast_github.fallback_dns.iter().copied());
-            let result = http_proxy::run(config, upstreams).await;
+            let result = http_proxy::run(config, upstreams, certificates).await;
             if let Some(proxy) = proxy {
                 proxy.stop().await;
             }
