@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use std::{env, fs, net::{IpAddr, Ipv4Addr, SocketAddr}, path::{Path, PathBuf}, process::{Child, Command, Stdio}, time::Duration};
+use std::{env, fs, os::unix::fs::PermissionsExt, net::{IpAddr, Ipv4Addr, SocketAddr}, path::{Path, PathBuf}, process::{Child, Command, Stdio}, time::Duration};
 use tokio::{net::{TcpListener, TcpStream}, sync::Mutex, time::{sleep, timeout}};
 use toml_edit::{value, Array, DocumentMut};
 
@@ -39,6 +39,12 @@ impl DnscryptProxy {
         update_config(&self.config, endpoint).await?;
         let mut guard = self.child.lock().await;
         if let Some(mut child) = guard.take() { let _ = child.kill(); let _ = child.wait(); }
+        let metadata = fs::metadata(&self.executable)?;
+        let mode = metadata.permissions().mode();
+        if mode & 0o111 == 0 {
+            fs::set_permissions(&self.executable, fs::Permissions::from_mode(mode | 0o755))
+                .with_context(|| format!("making {} executable", self.executable.display()))?;
+        }
         let child = Command::new(&self.executable)
             .current_dir(self.executable.parent().context("dnscrypt-proxy has no parent directory")?)
             .arg("-config")

@@ -29,8 +29,12 @@ upstream answers, caches them using bounded DNS TTLs, and can promote the fastes
 address. The resolver persists discovered `host:port` entries in `dnsendpoints.json`, keeps the
 original 10-minute domain/IP history and TCP health cache policy (5-minute normal / 1-minute local
 network failure; 5-second connect timeout), and exposes a one-shot `test-dns` refresh command.
-The HTTP proxy, DNSCrypt lifecycle, TLS/SNI handling, flow statistics, and certificate lifecycle
-are still being ported; normal startup does not claim to provide a working proxy yet.
+The bundled Linux `dnscrypt-proxy` can be configured and managed as a child process by Rust:
+its TOML listener, `ph` load-balancing strategy, log level, and 60–120 second positive/negative
+cache TTLs are applied at startup. The resolver prefers its local listener and falls back to the
+configured DNS servers if it cannot start. `test-dns` is currently a one-shot refresh; the original
+one-second background refresh loop is not yet wired into the long-running application. The HTTP
+proxy, TLS/SNI handling, flow statistics, and certificate lifecycle are still being ported; normal startup does not claim to provide a working proxy yet.
 
 ## Porting constraints
 
