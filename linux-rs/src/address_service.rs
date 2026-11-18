@@ -75,9 +75,5 @@ impl AddressService {
 }
 
 fn is_local_network_problem(error: &io::Error) -> bool {
-    matches!(error.raw_os_error(), Some(libc_enetdown()) | Some(libc_enetunreach()))
+    matches!(error.raw_os_error(), Some(100) | Some(101))
 }
-
-// Linux errno values; kept local to avoid an extra libc dependency.
-const fn libc_enetdown() -> i32 { 100 }
-const fn libc_enetunreach() -> i32 { 101 }

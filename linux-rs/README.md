@@ -26,9 +26,11 @@ The current Rust implementation includes configuration loading (JSON5 comments a
 `appsettings/appsettings.*.json` overlays), label-safe domain wildcard matching, systemd unit
 management, and a native DNS-over-TCP client. The DNS client queries A and AAAA records, merges
 upstream answers, caches them using bounded DNS TTLs, and can promote the fastest TCP-reachable
-address. It can be exercised with `fastgithub resolve github.com:443`. The HTTP proxy, persistent
-endpoint/IP health cache, DNSCrypt lifecycle, TLS/SNI handling, flow statistics, and certificate
-lifecycle are still being ported; normal startup does not claim to provide a working proxy yet.
+address. The resolver persists discovered `host:port` entries in `dnsendpoints.json`, keeps the
+original 10-minute domain/IP history and TCP health cache policy (5-minute normal / 1-minute local
+network failure; 5-second connect timeout), and exposes a one-shot `test-dns` refresh command.
+The HTTP proxy, DNSCrypt lifecycle, TLS/SNI handling, flow statistics, and certificate lifecycle
+are still being ported; normal startup does not claim to provide a working proxy yet.
 
 ## Porting constraints
 
