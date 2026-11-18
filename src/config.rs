@@ -43,9 +43,9 @@ pub struct DomainConfig {
 }
 
 impl DomainConfig {
-    /// Return the configured upstream SNI name. None means omit the SNI extension.
+    /// Return the configured upstream SNI name. SNI is enabled unless explicitly disabled.
     pub fn tls_sni_value(&self, domain: &str, address: IpAddr) -> Option<String> {
-        if self.tls_sni != Some(true) {
+        if self.tls_sni == Some(false) {
             return None;
         }
         let pattern = self.tls_sni_pattern.as_deref().filter(|value| !value.is_empty()).unwrap_or("@domain");
@@ -171,9 +171,11 @@ mod tests {
     }
 
     #[test]
-    fn sni_is_disabled_by_default_and_can_be_enabled() {
+    fn sni_is_enabled_by_default_and_can_be_disabled() {
         let address: IpAddr = "192.0.2.1".parse().unwrap();
-        assert_eq!(DomainConfig::default().tls_sni_value("github.com", address), None);
+        assert_eq!(DomainConfig::default().tls_sni_value("github.com", address).as_deref(), Some("github.com"));
+        let disabled = DomainConfig { tls_sni: Some(false), ..Default::default() };
+        assert_eq!(disabled.tls_sni_value("github.com", address), None);
         let enabled = DomainConfig { tls_sni: Some(true), ..Default::default() };
         assert_eq!(enabled.tls_sni_value("github.com", address).as_deref(), Some("github.com"));
     }
