@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use std::{collections::HashMap, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}, sync::{atomic::{AtomicU16, Ordering}, Arc}, time::Duration};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, sync::Mutex, time::{timeout, Instant}};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpStream, UdpSocket}, sync::Mutex, time::{timeout, Instant}};
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(4);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -12,14 +12,18 @@ static NEXT_ID: AtomicU16 = AtomicU16::new(1);
 struct CacheEntry { addresses: Vec<IpAddr>, expires_at: Instant }
 
 #[derive(Clone)]
+struct StateEntry { available: bool, expires_at: Instant }
+
+#[derive(Clone)]
 pub struct DnsClient {
     upstreams: Arc<Vec<SocketAddr>>,
     cache: Arc<Mutex<HashMap<(SocketAddr, String), CacheEntry>>>,
+    state_cache: Arc<Mutex<HashMap<SocketAddr, StateEntry>>>,
 }
 
 impl DnsClient {
     pub fn new(upstreams: Vec<SocketAddr>) -> Self {
-        Self { upstreams: Arc::new(upstreams), cache: Arc::new(Mutex::new(HashMap::new())) }
+        Self { upstreams: Arc::new(upstreams), cache: Arc::new(Mutex::new(HashMap::new())), state_cache: Arc::new(Mutex::new(HashMap::new())) }
     }
 
     /// Query configured upstreams over DNS-over-TCP, merging unique A and AAAA answers.
@@ -42,7 +46,19 @@ impl DnsClient {
     }
 
     async fn tcp_available(&self, upstream: SocketAddr) -> bool {
-        timeout(CONNECT_TIMEOUT, TcpStream::connect(upstream)).await.is_ok_and(|r| r.is_ok())
+        {
+            let mut cache = self.state_cache.lock().await;
+            if let Some(entry) = cache.get(&upstream) {
+                if entry.expires_at > Instant::now() { return entry.available; }
+                cache.remove(&upstream);
+            }
+        }
+        let available = timeout(CONNECT_TIMEOUT, TcpStream::connect(upstream)).await.is_ok_and(|r| r.is_ok());
+        self.state_cache.lock().await.insert(upstream, StateEntry {
+            available,
+            expires_at: Instant::now() + Duration::from_secs(300),
+        });
+        available
     }
 
     async fn lookup(&self, upstream: SocketAddr, host: &str) -> Result<Vec<IpAddr>> {
@@ -72,14 +88,11 @@ impl DnsClient {
     async fn query(&self, upstream: SocketAddr, host: &str, record_type: u16) -> Result<(Vec<IpAddr>, Duration)> {
         timeout(DNS_TIMEOUT, async {
             let query = build_query(host, record_type)?;
-            let mut stream = TcpStream::connect(upstream).await.with_context(|| format!("connect DNS {upstream}"))?;
-            stream.write_u16(query.len() as u16).await?;
-            stream.write_all(&query).await?;
-            let length = stream.read_u16().await? as usize;
-            if !(12..=65535).contains(&length) { bail!("invalid DNS response length {length}"); }
-            let mut response = vec![0; length];
-            stream.read_exact(&mut response).await?;
-            parse_response(&response, record_type, u16::from_be_bytes([query[0], query[1]]))
+            if upstream.port() == 53 {
+                tcp_query(upstream, &query, record_type).await
+            } else {
+                udp_query(upstream, &query, record_type).await
+            }
         }).await.context("DNS query timed out")?
     }
 
@@ -103,6 +116,35 @@ impl DnsClient {
             if let Some(index) = addresses.iter().position(|item| *item == ip) { addresses.swap(0, index); }
         }
     }
+}
+ 
+async fn tcp_query(upstream: SocketAddr, query: &[u8], record_type: u16) -> Result<(Vec<IpAddr>, Duration)> {
+    let mut stream = TcpStream::connect(upstream).await.with_context(|| format!("connect DNS TCP {upstream}"))?;
+    stream.write_u16(query.len() as u16).await?;
+    stream.write_all(query).await?;
+    let length = stream.read_u16().await? as usize;
+    if !(12..=65535).contains(&length) { bail!("invalid DNS response length {length}"); }
+    let mut response = vec![0; length];
+    stream.read_exact(&mut response).await?;
+    parse_response(&response, record_type, u16::from_be_bytes([query[0], query[1]]))
+}
+
+async fn udp_query(upstream: SocketAddr, query: &[u8], record_type: u16) -> Result<(Vec<IpAddr>, Duration)> {
+    let bind = if upstream.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let socket = UdpSocket::bind(bind).await?;
+    socket.connect(upstream).await.with_context(|| format!("connect DNS UDP {upstream}"))?;
+    socket.send(query).await?;
+    let mut response = vec![0u8; 65535];
+    let length = socket.recv(&mut response).await?;
+    response.truncate(length);
+    if response.len() < 12 { bail!("truncated DNS UDP response"); }
+    let expected_id = u16::from_be_bytes([query[0], query[1]]);
+    if u16_at(&response, 0)? != expected_id { bail!("DNS UDP response ID does not match query"); }
+    // RFC 1035: retry truncated UDP answers over TCP.
+    if u16_at(&response, 2)? & 0x0200 != 0 {
+        return tcp_query(upstream, query, record_type).await;
+    }
+    parse_response(&response, record_type, expected_id)
 }
 
 fn build_query(host: &str, record_type: u16) -> Result<Vec<u8>> {
