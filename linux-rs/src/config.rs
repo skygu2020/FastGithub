@@ -102,39 +102,28 @@ fn merge(base: &mut Value, overlay: Value) {
 }
 
 fn wildcard_domain_match(pattern: &str, host: &str) -> bool {
-    let pattern = pattern.to_ascii_lowercase();
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    let mut p = pattern.chars().peekable();
-    let mut h = host.chars().peekable();
-    let (mut star, mut retry) = (None, None);
+    let pattern: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
+    let host: Vec<char> = host.trim_end_matches('.').to_ascii_lowercase().chars().collect();
+    let mut previous = vec![false; host.len() + 1];
+    previous[0] = true;
 
-    while let Some(pc) = p.next() {
-        match pc {
-            '*' => {
-                star = Some(p.clone());
-                retry = Some(h.clone());
+    for token in pattern {
+        let mut current = vec![false; host.len() + 1];
+        if token == '*' {
+            current[0] = previous[0];
+            for index in 1..=host.len() {
+                current[index] = previous[index] || (host[index - 1] != '.' && current[index - 1]);
             }
-            '?' => {
-                if h.next().is_none() {
-                    return false;
-                }
-            }
-            _ => {
-                if h.peek() == Some(&pc) {
-                    h.next();
-                } else if let (Some(star_pattern), Some(retry_host)) = (&star, &mut retry) {
-                    if retry_host.next().is_none() || retry_host.peek() == Some(&'.') {
-                        return false;
-                    }
-                    h = retry_host.clone();
-                    p = star_pattern.clone();
-                } else {
-                    return false;
-                }
+        } else {
+            for index in 1..=host.len() {
+                current[index] = previous[index - 1]
+                    && host[index - 1] != '.'
+                    && (token == '?' || token == host[index - 1]);
             }
         }
+        previous = current;
     }
-    h.next().is_none()
+    previous[host.len()]
 }
 
 #[cfg(test)]
