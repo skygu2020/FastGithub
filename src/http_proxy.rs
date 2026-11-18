@@ -79,10 +79,8 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, doma
     };
     client.write_all(b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: FastGithub-Rust\r\n\r\n").await?;
     tracing::debug!(%peer, %host, port, "HTTP CONNECT tunnel established");
-    let mut first_bytes = [0u8; 5];
-    let is_tls = match timeout(HEADER_TIMEOUT, client.peek(&mut first_bytes)).await {
-        Ok(Ok(count)) => count >= 3 && first_bytes[0] == 22 && first_bytes[1] == 3,
-        Ok(Err(error)) => return Err(error.into()),
+    let is_tls = match timeout(HEADER_TIMEOUT, sniff_tls(&client)).await {
+        Ok(result) => result?,
         Err(_) => bail!("timed out waiting for CONNECT tunnel data"),
     };
     let (up, down) = if is_tls {
@@ -94,6 +92,19 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, doma
     Ok(())
 }
 
+async fn sniff_tls(client: &TcpStream) -> Result<bool> {
+    let mut prefix = [0u8; 3];
+    loop {
+        let count = client.peek(&mut prefix).await?;
+        if count == 0 {
+            bail!("client closed before sending CONNECT tunnel data");
+        }
+        if count >= prefix.len() {
+            return Ok(prefix[0] == 22 && prefix[1] == 3);
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
 
 struct TlsProxy {
     acceptor: SslAcceptor,

@@ -141,8 +141,6 @@ async fn main() -> Result<()> {
                 private_key = %certificates.ca_private_key_path().display(),
                 "FastGithub CA certificate is ready (not installed into system trust store)"
             );
-            // Keep the service alive for the upcoming TLS interception integration.
-            let _certificates = certificates;
             tracing::info!(version = env!("CARGO_PKG_VERSION"), proxy_port = config.fast_github.http_proxy_port,
                 domains = config.fast_github.domain_configs.len(), "FastGithub Rust Linux configuration loaded");
             let proxy = match dnscrypt::DnscryptProxy::discover() {
