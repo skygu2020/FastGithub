@@ -101,6 +101,10 @@ fn merge(base: &mut Value, overlay: Value) {
     }
 }
 
+pub fn domain_matches(pattern: &str, host: &str) -> bool {
+    wildcard_domain_match(pattern, host)
+}
+
 fn wildcard_domain_match(pattern: &str, host: &str) -> bool {
     let pattern: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
     let host: Vec<char> = host.trim_end_matches('.').to_ascii_lowercase().chars().collect();

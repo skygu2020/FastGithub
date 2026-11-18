@@ -2,6 +2,7 @@ mod address_service;
 mod config;
 mod dns;
 mod dnscrypt;
+mod http_proxy;
 mod persistence;
 mod resolver;
 mod service;
