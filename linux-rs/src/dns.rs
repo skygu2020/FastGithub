@@ -285,7 +285,7 @@ mod tests {
     async fn udp_query_rejects_mismatched_transaction_id() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let upstream = socket.local_addr().unwrap();
-        tokio::spawn(async move {
+        let server = tokio::spawn(async move {
             let mut query = [0u8; 512];
             let (_, peer) = socket.recv_from(&mut query).await.unwrap();
             let id = u16::from_be_bytes([query[0], query[1]]).wrapping_add(1);
@@ -295,6 +295,7 @@ mod tests {
         let query = build_query("example.com", 1).unwrap();
         let error = udp_query(upstream, &query, 1).await.unwrap_err();
         assert!(error.to_string().contains("ID does not match"));
+        server.await.unwrap();
     }
 
     #[tokio::test]
