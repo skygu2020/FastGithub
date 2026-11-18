@@ -32,6 +32,8 @@ enum Command {
     Stop,
     /// Print the effective Linux configuration.
     Check,
+    /// Create or load the local CA and print its file paths.
+    Cert,
     /// Resolve a host:port using configured DNS and cached TCP endpoint health.
     Resolve { endpoint: String },
     /// Refresh and benchmark all persisted DNS endpoints once.
@@ -122,8 +124,25 @@ async fn main() -> Result<()> {
             let config = config::AppConfig::load(&config_path)?;
             println!("{}", serde_json::to_string_pretty(&config)?);
         }
+        Some(Command::Cert) => {
+            let directory = certificate_directory(&config_path);
+            let certificates = cert::CertificateService::load_or_create(&directory)?;
+            println!("CA certificate: {}", certificates.ca_certificate_path().display());
+            println!("CA private key: {}", certificates.ca_private_key_path().display());
+            println!("CA subject: {:?}", certificates.ca_certificate().subject_name());
+        }
         None => {
             let config = config::AppConfig::load(&config_path)?;
+            let certificate_directory = certificate_directory(&config_path);
+            let certificates = cert::CertificateService::load_or_create(&certificate_directory)
+                .context("initializing FastGithub CA certificate")?;
+            tracing::info!(
+                certificate = %certificates.ca_certificate_path().display(),
+                private_key = %certificates.ca_private_key_path().display(),
+                "FastGithub CA certificate is ready (not installed into system trust store)"
+            );
+            // Keep the service alive for the upcoming TLS interception integration.
+            let _certificates = certificates;
             tracing::info!(version = env!("CARGO_PKG_VERSION"), proxy_port = config.fast_github.http_proxy_port,
                 domains = config.fast_github.domain_configs.len(), "FastGithub Rust Linux configuration loaded");
             let proxy = match dnscrypt::DnscryptProxy::discover() {
@@ -152,4 +171,8 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn certificate_directory(config_path: &std::path::Path) -> PathBuf {
+    config_path.parent().unwrap_or_else(|| std::path::Path::new(".")).join("certs")
 }

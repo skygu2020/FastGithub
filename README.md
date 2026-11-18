@@ -9,6 +9,7 @@ deliverables are not changed.
 
 ```sh
 cargo build --release
+./target/release/fastgithub cert
 ./target/release/fastgithub check
 ./target/release/fastgithub resolve github.com:443
 ./target/release/fastgithub test-dns
@@ -20,8 +21,11 @@ The Rust implementation includes JSON5 configuration loading and sorted
 management, a native DNS-over-TCP/UDP client, endpoint persistence/health ordering, bundled
 DNSCrypt process management, and an initial HTTP CONNECT forward-proxy listener. CONNECT
 currently establishes an opaque bidirectional TCP tunnel. TLS termination/interception, upstream
-TLS SNI application, plain HTTP absolute-form proxying, reverse-proxy rules, statistics, and
-certificate management are not yet implemented.
+TLS SNI application, plain HTTP absolute-form proxying, reverse-proxy rules, and statistics are
+not yet implemented. The local CA lifecycle is implemented: `fastgithub cert` creates or loads
+`certs/fastgithub.crt` and `certs/fastgithub.key` beside the selected configuration file. Normal
+proxy startup also creates or loads this CA and logs both paths. The CA is not automatically
+installed into the operating-system trust store.
 
 A bounded TLS ClientHello parser now extracts the SNI host name across fragmented TLS handshake records. It is groundwork for selecting per-host certificates; the CONNECT path does not yet invoke it and still forwards TLS bytes unchanged.\n\nThe active configuration layer preserves the original `TlsSni` semantics: SNI is omitted only
 when `TlsSni=false`; otherwise an empty pattern defaults to `@domain`. The pattern supports
