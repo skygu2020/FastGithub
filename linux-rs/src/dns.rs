@@ -79,7 +79,7 @@ impl DnsClient {
             if !(12..=65535).contains(&length) { bail!("invalid DNS response length {length}"); }
             let mut response = vec![0; length];
             stream.read_exact(&mut response).await?;
-            parse_response(&response, record_type)
+            parse_response(&response, record_type, u16::from_be_bytes([query[0], query[1]]))
         }).await.context("DNS query timed out")?
     }
 
@@ -96,7 +96,7 @@ impl DnsClient {
         let mut fastest: Option<(IpAddr, Duration)> = None;
         while let Some(result) = tasks.join_next().await {
             if let Ok(Some(candidate)) = result {
-                if fastest.as_ref().is_none_or(|best| candidate.1 < best.1) { fastest = Some(candidate); }
+                if fastest.as_ref().map_or(true, |best| candidate.1 < best.1) { fastest = Some(candidate); }
             }
         }
         if let Some((ip, _)) = fastest {
@@ -122,8 +122,9 @@ fn build_query(host: &str, record_type: u16) -> Result<Vec<u8>> {
     Ok(packet)
 }
 
-fn parse_response(packet: &[u8], expected_type: u16) -> Result<(Vec<IpAddr>, Duration)> {
+fn parse_response(packet: &[u8], expected_type: u16, expected_id: u16) -> Result<(Vec<IpAddr>, Duration)> {
     if packet.len() < 12 { bail!("truncated DNS header"); }
+    if u16_at(packet, 0)? != expected_id { bail!("DNS response ID does not match query"); }
     let flags = u16_at(packet, 2)?;
     if flags & 0x8000 == 0 { bail!("not a DNS response"); }
     if flags & 0x000f != 0 { bail!("DNS rcode {}", flags & 0x000f); }
@@ -199,7 +200,7 @@ mod tests {
     #[test]
     fn parses_a_record() {
         let packet = [0,1,0x81,0x80,0,1,0,1,0,0,0,0,1,b'a',0,0,1,0,1,0xc0,0x0c,0,1,0,1,0,0,0,60,0,4,1,2,3,4];
-        let (ips, ttl) = parse_response(&packet, 1).unwrap();
+        let (ips, ttl) = parse_response(&packet, 1, 1).unwrap();
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1,2,3,4))]);
         assert_eq!(ttl, Duration::from_secs(60));
     }

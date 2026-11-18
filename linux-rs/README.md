@@ -19,6 +19,7 @@ cargo build --release
 ```sh
 ./target/release/fastgithub check
 ./target/release/fastgithub resolve github.com:443
+./target/release/fastgithub test-dns
 ```
 
 The current Rust implementation includes configuration loading (JSON5 comments and sorted
