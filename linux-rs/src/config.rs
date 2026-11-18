@@ -4,9 +4,13 @@ use serde_json::Value;
 use std::{
     collections::BTreeMap,
     fs,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
+    sync::OnceLock,
+    time::Instant,
 };
+
+static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -36,6 +40,51 @@ pub struct DomainConfig {
     pub ip_address: Option<String>,
     pub destination: Option<String>,
     pub response: Option<Value>,
+}
+
+impl DomainConfig {
+    /// Resolve the upstream TLS SNI value using the original FastGithub tokens.
+    /// None means that the TLS ClientHello must omit the SNI extension.
+    pub fn tls_sni_value(&self, domain: &str, address: IpAddr) -> Option<String> {
+        if self.tls_sni != Some(true) {
+            return None;
+        }
+
+        let pattern = self
+            .tls_sni_pattern
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("@domain");
+        let uptime_ms = PROCESS_START
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_millis() as u64;
+        Some(expand_tls_sni_pattern(pattern, domain, address, uptime_ms))
+    }
+}
+
+fn expand_tls_sni_pattern(pattern: &str, domain: &str, address: IpAddr, uptime_ms: u64) -> String {
+    let value = replace_ascii_case_insensitive(pattern, "@domain", domain);
+    let value = replace_ascii_case_insensitive(&value, "@random", &uptime_ms.to_string());
+    replace_ascii_case_insensitive(&value, "@ipaddress", &address.to_string())
+}
+
+fn replace_ascii_case_insensitive(value: &str, needle: &str, replacement: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+
+    while let Some(relative) = lower[cursor..].find(&needle) {
+        let start = cursor + relative;
+        let end = start + needle.len();
+        output.push_str(&value[cursor..start]);
+        output.push_str(replacement);
+        cursor = end;
+    }
+
+    output.push_str(&value[cursor..]);
+    output
 }
 
 fn default_proxy_port() -> u16 {
@@ -132,7 +181,8 @@ fn wildcard_domain_match(pattern: &str, host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::wildcard_domain_match;
+    use super::{expand_tls_sni_pattern, wildcard_domain_match, DomainConfig};
+    use std::net::IpAddr;
 
     #[test]
     fn wildcard_does_not_cross_label_separator() {
@@ -144,5 +194,38 @@ mod tests {
     #[test]
     fn matching_is_case_insensitive_and_ignores_trailing_dot() {
         assert!(wildcard_domain_match("*.GitHub.com", "API.GITHUB.COM."));
+    }
+
+    #[test]
+    fn tls_sni_is_disabled_unless_explicitly_enabled() {
+        let config = DomainConfig::default();
+        assert_eq!(config.tls_sni_value("github.com", "192.0.2.1".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn tls_sni_defaults_to_domain_when_enabled_without_pattern() {
+        let config = DomainConfig { tls_sni: Some(true), ..Default::default() };
+        assert_eq!(
+            config.tls_sni_value("github.com", "192.0.2.1".parse().unwrap()).as_deref(),
+            Some("github.com")
+        );
+    }
+
+    #[test]
+    fn expands_sni_tokens_case_insensitively_in_reference_order() {
+        let address: IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(
+            expand_tls_sni_pattern("pre-@DOMAIN-@random-@IPADDRESS", "api.github.com", address, 12345),
+            "pre-api.github.com-12345-2001:db8::1"
+        );
+    }
+
+    #[test]
+    fn preserves_literal_custom_sni_text() {
+        let address: IpAddr = "192.0.2.9".parse().unwrap();
+        assert_eq!(
+            expand_tls_sni_pattern("edge.example.net", "origin.example.net", address, 1),
+            "edge.example.net"
+        );
     }
 }

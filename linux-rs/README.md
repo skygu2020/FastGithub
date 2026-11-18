@@ -27,36 +27,47 @@ The current Rust implementation includes configuration loading (JSON5 comments a
 `appsettings/appsettings.*.json` overlays), label-safe domain wildcard matching, systemd unit
 management, a native DNS-over-TCP/UDP client, and an initial HTTP CONNECT forward-proxy listener.
 The CONNECT listener accepts local proxy clients, resolves configured FastGithub domains through
-the project's DNS resolver, and establishes bidirectional TCP tunnels. Plain HTTP absolute-form
-requests, TLS interception/SNI rewriting, reverse proxy rules, statistics, and certificate
-management remain incomplete; this stage is not yet feature-parity with the original application.
-The DNS client queries A and AAAA records, merges
-upstream answers, caches them using bounded DNS TTLs, and can promote the fastest TCP-reachable
-address. The resolver persists discovered `host:port` entries in `dnsendpoints.json`, keeps the
-original 10-minute domain/IP history and TCP health cache policy (5-minute normal / 1-minute local
-network failure; 5-second connect timeout), and exposes a one-shot `test-dns` refresh command. DNS transport follows the reference behavior:
-port 53 uses TCP; custom ports use UDP and retry over TCP when the response is truncated.
+the project's DNS resolver, and establishes bidirectional TCP tunnels. The Rust configuration
+layer now also resolves the original `TlsSni` / `TlsSniPattern` semantics: SNI is omitted unless
+`TlsSni` is true; an enabled empty pattern defaults to `@domain`; and `@domain`, `@ipaddress`,
+and `@random` substitutions are case-insensitive. The `@random` token currently uses monotonic
+milliseconds since the Rust process started, matching the original use of a changing tick count
+rather than cryptographic randomness.
+
+This is configuration groundwork only: the CONNECT listener still forwards opaque TCP and does
+not yet terminate client TLS, generate/trust a local CA, apply the SNI value to an upstream TLS
+ClientHello, or implement the original HTTP reverse-proxy pipeline. Plain HTTP absolute-form
+requests, TLS interception, reverse proxy rules, statistics, and certificate management remain
+incomplete; this stage is not yet feature-parity with the original application.
+
+The DNS client queries A and AAAA records, merges upstream answers, caches them using bounded DNS
+TTLs, and can promote the fastest TCP-reachable address. The resolver persists discovered
+`host:port` entries in `dnsendpoints.json`, keeps the original 10-minute domain/IP history and
+TCP health cache policy (5-minute normal / 1-minute local network failure; 5-second connect
+timeout), and exposes a one-shot `test-dns` refresh command. DNS transport follows the reference
+behavior: port 53 uses TCP; custom ports use UDP and retry over TCP when the response is truncated.
 UDP transaction IDs are validated before parsing.
-The bundled Linux `dnscrypt-proxy` is a client-side encrypted-DNS forwarder and remains the correct component for this role. `DNSCrypt/encrypted-dns-server` is a server-side implementation and is not a drop-in replacement. The proxy can be configured and managed as a child process by Rust:
+
+The bundled Linux `dnscrypt-proxy` is a client-side encrypted-DNS forwarder and remains the correct
+component for this role. `DNSCrypt/encrypted-dns-server` is a server-side implementation and is
+not a drop-in replacement. The proxy can be configured and managed as a child process by Rust:
 its TOML listener, `ph` load-balancing strategy, log level, and 60–120 second positive/negative
 cache TTLs are applied at startup. The resolver prefers its local listener and falls back to the
-configured DNS servers if it cannot start. `test-dns` performs a one-shot refresh; `watch-dns` reproduces the original five-second
-initialization delay followed by one-second background refreshes until Ctrl-C. Normal startup now launches the HTTP CONNECT listener (and the bundled DNSCrypt client when
-available). This is an initial tunnel-only milestone, not full parity: absolute-form HTTP proxy
-requests, TLS interception/SNI rewriting, reverse proxy rules, flow statistics, and certificate
-lifecycle are still being ported.
-
+configured DNS servers if it cannot start. `test-dns` performs a one-shot refresh; `watch-dns`
+reproduces the original five-second initialization delay followed by one-second background refreshes
+until Ctrl-C. Normal startup now launches the HTTP CONNECT listener (and the bundled DNSCrypt
+client when available).
 
 ## DNSCrypt migration status
 
-The bundled `dnscrypt-proxy` remains in place until a native replacement preserves the
-shipped configuration's behavior. The current TOML enables both DNSCrypt and DNS-over-HTTPS,
-and requires no-log/no-filter resolvers. The Rust `dnscrypt` crate is a promising pure-Rust
-DNSCrypt v2 client with pinned provider keys, stamp parsing, certificate refresh, and optional
-Anonymized DNSCrypt relays. Its documented API does not currently establish parity for DoH,
-ODoH, or post-quantum DNSCrypt, so replacing the bundled proxy now would silently reduce
-protocol coverage. Do not remove the Go executable until those compatibility gaps are either
-implemented or explicitly accepted and tested.
+The bundled `dnscrypt-proxy` remains in place until a native replacement preserves the shipped
+configuration's behavior. The current TOML enables both DNSCrypt and DNS-over-HTTPS, and requires
+no-log/no-filter resolvers. The Rust `dnscrypt` crate is a promising pure-Rust DNSCrypt v2 client
+with pinned provider keys, stamp parsing, certificate refresh, and optional Anonymized DNSCrypt
+relays. Its documented API does not currently establish parity for DoH, ODoH, or post-quantum
+DNSCrypt, so replacing the bundled proxy now would silently reduce protocol coverage. Do not remove
+the Go executable until those compatibility gaps are either implemented or explicitly accepted
+and tested.
 
 ## Porting constraints
 
