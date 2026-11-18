@@ -6,6 +6,7 @@ mod http_proxy;
 mod persistence;
 mod resolver;
 mod service;
+mod tls;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
