@@ -25,7 +25,7 @@ cargo build --release
 
 The current Rust implementation includes configuration loading (JSON5 comments and sorted
 `appsettings/appsettings.*.json` overlays), label-safe domain wildcard matching, systemd unit
-management, and a native DNS-over-TCP client. The DNS client queries A and AAAA records, merges
+management, and a native DNS-over-TCP/UDP client. The DNS client queries A and AAAA records, merges
 upstream answers, caches them using bounded DNS TTLs, and can promote the fastest TCP-reachable
 address. The resolver persists discovered `host:port` entries in `dnsendpoints.json`, keeps the
 original 10-minute domain/IP history and TCP health cache policy (5-minute normal / 1-minute local
