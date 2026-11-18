@@ -33,6 +33,8 @@ enum Command {
     Resolve { endpoint: String },
     /// Refresh and benchmark all persisted DNS endpoints once.
     TestDns,
+    /// Run the original one-second DNS endpoint health refresh loop.
+    WatchDns,
 }
 
 #[tokio::main]
@@ -82,6 +84,35 @@ async fn main() -> Result<()> {
             let persistence = persistence::Persistence::new("dnsendpoints.json");
             let resolver = resolver::DomainResolver::new(dns, persistence).await?;
             resolver.test_speed().await?;
+            if let Some(proxy) = proxy { proxy.stop().await; }
+        }
+        Some(Command::WatchDns) => {
+            let config = config::AppConfig::load(&config_path)?;
+            let proxy = dnscrypt::DnscryptProxy::discover().ok();
+            let mut upstreams = Vec::new();
+            if let Some(proxy) = proxy.as_ref() {
+                match proxy.start().await {
+                    Ok(endpoint) => { upstreams.push(endpoint); upstreams.push(endpoint); }
+                    Err(error) => tracing::warn!(%error, "dnscrypt-proxy unavailable; using fallback DNS"),
+                }
+            }
+            upstreams.extend(config.fast_github.fallback_dns);
+            let dns = dns::DnsClient::new(upstreams);
+            let persistence = persistence::Persistence::new("dnsendpoints.json");
+            let resolver = resolver::DomainResolver::new(dns, persistence).await?;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            loop {
+                if let Err(error) = resolver.test_speed().await {
+                    tracing::warn!(%error, "DNS endpoint refresh failed");
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
+                    result = tokio::signal::ctrl_c() => {
+                        result.context("waiting for Ctrl-C")?;
+                        break;
+                    }
+                }
+            }
             if let Some(proxy) = proxy { proxy.stop().await; }
         }
         Some(Command::Check) => {

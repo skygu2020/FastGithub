@@ -19,7 +19,7 @@ cargo build --release
 ```sh
 ./target/release/fastgithub check
 ./target/release/fastgithub resolve github.com:443
-./target/release/fastgithub test-dns
+./target/release/fastgithub test-dns\n./target/release/fastgithub watch-dns
 ```
 
 The current Rust implementation includes configuration loading (JSON5 comments and sorted
@@ -32,8 +32,8 @@ network failure; 5-second connect timeout), and exposes a one-shot `test-dns` re
 The bundled Linux `dnscrypt-proxy` can be configured and managed as a child process by Rust:
 its TOML listener, `ph` load-balancing strategy, log level, and 60–120 second positive/negative
 cache TTLs are applied at startup. The resolver prefers its local listener and falls back to the
-configured DNS servers if it cannot start. `test-dns` is currently a one-shot refresh; the original
-one-second background refresh loop is not yet wired into the long-running application. The HTTP
+configured DNS servers if it cannot start. `test-dns` performs a one-shot refresh; `watch-dns` reproduces the original five-second
+initialization delay followed by one-second background refreshes until Ctrl-C. The HTTP
 proxy, TLS/SNI handling, flow statistics, and certificate lifecycle are still being ported; normal startup does not claim to provide a working proxy yet.
 
 ## Porting constraints
