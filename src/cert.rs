@@ -123,12 +123,15 @@ fn create_ca() -> Result<(X509, PKey<Private>)> {
     let now = unix_time()?;
     let mut builder = X509::builder()?;
     builder.set_version(2)?;
-    builder.set_serial_number(&serial_number()?)?;
+    let serial = serial_number()?;
+    let not_before = Asn1Time::from_unix(now - DAY_SECONDS as i64)?;
+    let not_after = Asn1Time::from_unix(now + 10 * 365 * DAY_SECONDS as i64)?;
+    builder.set_serial_number(&serial)?;
     builder.set_subject_name(&name)?;
     builder.set_issuer_name(&name)?;
     builder.set_pubkey(&key)?;
-    builder.set_not_before(&Asn1Time::from_unix(now - DAY_SECONDS as i64)?)?;
-    builder.set_not_after(&Asn1Time::from_unix(now + 10 * 365 * DAY_SECONDS as i64)?)?;
+    builder.set_not_before(&not_before)?;
+    builder.set_not_after(&not_after)?;
     builder.append_extension(BasicConstraints::new().critical().ca().pathlen(1).build()?)?;
     builder.append_extension(
         KeyUsage::new().critical().digital_signature().key_cert_sign().crl_sign().build()?,
@@ -158,12 +161,15 @@ fn create_server_certificate(
     let now = unix_time()?;
     let mut builder = X509::builder()?;
     builder.set_version(2)?;
-    builder.set_serial_number(&serial_number()?)?;
+    let serial = serial_number()?;
+    let not_before = Asn1Time::from_unix(now - DAY_SECONDS as i64)?;
+    let not_after = Asn1Time::from_unix(now + 365 * DAY_SECONDS as i64)?;
+    builder.set_serial_number(&serial)?;
     builder.set_subject_name(&name)?;
     builder.set_issuer_name(ca_certificate.subject_name())?;
     builder.set_pubkey(&key)?;
-    builder.set_not_before(&Asn1Time::from_unix(now - DAY_SECONDS as i64)?)?;
-    builder.set_not_after(&Asn1Time::from_unix(now + 365 * DAY_SECONDS as i64)?)?;
+    builder.set_not_before(&not_before)?;
+    builder.set_not_after(&not_after)?;
     builder.append_extension(BasicConstraints::new().critical().build()?)?;
     builder.append_extension(
         KeyUsage::new().critical().digital_signature().key_encipherment().build()?,
