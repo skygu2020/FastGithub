@@ -104,7 +104,7 @@ impl DnscryptProxy {
 
     async fn is_running(&self) -> bool {
         match self.child.lock().await.as_mut() {
-            Some(child) => child.try_wait().await.map(|status| status.is_none()).unwrap_or(false),
+            Some(child) => child.try_wait().map(|status| status.is_none()).unwrap_or(false),
             None => false,
         }
     }
@@ -112,7 +112,7 @@ impl DnscryptProxy {
     async fn child_exited(&self) -> Result<bool> {
         let mut guard = self.child.lock().await;
         match guard.as_mut() {
-            Some(child) => Ok(child.try_wait().await?.is_some()),
+            Some(child) => Ok(child.try_wait()?.is_some()),
             None => Ok(true),
         }
     }
@@ -120,7 +120,7 @@ impl DnscryptProxy {
     pub async fn stop(&self) {
         let mut guard = self.child.lock().await;
         if let Some(mut child) = guard.take() {
-            if child.try_wait().await.ok().flatten().is_none() {
+            if child.try_wait().ok().flatten().is_none() {
                 let _ = child.kill().await;
             }
             let _ = child.wait().await;

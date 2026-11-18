@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, net::SocketAddr, path::{Path, PathBuf}, sync::Arc};
 use tokio::sync::Mutex;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "camelCase")]
 pub struct EndpointRecord {
     pub host: String,
