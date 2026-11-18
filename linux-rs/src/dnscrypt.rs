@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
-use std::{env, fs, os::unix::fs::PermissionsExt, net::{IpAddr, Ipv4Addr, SocketAddr}, path::{Path, PathBuf}, process::{Child, Command, Stdio}, time::Duration};
-use tokio::{net::{TcpListener, TcpStream}, sync::Mutex, time::{sleep, timeout}};
+use std::{env, fs, os::unix::fs::PermissionsExt, net::{IpAddr, Ipv4Addr, SocketAddr}, path::{Path, PathBuf}, process::Stdio, time::Duration};
+use tokio::{net::{TcpListener, TcpStream}, process::{Child, Command}, sync::Mutex, time::{sleep, timeout}};
 use toml_edit::{value, Array, DocumentMut};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -14,20 +14,37 @@ pub struct DnscryptProxy {
 
 impl DnscryptProxy {
     pub fn discover() -> Result<Self> {
-        let root = env::current_dir().context("getting working directory")?;
-        let candidates = [
-            root.join("dnscrypt-proxy/dnscrypt-proxy"),
-            root.join("@dnscrypt-proxy/linux-x64/dnscrypt-proxy"),
-            root.join("@dnscrypt-proxy/linux-arm64/dnscrypt-proxy"),
-        ];
-        let executable = candidates.into_iter().find(|path| path.is_file())
-            .context("dnscrypt-proxy binary not found (expected dnscrypt-proxy/ or @dnscrypt-proxy/linux-*)")?;
-        let config_candidates = [
-            root.join("dnscrypt-proxy/dnscrypt-proxy.toml"),
-            root.join("@dnscrypt-proxy/dnscrypt-proxy.toml"),
-        ];
-        let config = config_candidates.into_iter().find(|path| path.is_file())
-            .context("dnscrypt-proxy.toml not found")?;
+        let mut roots = Vec::new();
+        if let Ok(cwd) = env::current_dir() {
+            roots.push(cwd);
+        }
+        if let Ok(executable) = env::current_exe() {
+            roots.extend(executable.ancestors().filter_map(Path::parent).map(Path::to_path_buf));
+        }
+        roots.dedup();
+
+        let mut found = None;
+        for root in roots {
+            let executable_candidates = [
+                root.join("dnscrypt-proxy/dnscrypt-proxy"),
+                root.join("@dnscrypt-proxy/linux-x64/dnscrypt-proxy"),
+                root.join("@dnscrypt-proxy/linux-arm64/dnscrypt-proxy"),
+            ];
+            let config_candidates = [
+                root.join("dnscrypt-proxy/dnscrypt-proxy.toml"),
+                root.join("@dnscrypt-proxy/dnscrypt-proxy.toml"),
+            ];
+            if let (Some(executable), Some(config)) = (
+                executable_candidates.into_iter().find(|path| path.is_file()),
+                config_candidates.into_iter().find(|path| path.is_file()),
+            ) {
+                found = Some((executable, config));
+                break;
+            }
+        }
+        let (executable, config) = found.context(
+            "dnscrypt-proxy resources not found beside the working directory or executable",
+        )?;
         Ok(Self { child: Mutex::new(None), endpoint: Mutex::new(None), executable, config })
     }
 
@@ -52,6 +69,7 @@ impl DnscryptProxy {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("starting {}", self.executable.display()))?;
         *guard = Some(child);
@@ -86,7 +104,7 @@ impl DnscryptProxy {
 
     async fn is_running(&self) -> bool {
         match self.child.lock().await.as_mut() {
-            Some(child) => child.try_wait().map(|status| status.is_none()).unwrap_or(false),
+            Some(child) => child.try_wait().await.map(|status| status.is_none()).unwrap_or(false),
             None => false,
         }
     }
@@ -94,7 +112,7 @@ impl DnscryptProxy {
     async fn child_exited(&self) -> Result<bool> {
         let mut guard = self.child.lock().await;
         match guard.as_mut() {
-            Some(child) => Ok(child.try_wait()?.is_some()),
+            Some(child) => Ok(child.try_wait().await?.is_some()),
             None => Ok(true),
         }
     }
@@ -102,10 +120,10 @@ impl DnscryptProxy {
     pub async fn stop(&self) {
         let mut guard = self.child.lock().await;
         if let Some(mut child) = guard.take() {
-            if child.try_wait().ok().flatten().is_none() {
-                let _ = child.kill();
+            if child.try_wait().await.ok().flatten().is_none() {
+                let _ = child.kill().await;
             }
-            let _ = child.wait();
+            let _ = child.wait().await;
         }
         *self.endpoint.lock().await = None;
     }
