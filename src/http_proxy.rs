@@ -161,8 +161,11 @@ impl TlsProxy {
             let address = upstream.peer_addr().ok()?.ip();
             value.tls_sni_value(&requested_host, address)
         });
+        // Preserve normal hostname SNI even when there is no matching domain rule.
+        // Only an explicit TlsSni=false setting suppresses the SNI extension.
+        let disable_sni = domain_config.is_some_and(|value| value.tls_sni == Some(false));
         let mut connect_config = self.connector.configure()?;
-        connect_config.set_use_server_name_indication(configured_sni.is_some());
+        connect_config.set_use_server_name_indication(!disable_sni);
         let mut upstream_ssl = connect_config.into_ssl(&requested_host)?;
         if let Some(sni) = configured_sni.as_deref() {
             upstream_ssl.set_hostname(sni)?;
