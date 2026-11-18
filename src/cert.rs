@@ -236,3 +236,64 @@ fn write_atomic(path: &Path, contents: &[u8], secret: bool) -> Result<()> {
         .with_context(|| format!("installing {}", path.display()))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_directory() -> PathBuf {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("fastgithub-cert-test-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn creates_persistent_ca_and_reloads_it() {
+        let directory = test_directory();
+        let service = CertificateService::load_or_create(&directory).unwrap();
+        let cert_path = service.ca_certificate_path();
+        let key_path = service.ca_private_key_path();
+        assert!(cert_path.is_file());
+        assert!(key_path.is_file());
+        let first = service.ca_certificate().digest(MessageDigest::sha256()).unwrap();
+        drop(service);
+
+        let reloaded = CertificateService::load_or_create(&directory).unwrap();
+        let second = reloaded.ca_certificate().digest(MessageDigest::sha256()).unwrap();
+        assert_eq!(first.as_ref(), second.as_ref());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(key_path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn issues_and_caches_host_certificates() {
+        let directory = test_directory();
+        let service = CertificateService::load_or_create(&directory).unwrap();
+        let first = service.server_certificate("API.GITHUB.COM.").unwrap();
+        let second = service.server_certificate("api.github.com").unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(first.certificate.public_key().unwrap().public_eq(&first.private_key));
+        let issuer_key = service.ca_certificate().public_key().unwrap();
+        assert!(first.certificate.verify(&issuer_key).unwrap());
+
+        let san = first.certificate.subject_alt_names().unwrap();
+        let names = san.iter().filter_map(|name| name.dnsname()).collect::<Vec<_>>();
+        assert!(names.iter().any(|name| *name == "api.github.com"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_mismatched_ca_key() {
+        let directory = test_directory();
+        let _service = CertificateService::load_or_create(&directory).unwrap();
+        let replacement = PKey::from_rsa(Rsa::generate(RSA_BITS).unwrap()).unwrap();
+        std::fs::write(directory.join(CA_KEY_FILE), replacement.private_key_to_pem_pkcs8().unwrap()).unwrap();
+        assert!(CertificateService::load_or_create(&directory).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
