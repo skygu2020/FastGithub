@@ -124,7 +124,29 @@ async fn main() -> Result<()> {
             let config = config::AppConfig::load(&config_path)?;
             tracing::info!(version = env!("CARGO_PKG_VERSION"), proxy_port = config.fast_github.http_proxy_port,
                 domains = config.fast_github.domain_configs.len(), "FastGithub Rust Linux configuration loaded");
-            tracing::warn!("Linux Rust network services are being ported; this bootstrap does not yet start the proxy");
+            let proxy = match dnscrypt::DnscryptProxy::discover() {
+                Ok(proxy) => Some(proxy),
+                Err(error) => {
+                    tracing::warn!(%error, "DNSCrypt proxy resources unavailable; using fallback DNS");
+                    None
+                }
+            };
+            let mut upstreams = Vec::new();
+            if let Some(proxy) = proxy.as_ref() {
+                match proxy.start().await {
+                    Ok(endpoint) => {
+                        upstreams.push(endpoint);
+                        upstreams.push(endpoint);
+                    }
+                    Err(error) => tracing::warn!(%error, "DNSCrypt proxy failed to start; using fallback DNS"),
+                }
+            }
+            upstreams.extend(config.fast_github.fallback_dns.iter().copied());
+            let result = http_proxy::run(config, upstreams).await;
+            if let Some(proxy) = proxy {
+                proxy.stop().await;
+            }
+            result?;
         }
     }
     Ok(())
