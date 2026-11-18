@@ -21,11 +21,13 @@ cargo build --release
 sudo ./target/release/fastgithub
 ```
 
-The bootstrap currently implements configuration loading (including JSON5 comments and sorted
-`appsettings/appsettings.*.json` overlays), domain wildcard matching, and systemd unit management.
-The proxy, DNS resolution/IP racing, TLS/SNI handling, flow statistics, and certificate lifecycle
-are the next implementation stages. The executable intentionally reports that network services
-are not yet started rather than pretending the port is complete.
+The current Rust implementation includes configuration loading (JSON5 comments and sorted
+`appsettings/appsettings.*.json` overlays), label-safe domain wildcard matching, systemd unit
+management, and a native DNS-over-TCP client. The DNS client queries A and AAAA records, merges
+upstream answers, caches them using bounded DNS TTLs, and can promote the fastest TCP-reachable
+address. It can be exercised with `fastgithub resolve github.com:443`. The HTTP proxy, persistent
+endpoint/IP health cache, DNSCrypt lifecycle, TLS/SNI handling, flow statistics, and certificate
+lifecycle are still being ported; normal startup does not claim to provide a working proxy yet.
 
 ## Porting constraints
 
