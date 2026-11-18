@@ -49,11 +49,19 @@ impl DomainConfig {
             return None;
         }
         let pattern = self.tls_sni_pattern.as_deref().filter(|value| !value.is_empty()).unwrap_or("@domain");
-        let uptime_ms = PROCESS_START.get_or_init(Instant::now).elapsed().as_millis();
+        let uptime_ms = system_uptime_ms();
         let value = replace_ascii_case_insensitive(pattern, "@domain", domain);
         let value = replace_ascii_case_insensitive(&value, "@random", &uptime_ms.to_string());
         Some(replace_ascii_case_insensitive(&value, "@ipaddress", &address.to_string()))
     }
+}
+
+fn system_uptime_ms() -> u128 {
+    fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|text| text.split_ascii_whitespace().next()?.parse::<f64>().ok())
+        .map(|seconds| (seconds * 1000.0) as u128)
+        .unwrap_or_else(|| PROCESS_START.get_or_init(Instant::now).elapsed().as_millis())
 }
 
 fn replace_ascii_case_insensitive(value: &str, needle: &str, replacement: &str) -> String {
