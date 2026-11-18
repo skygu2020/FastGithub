@@ -40,8 +40,10 @@ The bundled Linux `dnscrypt-proxy` is a client-side encrypted-DNS forwarder and 
 its TOML listener, `ph` load-balancing strategy, log level, and 60–120 second positive/negative
 cache TTLs are applied at startup. The resolver prefers its local listener and falls back to the
 configured DNS servers if it cannot start. `test-dns` performs a one-shot refresh; `watch-dns` reproduces the original five-second
-initialization delay followed by one-second background refreshes until Ctrl-C. The HTTP
-proxy, TLS/SNI handling, flow statistics, and certificate lifecycle are still being ported; normal startup does not claim to provide a working proxy yet.
+initialization delay followed by one-second background refreshes until Ctrl-C. Normal startup now launches the HTTP CONNECT listener (and the bundled DNSCrypt client when
+available). This is an initial tunnel-only milestone, not full parity: absolute-form HTTP proxy
+requests, TLS interception/SNI rewriting, reverse proxy rules, flow statistics, and certificate
+lifecycle are still being ported.
 
 
 ## DNSCrypt migration status

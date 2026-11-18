@@ -129,3 +129,38 @@ async fn connect_target(host: &str, port: u16, resolver: &DomainResolver, domain
     }
     bail!("all connection attempts failed: {}", failures.join("; "))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_connect_request_line() {
+        let header = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+        assert_eq!(parse_request_line(header).unwrap(), ("CONNECT", "example.com:443"));
+    }
+
+    #[test]
+    fn parses_ipv4_and_domain_authorities() {
+        assert_eq!(parse_authority("github.com:443").unwrap(), ("github.com".into(), 443));
+        assert_eq!(parse_authority("127.0.0.1:8443").unwrap(), ("127.0.0.1".into(), 8443));
+    }
+
+    #[test]
+    fn parses_bracketed_ipv6_authority() {
+        assert_eq!(parse_authority("[::1]:443").unwrap(), ("::1".into(), 443));
+    }
+
+    #[test]
+    fn rejects_invalid_connect_authorities() {
+        assert!(parse_authority("https://github.com:443").is_err());
+        assert!(parse_authority("github.com").is_err());
+        assert!(parse_authority("github.com:0").is_err());
+        assert!(parse_authority("user@github.com:443").is_err());
+    }
+
+    #[test]
+    fn rejects_non_http_request_line() {
+        assert!(parse_request_line(b"CONNECT github.com:443\r\n\r\n").is_err());
+    }
+}
