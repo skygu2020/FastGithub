@@ -28,7 +28,9 @@ and statistics are not yet implemented. The local CA lifecycle is implemented: `
 proxy startup also creates or loads this CA and logs both paths. The CA is not automatically
 installed into the operating-system trust store.
 
-A bounded TLS ClientHello parser is retained for protocol analysis; the active TLS interception path uses OpenSSL's ClientHello/SNI callback to select per-host certificates.\n\nThe active configuration layer preserves the original `TlsSni` semantics: SNI is omitted only
+A bounded TLS ClientHello parser is retained for protocol analysis; the active TLS interception path uses OpenSSL's ClientHello/SNI callback to select per-host certificates.
+
+The active configuration layer preserves the original `TlsSni` semantics: SNI is omitted only
 when `TlsSni=false`; otherwise an empty pattern defaults to `@domain`. The pattern supports
 case-insensitive `@domain`, `@ipaddress`, and `@random` tokens. The random token currently
 uses Linux system uptime milliseconds from `/proc/uptime`, corresponding to the original changing tick

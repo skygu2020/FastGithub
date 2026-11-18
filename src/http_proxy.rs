@@ -99,10 +99,21 @@ async fn sniff_tls(client: &TcpStream) -> Result<bool> {
         if count == 0 {
             bail!("client closed before sending CONNECT tunnel data");
         }
-        if count >= prefix.len() {
-            return Ok(prefix[0] == 22 && prefix[1] == 3);
+        if let Some(is_tls) = classify_tls_prefix(&prefix[..count]) {
+            return Ok(is_tls);
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+fn classify_tls_prefix(prefix: &[u8]) -> Option<bool> {
+    match prefix {
+        [] => None,
+        [content_type, ..] if *content_type != 22 => Some(false),
+        [_content_type] => None,
+        [_content_type, version, ..] if *version != 3 => Some(false),
+        [_, _, _] => Some(true),
+        _ => None,
     }
 }
 
@@ -118,13 +129,13 @@ impl TlsProxy {
             .context("creating inbound TLS acceptor")?;
         let callback_certificates = Arc::clone(&certificates);
         acceptor.set_servername_callback(move |ssl, _alert| {
-            let Some(host) = ssl.servername(NameType::HOST_NAME) else {
-                return Err(SniError::ALERT_FATAL);
-            };
-            let certificate = callback_certificates.server_certificate(host)
-                .map_err(|_| SniError::ALERT_FATAL)?;
-            ssl.set_certificate(&certificate.certificate).map_err(|_| SniError::ALERT_FATAL)?;
-            ssl.set_private_key(&certificate.private_key).map_err(|_| SniError::ALERT_FATAL)?;
+            if let Some(host) = ssl.servername(NameType::HOST_NAME) {
+                let certificate = callback_certificates.server_certificate(host)
+                    .map_err(|_| SniError::ALERT_FATAL)?;
+                ssl.set_certificate(&certificate.certificate).map_err(|_| SniError::ALERT_FATAL)?;
+                ssl.set_private_key(&certificate.private_key).map_err(|_| SniError::ALERT_FATAL)?;
+            }
+            // No SNI: keep the CONNECT-authority certificate installed on this session.
             Ok(())
         });
         let connector = SslConnector::builder(SslMethod::tls())
@@ -226,6 +237,16 @@ async fn connect_target(host: &str, port: u16, resolver: &DomainResolver, domain
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_fragmented_tls_record_prefixes() {
+        assert_eq!(classify_tls_prefix(&[]), None);
+        assert_eq!(classify_tls_prefix(&[22]), None);
+        assert_eq!(classify_tls_prefix(&[22, 3]), None);
+        assert_eq!(classify_tls_prefix(&[22, 3, 1]), Some(true));
+        assert_eq!(classify_tls_prefix(&[22, 4]), Some(false));
+        assert_eq!(classify_tls_prefix(&[23]), Some(false));
+    }
 
     #[test]
     fn bad_request_response_uses_http_crlf_delimiters() {
