@@ -17,8 +17,8 @@ cargo build --release
 ## Run
 
 ```sh
-./target/release/fastgithub --check
-sudo ./target/release/fastgithub
+./target/release/fastgithub check
+./target/release/fastgithub resolve github.com:443
 ```
 
 The current Rust implementation includes configuration loading (JSON5 comments and sorted
