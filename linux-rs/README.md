@@ -31,11 +31,8 @@ original 10-minute domain/IP history and TCP health cache policy (5-minute norma
 network failure; 5-second connect timeout), and exposes a one-shot `test-dns` refresh command.
 The bundled Linux `dnscrypt-proxy` is a client-side encrypted-DNS forwarder and remains the correct component for this role. `DNSCrypt/encrypted-dns-server` is a server-side implementation and is not a drop-in replacement. The proxy can be configured and managed as a child process by Rust:
 its TOML listener, `ph` load-balancing strategy, log level, and 60–120 second positive/negative
-cache TTLs are applied at startup. Resource discovery checks both the working directory and
-the executable's ancestor directories, so launching FastGithub from another directory does not
-break bundled-resource lookup. The Tokio child process uses `kill_on_drop` and explicit
-asynchronous shutdown to avoid leaving the proxy running after early returns. The resolver
-prefers its local listener and falls back to the configured DNS servers if it cannot start. `test-dns` performs a one-shot refresh; `watch-dns` reproduces the original five-second
+cache TTLs are applied at startup. The resolver prefers its local listener and falls back to the
+configured DNS servers if it cannot start. `test-dns` performs a one-shot refresh; `watch-dns` reproduces the original five-second
 initialization delay followed by one-second background refreshes until Ctrl-C. The HTTP
 proxy, TLS/SNI handling, flow statistics, and certificate lifecycle are still being ported; normal startup does not claim to provide a working proxy yet.
 

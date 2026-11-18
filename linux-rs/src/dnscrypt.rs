@@ -55,7 +55,7 @@ impl DnscryptProxy {
         let endpoint = available_loopback_endpoint().await?;
         update_config(&self.config, endpoint).await?;
         let mut guard = self.child.lock().await;
-        if let Some(mut child) = guard.take() { let _ = child.kill(); let _ = child.wait(); }
+        if let Some(mut child) = guard.take() { let _ = child.kill().await; let _ = child.wait().await; }
         let metadata = fs::metadata(&self.executable)?;
         let mode = metadata.permissions().mode();
         if mode & 0o111 == 0 {
