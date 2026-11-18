@@ -235,16 +235,95 @@ fn u32_at(data: &[u8], offset: usize) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn response(id: u16, flags: u16) -> Vec<u8> {
+        let mut packet = Vec::with_capacity(28);
+        packet.extend_from_slice(&id.to_be_bytes());
+        packet.extend_from_slice(&flags.to_be_bytes());
+        packet.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0]);
+        packet.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]);
+        packet.extend_from_slice(&60u32.to_be_bytes());
+        packet.extend_from_slice(&[0, 4, 1, 2, 3, 4]);
+        packet
+    }
+
     #[test]
     fn builds_question() {
         let packet = build_query("api.github.com", 1).unwrap();
         assert_eq!(&packet[12..], &[3,b'a',b'p',b'i',7,b'g',b'i',b't',b'h',b'u',b'b',3,b'c',b'o',b'm',0,0,1,0,1]);
     }
+
     #[test]
     fn parses_a_record() {
         let packet = [0,1,0x81,0x80,0,1,0,1,0,0,0,0,1,b'a',0,0,1,0,1,0xc0,0x0c,0,1,0,1,0,0,0,60,0,4,1,2,3,4];
         let (ips, ttl) = parse_response(&packet, 1, 1).unwrap();
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1,2,3,4))]);
         assert_eq!(ttl, Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn udp_query_accepts_matching_response() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream = socket.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut query = [0u8; 512];
+            let (length, peer) = socket.recv_from(&mut query).await.unwrap();
+            let id = u16::from_be_bytes([query[0], query[1]]);
+            socket.send_to(&response(id, 0x8180), peer).await.unwrap();
+            length
+        });
+
+        let query = build_query("example.com", 1).unwrap();
+        let (addresses, ttl) = udp_query(upstream, &query, 1).await.unwrap();
+        assert_eq!(addresses, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+        assert_eq!(ttl, Duration::from_secs(60));
+        assert!(server.await.unwrap() >= 12);
+    }
+
+    #[tokio::test]
+    async fn udp_query_rejects_mismatched_transaction_id() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut query = [0u8; 512];
+            let (_, peer) = socket.recv_from(&mut query).await.unwrap();
+            let id = u16::from_be_bytes([query[0], query[1]]).wrapping_add(1);
+            socket.send_to(&response(id, 0x8180), peer).await.unwrap();
+        });
+
+        let query = build_query("example.com", 1).unwrap();
+        let error = udp_query(upstream, &query, 1).await.unwrap_err();
+        assert!(error.to_string().contains("ID does not match"));
+    }
+
+    #[tokio::test]
+    async fn udp_truncation_retries_over_tcp() {
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream = udp.local_addr().unwrap();
+        let tcp = tokio::net::TcpListener::bind(upstream).await.unwrap();
+
+        let udp_server = tokio::spawn(async move {
+            let mut query = [0u8; 512];
+            let (_, peer) = udp.recv_from(&mut query).await.unwrap();
+            let id = u16::from_be_bytes([query[0], query[1]]);
+            udp.send_to(&response(id, 0x8380), peer).await.unwrap();
+        });
+        let tcp_server = tokio::spawn(async move {
+            let (mut stream, _) = tcp.accept().await.unwrap();
+            let length = stream.read_u16().await.unwrap() as usize;
+            let mut query = vec![0; length];
+            stream.read_exact(&mut query).await.unwrap();
+            let id = u16::from_be_bytes([query[0], query[1]]);
+            let packet = response(id, 0x8180);
+            stream.write_u16(packet.len() as u16).await.unwrap();
+            stream.write_all(&packet).await.unwrap();
+        });
+
+        let query = build_query("example.com", 1).unwrap();
+        let (addresses, _) = udp_query(upstream, &query, 1).await.unwrap();
+        assert_eq!(addresses, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+        udp_server.await.unwrap();
+        tcp_server.await.unwrap();
     }
 }
