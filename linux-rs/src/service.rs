@@ -13,7 +13,7 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
 }
 
 pub async fn install_and_start(executable: &Path) -> Result<()> {
-    if unsafe { libc_geteuid() } != 0 {
+    if effective_uid() != 0 {
         bail!("root privileges are required to install a system service");
     }
 
@@ -35,7 +35,7 @@ pub async fn install_and_start(executable: &Path) -> Result<()> {
 }
 
 pub async fn stop_and_remove(_executable: &Path) -> Result<()> {
-    if unsafe { libc_geteuid() } != 0 {
+    if effective_uid() != 0 {
         bail!("root privileges are required to remove the system service");
     }
     let unit_name = "fastgithub-rs.service";
@@ -49,9 +49,9 @@ pub async fn stop_and_remove(_executable: &Path) -> Result<()> {
     Ok(())
 }
 
-unsafe fn libc_geteuid() -> u32 {
-    unsafe extern "C" {
+fn effective_uid() -> u32 {
+    extern "C" {
         fn geteuid() -> u32;
     }
-    geteuid()
+    unsafe { geteuid() }
 }
