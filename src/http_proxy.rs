@@ -6,6 +6,7 @@ use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{lookup_host, TcpListener, T
 const HEADER_LIMIT: usize = 16 * 1024;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const BAD_REQUEST_RESPONSE: &[u8] = BAD_REQUEST_RESPONSE;
 
 pub async fn run(config: crate::config::AppConfig, upstreams: Vec<SocketAddr>) -> Result<()> {
     let port = config.fast_github.http_proxy_port;
@@ -59,7 +60,7 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, doma
     let (host, port) = match parse_authority(authority) {
         Ok(value) => value,
         Err(error) => {
-            let _ = client.write_all(b"HTTP/1.1 400 Bad Request\\r\\nConnection: close\\r\\n\\r\\n").await;
+            let _ = client.write_all(BAD_REQUEST_RESPONSE).await;
             return Err(error);
         }
     };
@@ -139,6 +140,11 @@ async fn connect_target(host: &str, port: u16, resolver: &DomainResolver, domain
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bad_request_response_uses_http_crlf_delimiters() {
+        assert_eq!(BAD_REQUEST_RESPONSE, b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+    }
 
     #[test]
     fn parses_connect_request_line() {
