@@ -26,7 +26,7 @@ impl DnsClient {
         Self { upstreams: Arc::new(upstreams), cache: Arc::new(Mutex::new(HashMap::new())), state_cache: Arc::new(Mutex::new(HashMap::new())) }
     }
 
-    /// Query configured upstreams over DNS-over-TCP, merging unique A and AAAA answers.
+    /// Query configured DNS upstreams, merging unique A and AAAA answers.
     pub async fn resolve(&self, host: &str, port: u16, fast_sort: bool) -> Result<Vec<IpAddr>> {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
         if host.is_empty() { bail!("DNS host must not be empty"); }
@@ -35,7 +35,8 @@ impl DnsClient {
 
         let mut addresses = Vec::new();
         for upstream in self.upstreams.iter().copied() {
-            if !self.tcp_available(upstream).await { continue; }
+            // The reference implementation probes TCP only for port 53; custom ports are UDP.
+            if upstream.port() == 53 && !self.tcp_available(upstream).await { continue; }
             match self.lookup(upstream, &host).await {
                 Ok(found) => for ip in found { if !ip.is_loopback() && !addresses.contains(&ip) { addresses.push(ip); } },
                 Err(error) => tracing::warn!(%host, %upstream, %error, "DNS lookup failed"),
