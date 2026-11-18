@@ -1,0 +1,206 @@
+use anyhow::{bail, Context, Result};
+use std::{collections::HashMap, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}, sync::{atomic::{AtomicU16, Ordering}, Arc}, time::Duration};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, sync::Mutex, time::{timeout, Instant}};
+
+const DNS_TIMEOUT: Duration = Duration::from_secs(4);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const MIN_TTL: Duration = Duration::from_secs(30);
+const MAX_TTL: Duration = Duration::from_secs(600);
+static NEXT_ID: AtomicU16 = AtomicU16::new(1);
+
+#[derive(Clone)]
+struct CacheEntry { addresses: Vec<IpAddr>, expires_at: Instant }
+
+#[derive(Clone)]
+pub struct DnsClient {
+    upstreams: Arc<Vec<SocketAddr>>,
+    cache: Arc<Mutex<HashMap<(SocketAddr, String), CacheEntry>>>,
+}
+
+impl DnsClient {
+    pub fn new(upstreams: Vec<SocketAddr>) -> Self {
+        Self { upstreams: Arc::new(upstreams), cache: Arc::new(Mutex::new(HashMap::new())) }
+    }
+
+    /// Query configured upstreams over DNS-over-TCP, merging unique A and AAAA answers.
+    pub async fn resolve(&self, host: &str, port: u16, fast_sort: bool) -> Result<Vec<IpAddr>> {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() { bail!("DNS host must not be empty"); }
+        if let Ok(ip) = host.parse::<IpAddr>() { return Ok(vec![ip]); }
+        if host == "localhost" { return Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)]); }
+
+        let mut addresses = Vec::new();
+        for upstream in self.upstreams.iter().copied() {
+            if !self.tcp_available(upstream).await { continue; }
+            match self.lookup(upstream, &host).await {
+                Ok(found) => for ip in found { if !ip.is_loopback() && !addresses.contains(&ip) { addresses.push(ip); } },
+                Err(error) => tracing::warn!(%host, %upstream, %error, "DNS lookup failed"),
+            }
+        }
+        if fast_sort && addresses.len() > 1 { self.prefer_fastest(&mut addresses, port).await; }
+        Ok(addresses)
+    }
+
+    async fn tcp_available(&self, upstream: SocketAddr) -> bool {
+        timeout(CONNECT_TIMEOUT, TcpStream::connect(upstream)).await.is_ok_and(|r| r.is_ok())
+    }
+
+    async fn lookup(&self, upstream: SocketAddr, host: &str) -> Result<Vec<IpAddr>> {
+        let key = (upstream, host.to_owned());
+        {
+            let mut cache = self.cache.lock().await;
+            if let Some(entry) = cache.get(&key) {
+                if entry.expires_at > Instant::now() { return Ok(entry.addresses.clone()); }
+                cache.remove(&key);
+            }
+        }
+        let mut addresses = Vec::new();
+        let mut ttl = MAX_TTL;
+        for record_type in [1u16, 28u16] {
+            match self.query(upstream, host, record_type).await {
+                Ok((found, record_ttl)) => { addresses.extend(found); ttl = ttl.min(record_ttl); }
+                Err(error) if record_type == 28 => tracing::debug!(%host, %error, "AAAA query failed"),
+                Err(error) => return Err(error),
+            }
+        }
+        addresses.dedup();
+        if addresses.is_empty() { ttl = MIN_TTL; }
+        self.cache.lock().await.insert(key, CacheEntry { addresses: addresses.clone(), expires_at: Instant::now() + ttl.clamp(MIN_TTL, MAX_TTL) });
+        Ok(addresses)
+    }
+
+    async fn query(&self, upstream: SocketAddr, host: &str, record_type: u16) -> Result<(Vec<IpAddr>, Duration)> {
+        timeout(DNS_TIMEOUT, async {
+            let query = build_query(host, record_type)?;
+            let mut stream = TcpStream::connect(upstream).await.with_context(|| format!("connect DNS {upstream}"))?;
+            stream.write_u16(query.len() as u16).await?;
+            stream.write_all(&query).await?;
+            let length = stream.read_u16().await? as usize;
+            if !(12..=65535).contains(&length) { bail!("invalid DNS response length {length}"); }
+            let mut response = vec![0; length];
+            stream.read_exact(&mut response).await?;
+            parse_response(&response, record_type)
+        }).await.context("DNS query timed out")?
+    }
+
+    async fn prefer_fastest(&self, addresses: &mut Vec<IpAddr>, port: u16) {
+        let mut tasks = tokio::task::JoinSet::new();
+        for ip in addresses.iter().copied() {
+            tasks.spawn(async move {
+                let started = Instant::now();
+                let endpoint = SocketAddr::new(ip, port);
+                let ok = timeout(CONNECT_TIMEOUT, TcpStream::connect(endpoint)).await.is_ok_and(|r| r.is_ok());
+                ok.then_some((ip, started.elapsed()))
+            });
+        }
+        let mut fastest: Option<(IpAddr, Duration)> = None;
+        while let Some(result) = tasks.join_next().await {
+            if let Ok(Some(candidate)) = result {
+                if fastest.as_ref().is_none_or(|best| candidate.1 < best.1) { fastest = Some(candidate); }
+            }
+        }
+        if let Some((ip, _)) = fastest {
+            if let Some(index) = addresses.iter().position(|item| *item == ip) { addresses.swap(0, index); }
+        }
+    }
+}
+
+fn build_query(host: &str, record_type: u16) -> Result<Vec<u8>> {
+    let mut packet = Vec::with_capacity(host.len() + 32);
+    packet.extend_from_slice(&NEXT_ID.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+    packet.extend_from_slice(&0x0100u16.to_be_bytes());
+    packet.extend_from_slice(&1u16.to_be_bytes());
+    packet.extend_from_slice(&[0; 6]);
+    for label in host.split('.') {
+        if label.is_empty() || label.len() > 63 || !label.is_ascii() { bail!("invalid DNS label in {host}"); }
+        packet.push(label.len() as u8);
+        packet.extend_from_slice(label.as_bytes());
+    }
+    packet.push(0);
+    packet.extend_from_slice(&record_type.to_be_bytes());
+    packet.extend_from_slice(&1u16.to_be_bytes());
+    Ok(packet)
+}
+
+fn parse_response(packet: &[u8], expected_type: u16) -> Result<(Vec<IpAddr>, Duration)> {
+    if packet.len() < 12 { bail!("truncated DNS header"); }
+    let flags = u16_at(packet, 2)?;
+    if flags & 0x8000 == 0 { bail!("not a DNS response"); }
+    if flags & 0x000f != 0 { bail!("DNS rcode {}", flags & 0x000f); }
+    let questions = u16_at(packet, 4)? as usize;
+    let answers = u16_at(packet, 6)? as usize;
+    let mut offset = 12;
+    for _ in 0..questions {
+        offset = skip_name(packet, offset)?;
+        offset = offset.checked_add(4).context("question offset overflow")?;
+        if offset > packet.len() { bail!("truncated DNS question"); }
+    }
+    let mut result = Vec::new();
+    let mut ttl = MAX_TTL;
+    for _ in 0..answers {
+        offset = skip_name(packet, offset)?;
+        let kind = u16_at(packet, offset)?;
+        let class = u16_at(packet, offset + 2)?;
+        let record_ttl = u32_at(packet, offset + 4)?;
+        let length = u16_at(packet, offset + 8)? as usize;
+        offset += 10;
+        let end = offset.checked_add(length).context("record length overflow")?;
+        if end > packet.len() { bail!("truncated DNS record"); }
+        if class == 1 && kind == expected_type {
+            let ip = match (kind, length) {
+                (1, 4) => Some(IpAddr::V4(Ipv4Addr::new(packet[offset], packet[offset+1], packet[offset+2], packet[offset+3]))),
+                (28, 16) => { let mut octets = [0; 16]; octets.copy_from_slice(&packet[offset..end]); Some(IpAddr::V6(Ipv6Addr::from(octets))) },
+                _ => None,
+            };
+            if let Some(ip) = ip { result.push(ip); ttl = ttl.min(Duration::from_secs(record_ttl as u64)); }
+        }
+        offset = end;
+    }
+    if result.is_empty() { ttl = MIN_TTL; }
+    Ok((result, ttl))
+}
+
+fn skip_name(packet: &[u8], mut offset: usize) -> Result<usize> {
+    let mut cursor = offset;
+    let mut jumped = false;
+    for _ in 0..32 {
+        let length = *packet.get(cursor).context("truncated DNS name")?;
+        if length & 0xc0 == 0xc0 {
+            let second = *packet.get(cursor + 1).context("truncated compression pointer")?;
+            if !jumped { offset = cursor + 2; jumped = true; }
+            cursor = (((length & 0x3f) as usize) << 8) | second as usize;
+        } else if length & 0xc0 != 0 { bail!("invalid DNS label encoding"); }
+        else if length == 0 { return Ok(if jumped { offset } else { cursor + 1 }); }
+        else {
+            cursor = cursor.checked_add(1 + length as usize).context("DNS name overflow")?;
+            if cursor > packet.len() { bail!("truncated DNS label"); }
+        }
+    }
+    bail!("DNS compression pointer loop")
+}
+
+fn u16_at(data: &[u8], offset: usize) -> Result<u16> {
+    let v = data.get(offset..offset+2).context("truncated DNS u16")?;
+    Ok(u16::from_be_bytes([v[0], v[1]]))
+}
+fn u32_at(data: &[u8], offset: usize) -> Result<u32> {
+    let v = data.get(offset..offset+4).context("truncated DNS u32")?;
+    Ok(u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn builds_question() {
+        let packet = build_query("api.github.com", 1).unwrap();
+        assert_eq!(&packet[12..], &[3,b'a',b'p',b'i',7,b'g',b'i',b't',b'h',b'u',b'b',3,b'c',b'o',b'm',0,0,1,0,1]);
+    }
+    #[test]
+    fn parses_a_record() {
+        let packet = [0,1,0x81,0x80,0,1,0,1,0,0,0,0,1,b'a',0,0,1,0,1,0xc0,0x0c,0,1,0,1,0,0,0,60,0,4,1,2,3,4];
+        let (ips, ttl) = parse_response(&packet, 1).unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1,2,3,4))]);
+        assert_eq!(ttl, Duration::from_secs(60));
+    }
+}
