@@ -433,6 +433,7 @@ mod header_tests {
         headers.insert("te", HeaderValue::from_static("trailers"));
         headers.insert("trailer", HeaderValue::from_static("x-checksum"));
         headers.insert("upgrade", HeaderValue::from_static("websocket"));
+        headers.insert(header::EXPECT, HeaderValue::from_static("100-continue"));
         headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
 
         strip_hop_by_hop_headers(&mut headers);
@@ -443,6 +444,10 @@ mod header_tests {
         ] {
             assert!(!headers.contains_key(name), "header {name} was retained");
         }
+        // Expect is end-to-end request semantics, not a hop-by-hop field.
+        // Preserve it so the upstream HTTP/1 peer can participate in
+        // the 100-continue exchange.
+        assert_eq!(headers.get(header::EXPECT).unwrap(), "100-continue");
         assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "text/plain");
     }
 }
