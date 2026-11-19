@@ -62,7 +62,7 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, doma
     };
     if !method.eq_ignore_ascii_case("CONNECT") {
         let stream = crate::prefixed_io::PrefixedIo::new(client, header);
-        return crate::http_server::serve(stream, "http", config).await
+        return crate::http_server::serve(stream, "http", config, resolver, domains.to_vec()).await
             .with_context(|| format!("serving plain HTTP request from {peer}"));
     }
     let (host, port) = match parse_authority(authority) {
@@ -239,7 +239,7 @@ fn parse_authority(authority: &str) -> Result<(String, u16)> {
     Ok((host.to_owned(), port))
 }
 
-async fn connect_target(
+pub(crate) async fn connect_target(
     host: &str,
     port: u16,
     resolver: &DomainResolver,
