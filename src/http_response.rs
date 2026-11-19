@@ -93,6 +93,9 @@ fn host_from_authority(authority: &str) -> Result<String> {
         let (host, suffix) = rest.split_once(']').context("invalid bracketed IPv6 Host")?;
         if !suffix.is_empty() {
             let port = suffix.strip_prefix(':').context("invalid IPv6 Host port")?;
+            if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+                bail!("invalid IPv6 Host port");
+            }
             let port = port.parse::<u16>().context("invalid IPv6 Host port")?;
             if port == 0 { bail!("HTTP Host port must be non-zero"); }
         }
@@ -102,14 +105,37 @@ fn host_from_authority(authority: &str) -> Result<String> {
     if authority.matches(':').count() > 1 { bail!("IPv6 Host must use brackets"); }
     let host = match authority.rsplit_once(':') {
         Some((host, port)) => {
+            if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+                bail!("invalid Host port");
+            }
             let port = port.parse::<u16>().context("invalid Host port")?;
             if port == 0 { bail!("HTTP Host port must be non-zero"); }
             host
         }
         None => authority,
     };
-    if host.is_empty() { bail!("empty HTTP Host"); }
+    validate_http_hostname(host)?;
     Ok(host.to_owned())
+}
+
+/// Validate the ASCII DNS host syntax accepted by the proxy's domain matcher.
+/// Internationalized names must arrive in their IDNA ASCII (punycode) form.
+fn validate_http_hostname(host: &str) -> Result<()> {
+    if host.is_empty() || host.len() > 253 {
+        bail!("invalid HTTP hostname length");
+    }
+    let hostname = host.strip_suffix('.').unwrap_or(host);
+    if hostname.is_empty() {
+        bail!("empty HTTP hostname");
+    }
+    for label in hostname.split('.') {
+        if label.is_empty() || label.len() > 63
+            || !label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || label.starts_with('-') || label.ends_with('-') {
+            bail!("invalid HTTP hostname label");
+        }
+    }
+    Ok(())
 }
 
 fn reason_phrase(status: u16) -> &'static str {
@@ -147,6 +173,19 @@ mod tests {
     fn rejects_duplicate_host_headers() {
         assert!(parse_host_header(["Host: one.example", "host: two.example"].into_iter()).is_err());
         assert_eq!(parse_host_header(["X-Test: yes", "Host: one.example"].into_iter()).unwrap(), Some("one.example"));
+    }
+
+    #[test]
+    fn rejects_malformed_http_host_names_and_ports() {
+        for authority in [
+            "", ".example.com", "example..com", "-bad.example", "bad-.example",
+            "bad_host.example", "example.com:+443", "example.com:abc",
+            "example.com:65536", "example.com:0", "[::1]:+443",
+        ] {
+            assert!(host_from_authority(authority).is_err(), "accepted {authority}");
+        }
+        assert_eq!(host_from_authority("example.com.:443").unwrap(), "example.com.");
+        assert_eq!(host_from_authority("xn--bcher-kva.example").unwrap(), "xn--bcher-kva.example");
     }
 
     #[test]
