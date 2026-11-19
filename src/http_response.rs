@@ -15,6 +15,12 @@ pub async fn try_respond(stream: &mut TcpStream, header: &[u8], config: &AppConf
     if method.eq_ignore_ascii_case("CONNECT") { return Ok(false); }
 
     let host_header = parse_host_header(lines)?;
+    // HTTP/1.1 requires exactly one Host field even when the request-target
+    // uses absolute-form. The route layer separately verifies that both
+    // authorities identify the same virtual host.
+    if version == "HTTP/1.1" && host_header.is_none() {
+        bail!("HTTP/1.1 request is missing its Host header");
+    }
     let response = match route_request(method, target, host_header, "http", config)? {
         RouteDecision::Respond(response) => response,
         RouteDecision::Forward { .. } => return Ok(false),
