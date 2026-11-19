@@ -230,7 +230,22 @@ async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppCo
     } else {
         request.uri().to_string()
     };
-    let host = request.headers().get(header::HOST).and_then(|value| value.to_str().ok())
+    let host_header = request.headers().get(header::HOST);
+    if request.version() == http::Version::HTTP_2 {
+        let authority = request.uri().authority();
+        let host_values = request.headers().get_all(header::HOST);
+        if authority.is_none()
+            || host_values.iter().count() > 1
+            || host_header.is_some_and(|value| {
+                value.to_str().ok().is_none_or(|host| {
+                    !http_authorities_match(authority.expect("checked HTTP/2 authority"), host)
+                })
+            })
+        {
+            return empty_response(StatusCode::BAD_REQUEST);
+        }
+    }
+    let host = host_header.and_then(|value| value.to_str().ok())
         .or_else(|| request.uri().authority().map(|authority| authority.as_str()));
     if request.version() == http::Version::HTTP_11 && host.is_none() {
         return empty_response(StatusCode::BAD_REQUEST);
@@ -410,6 +425,16 @@ async fn forward_request_http2(
     let remaining = body_timeout.map(|duration| duration.saturating_sub(request_started.elapsed()));
     let response_body = TimeoutBody::new(boxed_body, remaining, connection_guard).boxed_unsync();
     Ok(Response::from_parts(response_parts, response_body))
+}
+
+/// Compare an HTTP/2 Host field with :authority. Host names are
+/// case-insensitive; an explicit port must match the authority exactly.
+fn http_authorities_match(authority: &http::uri::Authority, host: &str) -> bool {
+    let Ok(host_authority) = host.parse::<http::uri::Authority>() else {
+        return false;
+    };
+    authority.host().eq_ignore_ascii_case(host_authority.host())
+        && authority.port_u16() == host_authority.port_u16()
 }
 
 /// Detect an HTTP/1.1 protocol upgrade before the ordinary forwarding path
@@ -1357,6 +1382,19 @@ mod header_tests {
 
         let error = super::empty_response(http::StatusCode::BAD_GATEWAY);
         assert!(!error.headers().contains_key(header::CONNECTION));
+    }
+
+    #[test]
+    fn http2_host_must_match_authority() {
+        use super::http_authorities_match;
+
+        let authority = "Example.com:443".parse::<http::uri::Authority>().unwrap();
+        assert!(http_authorities_match(&authority, "example.COM:443"));
+        assert!(!http_authorities_match(&authority, "other.example:443"));
+        assert!(!http_authorities_match(&authority, "example.com"));
+        assert!(!http_authorities_match(&authority, "example.com:8443"));
+        assert!(!http_authorities_match(&authority, "user@example.com:443"));
+        assert!(!http_authorities_match(&authority, "example.com/path"));
     }
 
     #[test]
