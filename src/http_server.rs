@@ -59,23 +59,22 @@ where
 
 /// Serve one HTTP/1 connection over a plain TCP or decrypted TLS stream.
 /// Already-consumed bytes can be restored by wrapping the stream in PrefixedIo.
-pub async fn serve<S>(io: S, scheme: &'static str, config: Arc<AppConfig>, resolver: DomainResolver, domains: Vec<String>, tls_proxy: Arc<crate::http_proxy::TlsProxy>) -> anyhow::Result<()>
+pub async fn serve<S>(io: S, scheme: &'static str, config: Arc<AppConfig>, resolver: DomainResolver, tls_proxy: Arc<crate::http_proxy::TlsProxy>) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let service = service_fn(move |request: Request<Incoming>| {
         let config = Arc::clone(&config);
         let resolver = resolver.clone();
-        let domains = domains.clone();
         let tls_proxy = Arc::clone(&tls_proxy);
-        async move { Ok::<_, Infallible>(handle_request(request, scheme, &config, &resolver, &domains, &tls_proxy).await) }
+        async move { Ok::<_, Infallible>(handle_request(request, scheme, &config, &resolver, &tls_proxy).await) }
     });
     http1::Builder::new().keep_alive(false)
         .serve_connection(TokioIo::new(io), service).await?;
     Ok(())
 }
 
-async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppConfig, resolver: &DomainResolver, domains: &[String], tls_proxy: &crate::http_proxy::TlsProxy) -> Response<ResponseBody> {
+async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppConfig, resolver: &DomainResolver, tls_proxy: &crate::http_proxy::TlsProxy) -> Response<ResponseBody> {
     let method = request.method().clone();
     let target = request.uri().to_string();
     let host = request.headers().get(header::HOST).and_then(|value| value.to_str().ok());
@@ -92,7 +91,7 @@ async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppCo
                     return empty_response(StatusCode::BAD_GATEWAY);
                 }
             };
-            let forwarding = forward_request(request, uri, request_target, original_host, domain, timeout_duration, resolver, domains, config, tls_proxy);
+            let forwarding = forward_request(request, uri, request_target, original_host, domain, timeout_duration, resolver, config, tls_proxy);
             match timeout_duration {
                 Some(duration) => match tokio::time::timeout(duration, forwarding).await {
                     Ok(Ok(response)) => response,
@@ -126,7 +125,6 @@ async fn forward_request(
     domain: Option<crate::config::DomainConfig>,
     body_timeout: Option<Duration>,
     resolver: &DomainResolver,
-    domains: &[String],
     config: &AppConfig,
     tls_proxy: &crate::http_proxy::TlsProxy,
 ) -> anyhow::Result<Response<ResponseBody>> {
