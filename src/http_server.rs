@@ -63,7 +63,7 @@ where
             this.terminated = true;
             // Stop the Hyper connection driver immediately; otherwise it may
             // remain parked on a body that nobody will consume after timeout.
-            this.connection.take();
+            drop(this.connection.take());
             return Poll::Ready(Some(Err(Box::new(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "configured HTTP request timeout elapsed while streaming the response body",
@@ -74,12 +74,12 @@ where
                 this.terminated = true;
                 // The response is fully consumed. Do not leave an idle upstream
                 // keep-alive driver running after the last response frame.
-                this.connection.take();
+                drop(this.connection.take());
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(error))) => {
                 this.terminated = true;
-                this.connection.take();
+                drop(this.connection.take());
                 Poll::Ready(Some(Err(error)))
             }
             other => other,
