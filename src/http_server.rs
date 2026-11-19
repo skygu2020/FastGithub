@@ -237,7 +237,7 @@ async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppCo
         if authority.is_none()
             || host_values.iter().count() > 1
             || host_header.is_some_and(|value| {
-                value.to_str().ok().is_none_or(|host| {
+                value.to_str().ok().map_or(true, |host| {
                     !http_authorities_match(authority.expect("checked HTTP/2 authority"), host)
                 })
             })
