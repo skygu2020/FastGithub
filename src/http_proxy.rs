@@ -257,16 +257,20 @@ pub(crate) async fn connect_target(
     // request-scoped cancellation will be applied by the HTTP forwarding layer.
     let connect_timeout = CONNECT_TIMEOUT;
     let mut addresses = Vec::new();
+    // DomainConfig belongs to the original request host, even when Destination
+    // rewrites the upstream authority. Its IPAddress must therefore be tried
+    // before resolving (or directly connecting to) the destination host.
+    if let Some(configured) = domain_config.and_then(|value| value.ip_address.as_deref()) {
+        let ip = configured.parse::<IpAddr>()
+            .with_context(|| format!("invalid IPAddress '{configured}' for {host}"))?;
+        addresses.push(ip);
+    }
+
     if let Ok(ip) = host.parse::<IpAddr>() {
         addresses.push(ip);
     } else if domain_config.is_some() {
-        // Match the .NET implementation: a configured IP is the first candidate,
-        // not an exclusive override; DNS candidates remain available as fallback.
-        if let Some(configured) = domain_config.and_then(|value| value.ip_address.as_deref()) {
-            let ip = configured.parse::<IpAddr>()
-                .with_context(|| format!("invalid IPAddress '{configured}' for {host}"))?;
-            addresses.push(ip);
-        }
+        // A configured IP is the first candidate, not an exclusive override;
+        // resolver candidates remain available as fallback.
         match resolver.resolve(host, port).await {
             Ok(resolved) => addresses.extend(resolved),
             Err(error) if !addresses.is_empty() => {
