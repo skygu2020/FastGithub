@@ -199,7 +199,7 @@ fn parse_request_line(header: &[u8]) -> Result<(&str, &str)> {
     let method = fields.next().context("missing HTTP method")?;
     let authority = fields.next().context("missing HTTP request target")?;
     let version = fields.next().context("missing HTTP version")?;
-    if fields.next().is_some() || !version.starts_with("HTTP/1.") { bail!("invalid HTTP request line"); }
+    if fields.next().is_some() || !matches!(version, "HTTP/1.0" | "HTTP/1.1") { bail!("invalid HTTP request line"); }
     Ok((method, authority))
 }
 
@@ -352,5 +352,6 @@ mod tests {
     #[test]
     fn rejects_non_http_request_line() {
         assert!(parse_request_line(b"CONNECT github.com:443\r\n\r\n").is_err());
+        assert!(parse_request_line(b"CONNECT github.com:443 HTTP/1.x\r\n\r\n").is_err());
     }
 }

@@ -11,7 +11,7 @@ pub async fn try_respond(stream: &mut TcpStream, header: &[u8], config: &AppConf
     let method = fields.next().context("missing HTTP method")?;
     let target = fields.next().context("missing HTTP request target")?;
     let version = fields.next().context("missing HTTP version")?;
-    if fields.next().is_some() || !version.starts_with("HTTP/1.") { bail!("invalid HTTP request line"); }
+    if fields.next().is_some() || !matches!(version, "HTTP/1.0" | "HTTP/1.1") { bail!("invalid HTTP request line"); }
     if method.eq_ignore_ascii_case("CONNECT") { return Ok(false); }
 
     let host = match request_target_host(target)? {
