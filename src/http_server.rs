@@ -258,7 +258,6 @@ fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
         HeaderName::from_static("proxy-authenticate"),
         HeaderName::from_static("proxy-authorization"),
         HeaderName::from_static("te"),
-        HeaderName::from_static("trailer"),
         HeaderName::from_static("upgrade"),
     ] {
         headers.remove(name);
@@ -440,7 +439,7 @@ mod header_tests {
 
         for name in [
             "connection", "x-private", "keep-alive", "proxy-connection",
-            "proxy-authenticate", "proxy-authorization", "te", "trailer", "upgrade",
+            "proxy-authenticate", "proxy-authorization", "te", "upgrade",
         ] {
             assert!(!headers.contains_key(name), "header {name} was retained");
         }
@@ -448,6 +447,9 @@ mod header_tests {
         // Preserve it so the upstream HTTP/1 peer can participate in
         // the 100-continue exchange.
         assert_eq!(headers.get(header::EXPECT).unwrap(), "100-continue");
+        // Trailer declares end-to-end fields carried in the message body;
+        // unlike TE, it is not inherently hop-by-hop.
+        assert_eq!(headers.get("trailer").unwrap(), "x-checksum");
         assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "text/plain");
     }
 }
