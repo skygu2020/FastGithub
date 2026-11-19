@@ -204,17 +204,40 @@ fn parse_request_line(header: &[u8]) -> Result<(&str, &str)> {
 }
 
 fn parse_authority(authority: &str) -> Result<(String, u16)> {
-    if authority.contains("://") || authority.contains('/') || authority.contains('@') {
-        bail!("CONNECT target must be host:port authority");
+    if authority.is_empty()
+        || authority.bytes().any(|byte| byte <= 0x20 || byte >= 0x7f)
+        || authority.contains("://")
+        || authority.contains(['/', '\\\\', '@', '?', '#']) {
+        bail!("CONNECT target must be a valid host:port authority");
     }
+
     let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
         let (host, suffix) = rest.split_once(']').context("invalid bracketed IPv6 authority")?;
-        (host, suffix.strip_prefix(':').context("CONNECT target requires a port")?)
+        host.parse::<std::net::Ipv6Addr>().context("invalid CONNECT IPv6 address")?;
+        let port = suffix.strip_prefix(':').context("CONNECT target requires a port")?;
+        if port.contains(':') || port.is_empty() {
+            bail!("invalid CONNECT port");
+        }
+        (host, port)
     } else {
-        authority.rsplit_once(':').context("CONNECT target requires host:port")?
+        let (host, port) = authority.rsplit_once(':')
+            .context("CONNECT target requires host:port")?;
+        if host.contains(':') {
+            bail!("IPv6 CONNECT targets must use brackets");
+        }
+        if host.is_empty() || !host.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-')
+        }) {
+            bail!("invalid CONNECT hostname");
+        }
+        (host, port)
     };
-    let port: u16 = port.parse().context("invalid CONNECT port")?;
-    if host.is_empty() || port == 0 { bail!("CONNECT host and port must be non-empty"); }
+
+    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("invalid CONNECT port");
+    }
+    let port: u16 = port.parse().context("CONNECT port is outside the valid range")?;
+    if port == 0 { bail!("CONNECT port must be non-zero"); }
     Ok((host.to_owned(), port))
 }
 
@@ -316,6 +339,14 @@ mod tests {
         assert!(parse_authority("github.com").is_err());
         assert!(parse_authority("github.com:0").is_err());
         assert!(parse_authority("user@github.com:443").is_err());
+        assert!(parse_authority("2001:db8::1:443").is_err());
+        assert!(parse_authority("[not-ipv6]:443").is_err());
+        assert!(parse_authority("[::1]443").is_err());
+        assert!(parse_authority("[::1]:443:9").is_err());
+        assert!(parse_authority("bad_host:443").is_err());
+        assert!(parse_authority("github.com: 443").is_err());
+        assert!(parse_authority("github.com:+443").is_err());
+        assert!(parse_authority("github.com:65536").is_err());
     }
 
     #[test]
