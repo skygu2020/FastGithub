@@ -18,6 +18,7 @@
 - 未拦截的非 TLS CONNECT 仍作为原始 TCP 隧道转发。
 - 上游使用 Hyper HTTP/1 client handshake 和 `send_request`，请求体、响应体通过 Hyper body 流转发，不把整份响应缓存到内存。
 - 请求和响应的 hop-by-hop headers，以及 `Connection` 指定的逐跳字段会被移除；请求中的端到端 `Expect` 和 `Trailer` 声明会保留（`TE` 仍按逐跳字段移除）；响应 Server 标记为 `FastGithub`。
+- 响应体包装层逐 frame 透传 data 和 trailer frame；单元测试覆盖 `TimeoutBody` 不吞掉 `x-checksum` trailer。该测试验证包装层，不等同于真实 TCP/Hyper 上下游端到端互操作验证。
 - 当前 HTTP/1 server 显式关闭 keep-alive：每条客户端连接只服务一个请求后关闭。不是持久连接实现。
 
 ### DomainConfig 处理
