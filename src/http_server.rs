@@ -608,6 +608,57 @@ mod header_tests {
     }
 
     #[tokio::test]
+    async fn canceling_gated_expect_request_aborts_upstream_driver() {
+        use bytes::Bytes;
+        use http::{header, HeaderValue, Request};
+        use http_body_util::Full;
+        use hyper::client::conn::http1 as client_http1;
+        use hyper_util::rt::TokioIo;
+        use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener, sync::oneshot};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                head.push(byte[0]);
+            }
+            // No 100 is sent. Cancellation must close the upstream socket
+            // without ever polling or transmitting the gated request body.
+            assert!(String::from_utf8_lossy(&head).to_ascii_lowercase().contains("expect: 100-continue"));
+            let mut body_byte = [0_u8; 1];
+            assert_eq!(stream.read(&mut body_byte).await.unwrap(), 0);
+        });
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) = client_http1::handshake(TokioIo::new(stream)).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await });
+        let connection_guard = super::UpstreamConnectionGuard(driver.abort_handle());
+
+        let (_continue_tx, continue_rx) = oneshot::channel();
+        let body = super::ExpectContinueBody::new(
+            Full::new(Bytes::from_static(b"payload")).map_err(|never| match never {}),
+            Some(continue_rx),
+        );
+        let mut request = Request::new(body);
+        *request.method_mut() = http::Method::POST;
+        *request.uri_mut() = "/upload".parse().unwrap();
+        request.headers_mut().insert(header::HOST, HeaderValue::from_static("localhost"));
+        request.headers_mut().insert(header::EXPECT, HeaderValue::from_static("100-continue"));
+
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            sender.send_request(request),
+        ).await.is_err());
+        drop(connection_guard);
+        assert!(driver.await.unwrap_err().is_cancelled());
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn gated_expect_body_stops_when_upstream_rejects_without_continue() {
         use bytes::Bytes;
         use http::{header, HeaderValue, Request, StatusCode};
