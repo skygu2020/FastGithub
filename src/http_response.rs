@@ -77,7 +77,7 @@ fn parse_host_header<'a>(lines: impl Iterator<Item = &'a str>) -> Result<Option<
         if name.is_empty() || !name.bytes().all(is_http_token) {
             bail!("invalid HTTP header field name");
         }
-        if value.bytes().any(|byte| (byte < 0x20 && byte != b'\\t') || byte == 0x7f) {
+        if value.bytes().any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f) {
             bail!("invalid control character in HTTP header value");
         }
         if name.eq_ignore_ascii_case("host") {
