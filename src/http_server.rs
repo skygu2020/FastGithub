@@ -376,6 +376,81 @@ mod header_tests {
     }
 
     #[tokio::test]
+    async fn hyper_http1_server_sends_continue_only_when_request_body_is_polled() {
+        use bytes::Bytes;
+        use http::Response;
+        use http_body_util::{BodyExt, Full};
+        use hyper::{server::conn::http1 as server_http1, service::service_fn, Request};
+        use hyper_util::rt::TokioIo;
+        use std::convert::Infallible;
+        use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener, sync::oneshot};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (received_tx, received_rx) = oneshot::channel();
+        let (poll_tx, poll_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut received_tx = Some(received_tx);
+            let mut poll_rx = Some(poll_rx);
+            let service = service_fn(move |request: Request<hyper::body::Incoming>| {
+                let received_tx = received_tx.take().unwrap();
+                let poll_rx = poll_rx.take().unwrap();
+                async move {
+                    received_tx.send(()).unwrap();
+                    // Do not touch Incoming until the test explicitly permits it.
+                    poll_rx.await.unwrap();
+                    let mut body = request.into_body();
+                    while let Some(frame) = body.frame().await {
+                        frame.unwrap();
+                    }
+                    Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                }
+            });
+            server_http1::Builder::new()
+                .keep_alive(false)
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream.write_all(
+            b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 7\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+        ).await.unwrap();
+        received_rx.await.unwrap();
+
+        // Merely receiving the request head must not emit an interim response.
+        let mut probe = [0_u8; 1];
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            stream.read(&mut probe),
+        ).await.is_err());
+
+        poll_tx.send(()).unwrap();
+        let mut interim = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !interim.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            interim.push(byte[0]);
+        }
+        assert!(String::from_utf8_lossy(&interim).starts_with("HTTP/1.1 100"));
+
+        stream.write_all(b"payload").await.unwrap();
+        let mut final_head = Vec::new();
+        while !final_head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            final_head.push(byte[0]);
+        }
+        assert!(String::from_utf8_lossy(&final_head).starts_with("HTTP/1.1 200"));
+        let mut response_body = [0_u8; 2];
+        stream.read_exact(&mut response_body).await.unwrap();
+        assert_eq!(&response_body, b"ok");
+        assert_eq!(StatusCode::OK.as_u16(), 200);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn hyper_http1_client_reports_upstream_informational_responses() {
         use bytes::Bytes;
         use http::{header, HeaderValue, Request, StatusCode};
