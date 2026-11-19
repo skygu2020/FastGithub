@@ -154,7 +154,9 @@ impl TlsProxy {
         domain_config: Option<&crate::config::DomainConfig>,
     ) -> Result<SslStream<TcpStream>> {
         let configured_sni = domain_config.and_then(|rule| rule.tls_sni_value(upstream_host, upstream_ip));
-        let disable_sni = domain_config.is_some_and(|rule| rule.tls_sni == Some(false));
+        // A configured DomainConfig defaults TlsSni to false in the .NET
+        // implementation. Unconfigured hosts retain normal TLS SNI behavior.
+        let disable_sni = domain_config.is_some_and(|rule| rule.tls_sni != Some(true));
         let ignore_name_mismatch = domain_config.is_some_and(|rule| rule.tls_ignore_name_mismatch == Some(true));
         let mut connect_config = self.connector.configure()?;
         connect_config.set_use_server_name_indication(!disable_sni);
