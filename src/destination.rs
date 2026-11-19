@@ -7,7 +7,7 @@ pub fn resolve_destination(scheme: &str, host: &str, destination: &str) -> Resul
     if !matches!(scheme, "http" | "https") {
         bail!("unsupported original request scheme '{scheme}'");
     }
-    if host.is_empty() || host.contains(['/', '\\', '?', '#', '@', '\r', '\n']) {
+    if host.is_empty() || host.chars().any(|character| matches!(character, '/' | '\\' | '?' | '#' | '@' | '\r' | '\n')) {
         bail!("invalid original request host");
     }
     let base = Url::parse(&format!("{scheme}://{host}/"))
