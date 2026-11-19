@@ -377,6 +377,35 @@ mod header_tests {
     }
 
     #[tokio::test]
+    async fn upstream_body_error_releases_connection_driver() {
+        use super::{BoxError, TimeoutBody};
+        use bytes::Bytes;
+        use http_body::Frame;
+        use std::{io, pin::Pin, task::{Context, Poll}};
+
+        struct FailingBody;
+        impl http_body::Body for FailingBody {
+            type Data = Bytes;
+            type Error = BoxError;
+
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                Poll::Ready(Some(Err(Box::new(io::Error::other("upstream body failed")))))
+            }
+        }
+
+        let task = tokio::spawn(std::future::pending::<()>());
+        let guard = super::UpstreamConnectionGuard(task.abort_handle());
+        let mut body = TimeoutBody::new(FailingBody, None, guard);
+
+        assert!(body.frame().await.unwrap().is_err());
+        assert!(body.frame().await.is_none());
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
     async fn dropping_response_guard_aborts_upstream_driver() {
         let task = tokio::spawn(std::future::pending::<()>());
         let guard = super::UpstreamConnectionGuard(task.abort_handle());
