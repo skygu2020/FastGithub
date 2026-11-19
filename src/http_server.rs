@@ -376,6 +376,59 @@ mod header_tests {
     }
 
     #[tokio::test]
+    async fn hyper_http1_client_reports_upstream_informational_responses() {
+        use bytes::Bytes;
+        use http::{header, HeaderValue, Request, StatusCode};
+        use http_body_util::Full;
+        use hyper::{client::conn::http1 as client_http1, ext::on_informational};
+        use hyper_util::rt::TokioIo;
+        use std::sync::{Arc, Mutex};
+        use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener};
+
+        // Hyper's server Service API only returns one final Response, so use a
+        // tiny raw peer to emit a real 100 Continue followed by the final reply.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request_head = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request_head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                request_head.push(byte[0]);
+            }
+            assert!(String::from_utf8_lossy(&request_head)
+                .to_ascii_lowercase()
+                .contains("expect: 100-continue"));
+            stream.write_all(
+                b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            ).await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) = client_http1::handshake(TokioIo::new(stream)).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await.unwrap() });
+        let informational = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&informational);
+        let mut request = Request::new(Full::new(Bytes::from_static(b"payload")));
+        *request.method_mut() = http::Method::POST;
+        *request.uri_mut() = "/upload".parse().unwrap();
+        request.headers_mut().insert(header::HOST, HeaderValue::from_static("localhost"));
+        request.headers_mut().insert(header::EXPECT, HeaderValue::from_static("100-continue"));
+        on_informational(&mut request, move |response| {
+            observed.lock().unwrap().push(response.status());
+        });
+
+        let response = sender.send_request(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(informational.lock().unwrap().as_slice(), &[StatusCode::CONTINUE]);
+        drop(response);
+        drop(sender);
+        driver.await.unwrap().unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn hyper_http1_loopback_preserves_request_and_response_trailers() {
         use super::BoxError;
         use bytes::Bytes;
