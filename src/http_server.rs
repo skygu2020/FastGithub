@@ -2,8 +2,14 @@ use crate::{config::AppConfig, http_route::{route_request, RouteDecision}, resol
 use bytes::Bytes;
 use http::{header, HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode};
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
-use hyper::{body::Incoming, client::conn::http1 as client_http1, server::conn::http1, service::service_fn, Request};
-use hyper_util::rt::TokioIo;
+use hyper::{
+    body::Incoming,
+    client::conn::{http1 as client_http1, http2 as client_http2},
+    server::conn::{http1, http2 as server_http2},
+    service::service_fn,
+    Request,
+};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use anyhow::Context;
 use std::{convert::Infallible, error::Error, future::Future, io, pin::Pin, sync::Arc, task::{Context as TaskContext, Poll}, time::Duration};
 use tokio::{io::{AsyncRead, AsyncWrite}, sync::oneshot, time::Sleep};
@@ -185,10 +191,40 @@ where
     Ok(())
 }
 
+/// Serve decrypted TLS traffic negotiated as HTTP/2. The same request router
+/// and response/body pipeline are shared with the HTTP/1 entry point.
+pub async fn serve_http2<S>(io: S, scheme: &'static str, config: Arc<AppConfig>, resolver: DomainResolver, domains: Vec<String>, tls_proxy: Arc<crate::http_proxy::TlsProxy>) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let service = service_fn(move |request: Request<Incoming>| {
+        let config = Arc::clone(&config);
+        let resolver = resolver.clone();
+        let domains = domains.clone();
+        let tls_proxy = Arc::clone(&tls_proxy);
+        async move { Ok::<_, Infallible>(handle_request(request, scheme, &config, &resolver, &domains, &tls_proxy).await) }
+    });
+    server_http2::Builder::new(TokioExecutor::new())
+        .serve_connection(TokioIo::new(io), service)
+        .await?;
+    Ok(())
+}
+
 async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppConfig, resolver: &DomainResolver, domains: &[String], tls_proxy: &crate::http_proxy::TlsProxy) -> Response<ResponseBody> {
     let method = request.method().clone();
-    let target = request.uri().to_string();
-    let host = request.headers().get(header::HOST).and_then(|value| value.to_str().ok());
+    let target = if request.version() == http::Version::HTTP_2 {
+        match request.uri().authority() {
+            Some(authority) => {
+                let path = request.uri().path_and_query().map(|value| value.as_str()).unwrap_or("/");
+                format!("{scheme}://{authority}{path}")
+            }
+            None => request.uri().to_string(),
+        }
+    } else {
+        request.uri().to_string()
+    };
+    let host = request.headers().get(header::HOST).and_then(|value| value.to_str().ok())
+        .or_else(|| request.uri().authority().map(|authority| authority.as_str()));
     if request.version() == http::Version::HTTP_11 && host.is_none() {
         return empty_response(StatusCode::BAD_REQUEST);
     }
@@ -255,13 +291,20 @@ async fn forward_request(
     let host = uri.host_str().context("upstream URI has no host")?;
     let port = uri.port().unwrap_or(if uri.scheme() == "https" { 443 } else { 80 });
     let (stream, upstream_ip) = crate::http_proxy::connect_target(host, port, resolver, domains, config, domain.as_ref()).await?;
-    let io: Box<dyn AsyncIo> = if uri.scheme() == "https" {
-        Box::new(tls_proxy.connect_upstream(stream, host, upstream_ip, domain.as_ref()).await?)
+    let (io, upstream_http2): (Box<dyn AsyncIo>, bool) = if uri.scheme() == "https" {
+        let tls = tls_proxy.connect_upstream(stream, host, upstream_ip, domain.as_ref()).await?;
+        let use_http2 = tls.ssl().selected_alpn_protocol() == Some(b"h2");
+        (Box::new(tls), use_http2)
     } else if uri.scheme() == "http" {
-        Box::new(stream)
+        (Box::new(stream), false)
     } else {
         anyhow::bail!("unsupported upstream URI scheme '{}'", uri.scheme());
     };
+    if upstream_http2 {
+        return forward_request_http2(
+            request, uri, request_target, original_host, body_timeout, request_started, io,
+        ).await;
+    }
     let (mut sender, connection) = client_http1::handshake(TokioIo::new(io)).await?;
     let connection_task = tokio::spawn(async move {
         if let Err(error) = connection.await {
@@ -307,6 +350,58 @@ async fn forward_request(
     Ok(Response::from_parts(response_parts, response_body))
 }
 
+async fn forward_request_http2(
+    request: Request<Incoming>,
+    uri: url::Url,
+    request_target: String,
+    original_host: String,
+    body_timeout: Option<Duration>,
+    request_started: tokio::time::Instant,
+    io: Box<dyn AsyncIo>,
+) -> anyhow::Result<Response<ResponseBody>> {
+    let (mut sender, connection) =
+        client_http2::handshake(TokioExecutor::new(), TokioIo::new(io)).await?;
+    let connection_task = tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            tracing::debug!(%error, "upstream HTTP/2 connection ended");
+        }
+    });
+    let connection_guard = UpstreamConnectionGuard(connection_task.abort_handle());
+
+    let (mut parts, body) = request.into_parts();
+    let host = uri.host_str().context("upstream HTTP/2 URI has no host")?;
+    parts.uri = format!("{}://{}{}", uri.scheme(), host_authority(&uri), request_target).parse()
+        .context("building upstream HTTP/2 request URI")?;
+    parts.version = http::Version::HTTP_2;
+    strip_hop_by_hop_headers(&mut parts.headers);
+    parts.headers.remove(header::HOST);
+    append_fastgithub_user_agent(&mut parts.headers)?;
+    tracing::debug!(%original_host, upstream = %uri, "forwarding HTTP/2 request");
+
+    let expect_continue = should_gate_expect_continue(&parts.headers, &body);
+    let (continue_tx, continue_rx) = oneshot::channel();
+    let gated_body = ExpectContinueBody::new(body, expect_continue.then_some(continue_rx));
+    let mut upstream_request = Request::from_parts(parts, gated_body);
+    if expect_continue {
+        let continue_sender = std::sync::Mutex::new(Some(continue_tx));
+        hyper::ext::on_informational(&mut upstream_request, move |response| {
+            if response.status() == StatusCode::CONTINUE {
+                if let Some(sender) = continue_sender.lock().expect("continue sender mutex").take() {
+                    let _ = sender.send(());
+                }
+            }
+        });
+    }
+
+    let upstream_response = sender.send_request(upstream_request).await?;
+    let (mut response_parts, response_body) = upstream_response.into_parts();
+    strip_hop_by_hop_headers(&mut response_parts.headers);
+    response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
+    let boxed_body = response_body.map_err(|error| Box::new(error) as BoxError).boxed_unsync();
+    let remaining = body_timeout.map(|duration| duration.saturating_sub(request_started.elapsed()));
+    let response_body = TimeoutBody::new(boxed_body, remaining, connection_guard).boxed_unsync();
+    Ok(Response::from_parts(response_parts, response_body))
+}
 
 /// Detect an HTTP/1.1 protocol upgrade before the ordinary forwarding path
 /// strips hop-by-hop headers.
