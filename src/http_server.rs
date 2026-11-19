@@ -438,6 +438,20 @@ fn upgrade_protocols(headers: &HeaderMap) -> Vec<String> {
         .collect()
 }
 
+/// A 101 response must select exactly one protocol, and it must be one
+/// offered by the downstream client. Accepting a list here would allow a
+/// malformed response to switch protocols ambiguously.
+fn is_valid_upgrade_response(headers: &HeaderMap, requested_protocols: &[String]) -> bool {
+    if !has_connection_token(headers, "upgrade") {
+        return false;
+    }
+    let accepted_protocols = upgrade_protocols(headers);
+    accepted_protocols.len() == 1
+        && requested_protocols.iter().any(|requested| {
+            requested.eq_ignore_ascii_case(&accepted_protocols[0])
+        })
+}
+
 /// Keep only the HTTP/1 fields required to negotiate an upgrade. Connection
 /// remains hop-by-hop, but its value is normalized to the Upgrade token.
 fn preserve_upgrade_hop_by_hop_headers(headers: &mut HeaderMap) {
@@ -522,12 +536,7 @@ async fn forward_upgrade_request(
         return Ok(Response::from_parts(response_parts, response_body));
     }
 
-    let accepted_protocols = upgrade_protocols(upstream_response.headers());
-    let valid_upgrade = has_connection_token(upstream_response.headers(), "upgrade")
-        && accepted_protocols.iter().any(|accepted| {
-            requested_protocols.iter().any(|requested| requested.eq_ignore_ascii_case(accepted))
-        });
-    if !valid_upgrade {
+    if !is_valid_upgrade_response(upstream_response.headers(), &requested_protocols) {
         anyhow::bail!("upstream returned an invalid or unrequested protocol upgrade");
     }
 
@@ -1348,6 +1357,30 @@ mod header_tests {
 
         let error = super::empty_response(http::StatusCode::BAD_GATEWAY);
         assert!(!error.headers().contains_key(header::CONNECTION));
+    }
+
+    #[test]
+    fn validates_that_upstream_selects_exactly_one_requested_upgrade_protocol() {
+        use super::is_valid_upgrade_response;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+        headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+        let requested = vec!["websocket".to_owned(), "h2c".to_owned()];
+        assert!(is_valid_upgrade_response(&headers, &requested));
+
+        headers.insert(header::UPGRADE, HeaderValue::from_static("WebSocket"));
+        assert!(is_valid_upgrade_response(&headers, &requested));
+
+        headers.insert(header::UPGRADE, HeaderValue::from_static("websocket, h2c"));
+        assert!(!is_valid_upgrade_response(&headers, &requested));
+
+        headers.insert(header::UPGRADE, HeaderValue::from_static("not-offered"));
+        assert!(!is_valid_upgrade_response(&headers, &requested));
+
+        headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+        headers.remove(header::CONNECTION);
+        assert!(!is_valid_upgrade_response(&headers, &requested));
     }
 
     #[test]
