@@ -63,6 +63,11 @@ pub fn route_request(
         // proxy should reject, including a zero port or malformed DNS labels.
         let raw_authority = absolute_authority(request_target)?;
         parse_host_authority(raw_authority)?;
+        if let Some(host_header) = host_header {
+            if !authorities_match(raw_authority, host_header)? {
+                bail!("Host header does not match absolute-form request-target authority");
+            }
+        }
         Some(uri)
     };
 
@@ -125,6 +130,36 @@ fn absolute_authority(request_target: &str) -> Result<&str> {
         bail!("absolute-form request-target has an empty authority");
     }
     Ok(authority)
+}
+
+/// Compare absolute-form authority with Host without allowing the Host
+/// field to redirect rule selection to a different virtual host.
+fn authorities_match(left: &str, right: &str) -> Result<bool> {
+    let left_host = parse_host_authority(left)?;
+    let right_host = parse_host_authority(right)?;
+    let left_port = authority_port(left)?;
+    let right_port = authority_port(right)?;
+    Ok(left_host.eq_ignore_ascii_case(&right_host) && left_port == right_port)
+}
+
+fn authority_port(authority: &str) -> Result<Option<u16>> {
+    let suffix = if let Some(rest) = authority.strip_prefix('[') {
+        let (_, suffix) = rest.split_once(']').context("invalid bracketed authority")?;
+        suffix
+    } else {
+        if authority.matches(':').count() > 1 {
+            bail!("IPv6 authority must use brackets");
+        }
+        match authority.rsplit_once(':') {
+            Some((_, port)) => return Ok(Some(port.parse::<u16>().context("invalid authority port")?)),
+            None => return Ok(None),
+        }
+    };
+    if suffix.is_empty() {
+        return Ok(None);
+    }
+    let port = suffix.strip_prefix(':').context("invalid bracketed authority suffix")?;
+    Ok(Some(port.parse::<u16>().context("invalid authority port")?))
 }
 
 fn is_http_token(byte: u8) -> bool {
@@ -285,6 +320,14 @@ mod tests {
     fn rejects_zero_port_in_host_authority() {
         let cfg = config(&[]);
         assert!(route_request("GET", "/", Some("example.com:0"), "http", &cfg).is_err());
+    }
+
+    #[test]
+    fn rejects_mismatched_absolute_form_host_header() {
+        let cfg = config(&[]);
+        assert!(route_request("GET", "http://example.com:8080/path", Some("other.example:8080"), "http", &cfg).is_err());
+        assert!(route_request("GET", "http://example.com:8080/path", Some("example.com:80"), "http", &cfg).is_err());
+        assert!(route_request("GET", "http://EXAMPLE.com:8080/path", Some("example.com:8080"), "http", &cfg).is_ok());
     }
 
     #[test]
