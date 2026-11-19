@@ -341,10 +341,21 @@ mod header_tests {
         let inner = Full::new(Bytes::from_static(b"response"))
             .map_err(|never| match never {})
             .boxed_unsync();
-        let mut body = TimeoutBody::new(inner, std::time::Duration::ZERO);
+        let connection_task = tokio::spawn(std::future::pending::<()>());
+        let connection_guard = super::UpstreamConnectionGuard(connection_task.abort_handle());
+        let mut body = TimeoutBody::new(inner, Some(std::time::Duration::ZERO), connection_guard);
 
         assert!(body.frame().await.expect("timeout error frame").is_err());
         assert!(body.frame().await.is_none());
+        assert!(connection_task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn dropping_response_guard_aborts_upstream_driver() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        let guard = super::UpstreamConnectionGuard(task.abort_handle());
+        drop(guard);
+        assert!(task.await.unwrap_err().is_cancelled());
     }
 
     #[test]
