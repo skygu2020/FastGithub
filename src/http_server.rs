@@ -5,13 +5,57 @@ use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::{body::Incoming, client::conn::http1 as client_http1, server::conn::http1, service::service_fn, Request};
 use hyper_util::rt::TokioIo;
 use anyhow::Context;
-use std::{convert::Infallible, error::Error, sync::Arc};
-use tokio::io::{AsyncRead, AsyncWrite};
+use std::{convert::Infallible, error::Error, io, pin::Pin, sync::Arc, task::{Context as TaskContext, Poll}, time::Duration};
+use tokio::{io::{AsyncRead, AsyncWrite}, time::Sleep};
 
 type BoxError = Box<dyn Error + Send + Sync>;
 trait AsyncIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AsyncIo for T {}
 type ResponseBody = UnsyncBoxBody<Bytes, BoxError>;
+
+
+/// Enforce the configured timeout while the upstream response body is streamed.
+/// The forwarding future has its own timeout for DNS, connect, TLS and response headers.
+struct TimeoutBody<B> {
+    inner: Pin<Box<B>>,
+    sleep: Pin<Box<Sleep>>,
+}
+
+impl<B> TimeoutBody<B> {
+    fn new(inner: B, duration: Duration) -> Self {
+        Self { inner: Box::pin(inner), sleep: Box::pin(tokio::time::sleep(duration)) }
+    }
+}
+
+impl<B> http_body::Body for TimeoutBody<B>
+where
+    B: http_body::Body<Data = Bytes, Error = BoxError>,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.sleep.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Some(Err(Box::new(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "configured HTTP response-body timeout elapsed",
+            )))));
+        }
+        this.inner.as_mut().poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.as_ref().get_ref().is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.as_ref().get_ref().size_hint()
+    }
+}
 
 /// Serve one HTTP/1 connection over a plain TCP or decrypted TLS stream.
 /// Already-consumed bytes can be restored by wrapping the stream in PrefixedIo.
@@ -48,7 +92,7 @@ async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppCo
                     return empty_response(StatusCode::BAD_GATEWAY);
                 }
             };
-            let forwarding = forward_request(request, uri, request_target, original_host, domain, resolver, domains, config, tls_proxy);
+            let forwarding = forward_request(request, uri, request_target, original_host, domain, timeout_duration, resolver, domains, config, tls_proxy);
             match timeout_duration {
                 Some(duration) => match tokio::time::timeout(duration, forwarding).await {
                     Ok(Ok(response)) => response,
@@ -80,6 +124,7 @@ async fn forward_request(
     request_target: String,
     original_host: String,
     domain: Option<crate::config::DomainConfig>,
+    body_timeout: Option<Duration>,
     resolver: &DomainResolver,
     domains: &[String],
     config: &AppConfig,
@@ -114,7 +159,11 @@ async fn forward_request(
     strip_hop_by_hop_headers(&mut response_parts.headers);
     response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
     let boxed_body = response_body.map_err(|error| Box::new(error) as BoxError).boxed_unsync();
-    Ok(Response::from_parts(response_parts, boxed_body))
+    let response_body = match body_timeout {
+        Some(duration) => TimeoutBody::new(boxed_body, duration).boxed_unsync(),
+        None => boxed_body,
+    };
+    Ok(Response::from_parts(response_parts, response_body))
 }
 
 /// Remove hop-by-hop fields, including every field nominated by Connection.
