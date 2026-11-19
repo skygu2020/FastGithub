@@ -72,25 +72,24 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, doma
             return Err(error);
         }
     };
-    let (mut upstream, upstream_ip) = match connect_target(&host, port, &resolver, domains, &config).await {
-        Ok(connection) => connection,
-        Err(error) => {
-            let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").await;
-            return Err(error).with_context(|| format!("connecting to {host}:{port}"));
-        }
-    };
     client.write_all(b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: FastGithub-Rust\r\n\r\n").await?;
     tracing::debug!(%peer, %host, port, "HTTP CONNECT tunnel established");
     let is_tls = match timeout(HEADER_TIMEOUT, sniff_tls(&client)).await {
         Ok(result) => result?,
         Err(_) => bail!("timed out waiting for CONNECT tunnel data"),
     };
-    let (up, down) = if is_tls {
+    if is_tls {
+        // Intercepted TLS requests are routed by the decrypted HTTP Host and
+        // configured Destination; the CONNECT authority is not an upstream.
         tls_proxy.intercept(client, host.as_str(), Arc::clone(&config), resolver.clone(), domains.to_vec(), Arc::clone(&tls_proxy)).await?;
-        return Ok(())
-    } else {
-        tokio::io::copy_bidirectional(&mut client, &mut upstream).await?
-    };
+        return Ok(());
+    }
+
+    // A raw CONNECT tunnel has no HTTP request to route, so connect to its
+    // authority only after determining that the client is not starting TLS.
+    let (mut upstream, _upstream_ip) = connect_target(&host, port, &resolver, domains, &config)
+        .await.with_context(|| format!("connecting to raw CONNECT target {host}:{port}"))?;
+    let (up, down) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
     tracing::debug!(%peer, %host, port, client_to_upstream = up, upstream_to_client = down, tls_intercepted = is_tls, "HTTP CONNECT tunnel closed");
     Ok(())
 }
