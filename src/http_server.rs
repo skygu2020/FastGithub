@@ -171,6 +171,13 @@ where
     expects_continue(headers) && !body.is_end_stream()
 }
 
+/// Hyper currently does not expose HTTP/2 server-side 100-Continue emission.
+/// Reject this expectation explicitly rather than leaving an HTTP/2 client
+/// waiting forever while the proxy waits for its request body.
+fn http2_expect_continue_unsupported(version: http::Version, headers: &HeaderMap) -> bool {
+    version == http::Version::HTTP_2 && expects_continue(headers)
+}
+
 /// Serve one HTTP/1 connection over a plain TCP or decrypted TLS stream.
 /// Already-consumed bytes can be restored by wrapping the stream in PrefixedIo.
 pub async fn serve<S>(io: S, scheme: &'static str, config: Arc<AppConfig>, resolver: DomainResolver, domains: Vec<String>, tls_proxy: Arc<crate::http_proxy::TlsProxy>) -> anyhow::Result<()>
@@ -231,6 +238,9 @@ async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppCo
     match route_request(method.as_str(), &target, host, scheme, config) {
         Ok(RouteDecision::Respond(rule)) => configured_response(&method, rule),
         Ok(RouteDecision::Forward { uri, request_target, domain, original_host }) => {
+            if http2_expect_continue_unsupported(request.version(), request.headers()) {
+                return empty_response(StatusCode::EXPECTATION_FAILED);
+            }
             let timeout_duration = match domain.as_ref().map(|rule| rule.request_timeout()).transpose() {
                 Ok(value) => value.flatten(),
                 Err(error) => {
@@ -1477,6 +1487,17 @@ mod header_tests {
         drop(sender);
         driver.await.unwrap();
         server.await.unwrap();
+    }
+
+    #[test]
+    fn http2_expect_continue_is_rejected_instead_of_hanging() {
+        use super::http2_expect_continue_unsupported;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::EXPECT, HeaderValue::from_static("100-continue"));
+        assert!(http2_expect_continue_unsupported(http::Version::HTTP_2, &headers));
+        assert!(!http2_expect_continue_unsupported(http::Version::HTTP_11, &headers));
+        headers.remove(header::EXPECT);
+        assert!(!http2_expect_continue_unsupported(http::Version::HTTP_2, &headers));
     }
 
 }
