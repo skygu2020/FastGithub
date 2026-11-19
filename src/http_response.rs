@@ -16,22 +16,20 @@ pub async fn try_respond(stream: &mut TcpStream, header: &[u8], config: &AppConf
 
     let host = match request_target_host(target)? {
         Some(host) => host,
-        None => {
-            let host_header = lines.find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("host").then_some(value.trim())
-            });
-            match host_header {
-                Some(value) => host_from_authority(value)?,
-                None => return Ok(false),
-            }
-        }
+        None => match parse_host_header(lines)? {
+            Some(value) => host_from_authority(value)?,
+            None => return Ok(false),
+        },
     };
     let Some(response) = config.domain_config(&host).and_then(|domain| domain.response.as_ref()) else {
         return Ok(false);
     };
-    if !(100..=999).contains(&response.status_code) { bail!("configured Response.StatusCode must be between 100 and 999"); }
-    if response.content_type.chars().any(|character| character == '\r' || character == '\n') { bail!("configured Response.ContentType contains a line break"); }
+    // A 1xx response is provisional and requires a subsequent final response;
+    // this short-circuit handler cannot implement that exchange.
+    if !(200..=999).contains(&response.status_code) { bail!("configured Response.StatusCode must be between 200 and 999"); }
+    if response.content_type.chars().any(|character| character.is_control() && character != '\t') {
+        bail!("configured Response.ContentType contains an invalid control character");
+    }
 
     let body = response.content_value.as_deref().unwrap_or("").as_bytes();
     let no_body_status = (100..200).contains(&response.status_code) || matches!(response.status_code, 204 | 304);
@@ -47,16 +45,34 @@ pub async fn try_respond(stream: &mut TcpStream, header: &[u8], config: &AppConf
 }
 
 fn request_target_host(target: &str) -> Result<Option<String>> {
-    if let Some(rest) = target.strip_prefix("http://") {
+    if target.get(..7).is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://")) {
+        let rest = &target[7..];
         let authority = rest.split(|character| character == '/' || character == '?' || character == '#').next().unwrap_or_default();
         return Ok(Some(host_from_authority(authority)?));
     }
-    if target.starts_with("https://") || target.starts_with('/') || target == "*" { return Ok(None); }
-    Ok(None)
+    if target.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://")) {
+        bail!("HTTPS absolute-form is not valid on the plain HTTP proxy listener");
+    }
+    if target.starts_with('/') || target == "*" { return Ok(None); }
+    bail!("unsupported HTTP request-target form")
+}
+
+fn parse_host_header<'a>(lines: impl Iterator<Item = &'a str>) -> Result<Option<&'a str>> {
+    let mut host = None;
+    for line in lines {
+        if line.is_empty() { break; }
+        let (name, value) = line.split_once(':').context("malformed HTTP header field")?;
+        if name.eq_ignore_ascii_case("host") {
+            if host.is_some() { bail!("duplicate Host header"); }
+            host = Some(value.trim());
+        }
+    }
+    Ok(host)
 }
 
 fn host_from_authority(authority: &str) -> Result<String> {
-    if authority.is_empty() || authority.contains('@') || authority.chars().any(|character| matches!(character, '/' | '\\' | '\r' | '\n')) {
+    if authority.is_empty() || authority.bytes().any(|byte| byte <= 0x20 || byte >= 0x7f)
+        || authority.contains('@') || authority.chars().any(|character| matches!(character, '/' | '\\' | '\r' | '\n')) {
         bail!("invalid HTTP Host authority");
     }
     if let Some(rest) = authority.strip_prefix('[') {
@@ -90,18 +106,27 @@ fn reason_phrase(status: u16) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_from_authority, request_target_host};
+    use super::{host_from_authority, parse_host_header, request_target_host};
     #[test]
     fn extracts_absolute_and_origin_form_hosts() {
         assert_eq!(request_target_host("http://example.com:8080/a?q=1").unwrap().as_deref(), Some("example.com"));
+        assert_eq!(request_target_host("HTTP://EXAMPLE.COM/a").unwrap().as_deref(), Some("EXAMPLE.COM"));
+        assert!(request_target_host("https://example.com/a").is_err());
         assert_eq!(request_target_host("/path?q=1").unwrap(), None);
         assert_eq!(request_target_host("https://example.com/path").unwrap(), None);
     }
+    #[test]
+    fn rejects_duplicate_host_headers() {
+        assert!(parse_host_header(["Host: one.example", "host: two.example"].into_iter()).is_err());
+        assert_eq!(parse_host_header(["X-Test: yes", "Host: one.example"].into_iter()).unwrap(), Some("one.example"));
+    }
+
     #[test]
     fn parses_host_authorities() {
         assert_eq!(host_from_authority("example.com:443").unwrap(), "example.com");
         assert_eq!(host_from_authority("[2001:db8::1]:443").unwrap(), "2001:db8::1");
         assert!(host_from_authority("user@example.com").is_err());
         assert!(host_from_authority("example.com:bad").is_err());
+        assert!(host_from_authority("example.com extra").is_err());
     }
 }
