@@ -179,7 +179,9 @@ where
         async move { Ok::<_, Infallible>(handle_request(request, scheme, &config, &resolver, &domains, &tls_proxy).await) }
     });
     http1::Builder::new().keep_alive(true)
-        .serve_connection(TokioIo::new(io), service).await?;
+        .serve_connection(TokioIo::new(io), service)
+        .with_upgrades()
+        .await?;
     Ok(())
 }
 
@@ -204,7 +206,11 @@ async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppCo
             // after a slow DNS/connect/TLS/header phase, only the remaining budget
             // is available for streaming it.
             let request_started = tokio::time::Instant::now();
-            let forwarding = forward_request(request, uri, request_target, original_host, domain, timeout_duration, request_started, resolver, domains, config, tls_proxy);
+            let forwarding = if is_upgrade_request(&request) {
+                forward_upgrade_request(request, uri, request_target, original_host, domain, resolver, domains, config, tls_proxy)
+            } else {
+                forward_request(request, uri, request_target, original_host, domain, timeout_duration, request_started, resolver, domains, config, tls_proxy)
+            };
             match timeout_duration {
                 Some(duration) => match tokio::time::timeout(duration, forwarding).await {
                     Ok(Ok(response)) => response,
@@ -299,6 +305,150 @@ async fn forward_request(
     let remaining = body_timeout.map(|duration| duration.saturating_sub(request_started.elapsed()));
     let response_body = TimeoutBody::new(boxed_body, remaining, connection_guard).boxed_unsync();
     Ok(Response::from_parts(response_parts, response_body))
+}
+
+
+/// Detect an HTTP/1.1 protocol upgrade before the ordinary forwarding path
+/// strips hop-by-hop headers.
+fn is_upgrade_request(request: &Request<Incoming>) -> bool {
+    request.version() == http::Version::HTTP_11
+        && request.method() == Method::GET
+        && has_connection_token(request.headers(), "upgrade")
+        && !upgrade_protocols(request.headers()).is_empty()
+}
+
+fn has_connection_token(headers: &HeaderMap, token: &str) -> bool {
+    headers.get_all(header::CONNECTION).iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|value| value.trim().eq_ignore_ascii_case(token))
+}
+
+fn upgrade_protocols(headers: &HeaderMap) -> Vec<String> {
+    headers.get_all(header::UPGRADE).iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Keep only the HTTP/1 fields required to negotiate an upgrade. Connection
+/// remains hop-by-hop, but its value is normalized to the Upgrade token.
+fn preserve_upgrade_hop_by_hop_headers(headers: &mut HeaderMap) {
+    let nominated = headers.get_all(header::CONNECTION).iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|name| !name.eq_ignore_ascii_case("upgrade"))
+        .filter_map(|name| HeaderName::from_bytes(name.as_bytes()).ok())
+        .collect::<Vec<_>>();
+    for name in nominated {
+        headers.remove(name);
+    }
+    for name in [
+        HeaderName::from_static("proxy-connection"),
+        HeaderName::from_static("keep-alive"),
+        HeaderName::from_static("proxy-authenticate"),
+        HeaderName::from_static("proxy-authorization"),
+        HeaderName::from_static("te"),
+    ] {
+        headers.remove(name);
+    }
+    headers.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+}
+
+async fn forward_upgrade_request(
+    mut request: Request<Incoming>,
+    uri: url::Url,
+    request_target: String,
+    original_host: String,
+    domain: Option<crate::config::DomainConfig>,
+    resolver: &DomainResolver,
+    domains: &[String],
+    config: &AppConfig,
+    tls_proxy: &crate::http_proxy::TlsProxy,
+) -> anyhow::Result<Response<ResponseBody>> {
+    if has_fastgithub_user_agent(request.headers()) {
+        anyhow::bail!("request already contains FastGithub/1.0 User-Agent marker; refusing proxy loop");
+    }
+    let requested_protocols = upgrade_protocols(request.headers());
+    if requested_protocols.is_empty() || !has_connection_token(request.headers(), "upgrade") {
+        anyhow::bail!("malformed HTTP upgrade request");
+    }
+    let downstream_upgrade = hyper::upgrade::on(&mut request);
+    let host = uri.host_str().context("upstream URI has no host")?;
+    let port = uri.port().unwrap_or(if uri.scheme() == "https" { 443 } else { 80 });
+    let (stream, upstream_ip) = crate::http_proxy::connect_target(host, port, resolver, domains, config, domain.as_ref()).await?;
+    let io: Box<dyn AsyncIo> = if uri.scheme() == "https" {
+        Box::new(tls_proxy.connect_upstream(stream, host, upstream_ip, domain.as_ref()).await?)
+    } else if uri.scheme() == "http" {
+        Box::new(stream)
+    } else {
+        anyhow::bail!("unsupported upstream URI scheme '{}'", uri.scheme());
+    };
+    let (mut sender, connection) = client_http1::handshake(TokioIo::new(io)).await?;
+    let connection_task = tokio::spawn(async move {
+        if let Err(error) = connection.with_upgrades().await {
+            tracing::debug!(%error, "upstream HTTP upgrade connection ended");
+        }
+    });
+    let connection_guard = UpstreamConnectionGuard(connection_task.abort_handle());
+
+    let (mut parts, body) = request.into_parts();
+    parts.uri = format!("{}://{}{}", uri.scheme(), host_authority(&uri), request_target).parse()
+        .context("building upstream upgrade request URI")?;
+    preserve_upgrade_hop_by_hop_headers(&mut parts.headers);
+    append_fastgithub_user_agent(&mut parts.headers)?;
+    parts.headers.insert(header::HOST, HeaderValue::from_str(&host_header(&uri))?);
+    let upstream_request = Request::from_parts(parts, body);
+    tracing::debug!(%original_host, upstream = %uri, "forwarding HTTP protocol upgrade");
+
+    let mut upstream_response = sender.send_request(upstream_request).await?;
+    if upstream_response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        let (mut response_parts, response_body) = upstream_response.into_parts();
+        strip_hop_by_hop_headers(&mut response_parts.headers);
+        response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
+        let boxed_body = response_body.map_err(|error| Box::new(error) as BoxError).boxed_unsync();
+        let response_body = TimeoutBody::new(boxed_body, None, connection_guard).boxed_unsync();
+        return Ok(Response::from_parts(response_parts, response_body));
+    }
+
+    let accepted_protocols = upgrade_protocols(upstream_response.headers());
+    let valid_upgrade = has_connection_token(upstream_response.headers(), "upgrade")
+        && accepted_protocols.iter().any(|accepted| {
+            requested_protocols.iter().any(|requested| requested.eq_ignore_ascii_case(accepted))
+        });
+    if !valid_upgrade {
+        anyhow::bail!("upstream returned an invalid or unrequested protocol upgrade");
+    }
+
+    let upstream_upgrade = hyper::upgrade::on(&mut upstream_response);
+    let (mut response_parts, _response_body) = upstream_response.into_parts();
+    preserve_upgrade_hop_by_hop_headers(&mut response_parts.headers);
+    response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
+
+    tokio::spawn(async move {
+        match tokio::try_join!(downstream_upgrade, upstream_upgrade) {
+            Ok((downstream, upstream)) => {
+                // Both HTTP connections have handed off their IO. The driver is
+                // no longer needed; the upgraded byte streams now own the tunnel.
+                drop(connection_guard);
+                let mut downstream = TokioIo::new(downstream);
+                let mut upstream = TokioIo::new(upstream);
+                if let Err(error) = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await {
+                    tracing::debug!(%error, "upgraded protocol tunnel ended");
+                }
+            }
+            Err(error) => {
+                drop(connection_guard);
+                tracing::debug!(%error, "HTTP protocol upgrade failed");
+            }
+        }
+    });
+
+    Ok(Response::from_parts(response_parts, empty_body()))
 }
 
 const FASTGITHUB_USER_AGENT: &str = "FastGithub/1.0";
