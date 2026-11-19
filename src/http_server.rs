@@ -267,7 +267,7 @@ async fn forward_request(
     parts.headers.insert(header::HOST, HeaderValue::from_str(&host_header(&uri))?);
     tracing::debug!(%original_host, upstream = %uri, "forwarding HTTP request");
 
-    let expect_continue = expects_continue(&parts.headers);
+    let expect_continue = expects_continue(&parts.headers) && !body.is_end_stream();
     let (continue_tx, continue_rx) = oneshot::channel();
     let gated_body = ExpectContinueBody::new(body, expect_continue.then_some(continue_rx));
     let mut upstream_request = Request::from_parts(parts, gated_body);
@@ -527,6 +527,21 @@ mod header_tests {
         stream.read_exact(&mut response_body).await.unwrap();
         assert_eq!(&response_body, b"ok");
         server.await.unwrap();
+    }
+
+    #[test]
+    fn expect_continue_does_not_gate_an_empty_request_body() {
+        use bytes::Bytes;
+        use http::{header, HeaderMap, HeaderValue};
+        use http_body::Body;
+        use http_body_util::Full;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::EXPECT, HeaderValue::from_static("100-continue"));
+        let body = Full::new(Bytes::new());
+        assert!(expects_continue(&headers));
+        assert!(body.is_end_stream());
+        assert!(!(expects_continue(&headers) && !body.is_end_stream()));
     }
 
     #[tokio::test]
