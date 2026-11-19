@@ -132,7 +132,7 @@ async fn forward_request(
 ) -> anyhow::Result<Response<ResponseBody>> {
     let host = uri.host_str().context("upstream URI has no host")?;
     let port = uri.port().unwrap_or(if uri.scheme() == "https" { 443 } else { 80 });
-    let (stream, upstream_ip) = crate::http_proxy::connect_target(host, port, resolver, domains, config).await?;
+    let (stream, upstream_ip) = crate::http_proxy::connect_target(host, port, resolver, domain.as_ref().or_else(|| config.domain_config(&original_host))).await?;
     let io: Box<dyn AsyncIo> = if uri.scheme() == "https" {
         Box::new(tls_proxy.connect_upstream(stream, host, &original_host, upstream_ip, domain.as_ref()).await?)
     } else if uri.scheme() == "http" {
