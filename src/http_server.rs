@@ -178,7 +178,7 @@ where
         let tls_proxy = Arc::clone(&tls_proxy);
         async move { Ok::<_, Infallible>(handle_request(request, scheme, &config, &resolver, &domains, &tls_proxy).await) }
     });
-    http1::Builder::new().keep_alive(false)
+    http1::Builder::new().keep_alive(true)
         .serve_connection(TokioIo::new(io), service).await?;
     Ok(())
 }
@@ -385,7 +385,6 @@ fn configured_response(method: &Method, rule: crate::config::ResponseConfig) -> 
         }
     }
     if !suppress_body { *response.body_mut() = Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed_unsync(); }
-    response.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("close"));
     response.headers_mut().insert(header::SERVER, HeaderValue::from_static("FastGithub"));
     response
 }
@@ -398,7 +397,6 @@ fn empty_response(status: StatusCode) -> Response<ResponseBody> {
     let mut response = Response::new(empty_body());
     *response.status_mut() = status;
     response.headers_mut().insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
-    response.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("close"));
     response.headers_mut().insert(header::SERVER, HeaderValue::from_static("FastGithub"));
     response
 }
@@ -1023,4 +1021,75 @@ mod header_tests {
         assert_eq!(headers.get("trailer").unwrap(), "x-checksum");
         assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "text/plain");
     }
+    #[tokio::test]
+    async fn http1_server_keeps_one_connection_open_for_multiple_requests() {
+        use bytes::Bytes;
+        use http::{Request, Response, StatusCode};
+        use http_body_util::{BodyExt, Full};
+        use hyper::{service::service_fn, server::conn::http1 as server_http1};
+        use hyper_util::rt::TokioIo;
+        use std::{convert::Infallible, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = service_fn(move |_request: Request<hyper::body::Incoming>| {
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                async {
+                    let mut response = Response::new(Full::new(Bytes::from_static(b"ok")));
+                    *response.status_mut() = StatusCode::OK;
+                    Ok::<_, Infallible>(response)
+                }
+            });
+            server_http1::Builder::new()
+                .keep_alive(true)
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) = client_http1::handshake(TokioIo::new(stream)).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await.unwrap() });
+
+        for _ in 0..2 {
+            let request = Request::builder()
+                .method(http::Method::GET)
+                .uri("/")
+                .header(header::HOST, "localhost")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let response = sender.send_request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), Bytes::from_static(b"ok"));
+        }
+
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        drop(sender);
+        driver.await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn generated_responses_do_not_force_connection_close() {
+        use crate::config::ResponseConfig;
+
+        let configured = super::configured_response(
+            &http::Method::GET,
+            ResponseConfig {
+                status_code: 200,
+                content_type: "text/plain".into(),
+                content_value: Some("ok".into()),
+            },
+        );
+        assert!(!configured.headers().contains_key(header::CONNECTION));
+
+        let error = super::empty_response(http::StatusCode::BAD_GATEWAY);
+        assert!(!error.headers().contains_key(header::CONNECTION));
+    }
+
 }
