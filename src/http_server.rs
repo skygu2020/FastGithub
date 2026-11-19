@@ -96,14 +96,14 @@ where
 }
 
 /// Hold an incoming request body until the upstream explicitly sends 100 Continue.
-struct ExpectContinueBody {
-    inner: Pin<Box<Incoming>>,
+struct ExpectContinueBody<B> {
+    inner: Pin<Box<B>>,
     continue_rx: Option<oneshot::Receiver<()>>,
     released: bool,
 }
 
-impl ExpectContinueBody {
-    fn new(inner: Incoming, continue_rx: Option<oneshot::Receiver<()>>) -> Self {
+impl<B> ExpectContinueBody<B> {
+    fn new(inner: B, continue_rx: Option<oneshot::Receiver<()>>) -> Self {
         Self {
             inner: Box::pin(inner),
             released: continue_rx.is_none(),
@@ -112,9 +112,12 @@ impl ExpectContinueBody {
     }
 }
 
-impl http_body::Body for ExpectContinueBody {
+impl<B> http_body::Body for ExpectContinueBody<B>
+where
+    B: http_body::Body<Data = Bytes>,
+{
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = B::Error;
 
     fn poll_frame(
         self: Pin<&mut Self>,
@@ -523,6 +526,69 @@ mod header_tests {
         let mut response_body = [0_u8; 2];
         stream.read_exact(&mut response_body).await.unwrap();
         assert_eq!(&response_body, b"ok");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gated_expect_body_waits_for_upstream_continue() {
+        use bytes::Bytes;
+        use http::{header, HeaderValue, Request, StatusCode};
+        use http_body_util::{BodyExt, Full};
+        use hyper::{client::conn::http1 as client_http1, ext::on_informational};
+        use hyper_util::rt::TokioIo;
+        use std::sync::Mutex;
+        use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener, sync::oneshot};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                head.push(byte[0]);
+            }
+            assert!(String::from_utf8_lossy(&head).to_ascii_lowercase().contains("expect: 100-continue"));
+            let mut probe = [0_u8; 1];
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                stream.read(&mut probe),
+            ).await.is_err());
+            stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await.unwrap();
+            let mut body = [0_u8; 7];
+            stream.read_exact(&mut body).await.unwrap();
+            assert_eq!(&body, b"payload");
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) = client_http1::handshake(TokioIo::new(stream)).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await.unwrap() });
+        let (continue_tx, continue_rx) = oneshot::channel();
+        let body = ExpectContinueBody::new(
+            Full::new(Bytes::from_static(b"payload")).map_err(|never| match never {}),
+            Some(continue_rx),
+        );
+        let mut request = Request::new(body);
+        *request.method_mut() = http::Method::POST;
+        *request.uri_mut() = "/upload".parse().unwrap();
+        request.headers_mut().insert(header::HOST, HeaderValue::from_static("localhost"));
+        request.headers_mut().insert(header::EXPECT, HeaderValue::from_static("100-continue"));
+        let sender_gate = Mutex::new(Some(continue_tx));
+        on_informational(&mut request, move |response| {
+            if response.status() == StatusCode::CONTINUE {
+                if let Some(sender) = sender_gate.lock().unwrap().take() {
+                    let _ = sender.send(());
+                }
+            }
+        });
+
+        let response = sender.send_request(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), Bytes::from_static(b"ok"));
+        drop(sender);
+        driver.await.unwrap().unwrap();
         server.await.unwrap();
     }
 
