@@ -228,8 +228,10 @@ async fn connect_target(
         .find(|(pattern, _)| crate::config::domain_matches(pattern, host))
         .map(|(_, value)| value);
 
-    let connect_timeout = domain_config.and_then(|value| value.request_timeout().transpose()).transpose()?
-        .flatten().unwrap_or(CONNECT_TIMEOUT);
+    let connect_timeout = match domain_config {
+        Some(value) => value.request_timeout()?.unwrap_or(CONNECT_TIMEOUT),
+        None => CONNECT_TIMEOUT,
+    };
     let mut addresses = Vec::new();
     if let Ok(ip) = host.parse::<IpAddr>() {
         addresses.push(ip);
