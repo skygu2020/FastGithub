@@ -446,7 +446,6 @@ mod header_tests {
         let mut response_body = [0_u8; 2];
         stream.read_exact(&mut response_body).await.unwrap();
         assert_eq!(&response_body, b"ok");
-        assert_eq!(StatusCode::OK.as_u16(), 200);
         server.await.unwrap();
     }
 
