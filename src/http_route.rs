@@ -50,11 +50,18 @@ pub fn route_request(
     let absolute = if request_target.starts_with('/') || request_target == "*" {
         None
     } else {
+        if request_target.bytes().any(|byte| byte <= 0x20 || byte >= 0x7f) {
+            bail!("absolute-form request-target must contain visible ASCII characters only");
+        }
         let uri = Url::parse(request_target).context("invalid absolute-form request target")?;
         if uri.scheme() != scheme || uri.host_str().is_none()
             || !uri.username().is_empty() || uri.password().is_some() || uri.fragment().is_some() {
             bail!("request-target scheme, authority, or fragment is invalid");
         }
+        // Validate the parsed authority with the same strict rules as Host.
+        // URL parsers can normalize or accept authority syntax that an HTTP
+        // proxy should reject, including a zero port or malformed DNS labels.
+        parse_host_authority(&authority_from_url(&uri))?;
         Some(uri)
     };
 
@@ -259,6 +266,16 @@ mod tests {
     fn rejects_zero_port_in_host_authority() {
         let cfg = config(&[]);
         assert!(route_request("GET", "/", Some("example.com:0"), "http", &cfg).is_err());
+    }
+
+    #[test]
+    fn validates_absolute_form_authority_and_visible_ascii() {
+        let cfg = config(&[]);
+        assert!(route_request("GET", "http://example.com:0/path", None, "http", &cfg).is_err());
+        assert!(route_request("GET", "http://bad..example/path", None, "http", &cfg).is_err());
+        assert!(route_request("GET", "http://example.com/a b", None, "http", &cfg).is_err());
+        assert!(route_request("GET", "http://example.com/路径", None, "http", &cfg).is_err());
+        assert!(route_request("GET", "http://example.com/path", None, "http", &cfg).is_ok());
     }
 
     #[test]
