@@ -19,7 +19,7 @@ bytes = "1"
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tokio-openssl = "0.6"
 serde = { version = "1", features = ["derive"] }
