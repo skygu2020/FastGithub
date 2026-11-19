@@ -150,11 +150,10 @@ impl TlsProxy {
         &self,
         upstream: TcpStream,
         upstream_host: &str,
-        original_host: &str,
         upstream_ip: IpAddr,
         domain_config: Option<&crate::config::DomainConfig>,
     ) -> Result<SslStream<TcpStream>> {
-        let configured_sni = domain_config.and_then(|rule| rule.tls_sni_value(original_host, upstream_ip));
+        let configured_sni = domain_config.and_then(|rule| rule.tls_sni_value(upstream_host, upstream_ip));
         let disable_sni = domain_config.is_some_and(|rule| rule.tls_sni == Some(false));
         let ignore_name_mismatch = domain_config.is_some_and(|rule| rule.tls_ignore_name_mismatch == Some(true));
         let mut connect_config = self.connector.configure()?;
