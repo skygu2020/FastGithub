@@ -86,7 +86,8 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, doma
         Err(_) => bail!("timed out waiting for CONNECT tunnel data"),
     };
     let (up, down) = if is_tls {
-        tls_proxy.intercept(client, upstream, &host, upstream_ip, &config).await?
+        tls_proxy.intercept(client, host.as_str(), Arc::clone(&config), resolver.clone(), domains.to_vec(), Arc::clone(&tls_proxy)).await?;
+        return Ok(())
     } else {
         tokio::io::copy_bidirectional(&mut client, &mut upstream).await?
     };
@@ -119,7 +120,7 @@ fn classify_tls_prefix(prefix: &[u8]) -> Option<bool> {
     }
 }
 
-struct TlsProxy {
+pub(crate) pub(crate) struct TlsProxy {
     acceptor: SslAcceptor,
     connector: SslConnector,
     certificates: Arc<CertificateService>,
@@ -146,7 +147,31 @@ impl TlsProxy {
         Ok(Self { acceptor: acceptor.build(), connector, certificates })
     }
 
-    async fn intercept(&self, client: TcpStream, upstream: TcpStream, connect_host: &str, upstream_ip: IpAddr, config: &AppConfig) -> Result<(u64, u64)> {
+    pub(crate) async fn connect_upstream(
+        &self,
+        upstream: TcpStream,
+        upstream_host: &str,
+        original_host: &str,
+        upstream_ip: IpAddr,
+        domain_config: Option<&crate::config::DomainConfig>,
+    ) -> Result<SslStream<TcpStream>> {
+        let configured_sni = domain_config.and_then(|rule| rule.tls_sni_value(original_host, upstream_ip));
+        let disable_sni = domain_config.is_some_and(|rule| rule.tls_sni == Some(false));
+        let ignore_name_mismatch = domain_config.is_some_and(|rule| rule.tls_ignore_name_mismatch == Some(true));
+        let mut connect_config = self.connector.configure()?;
+        connect_config.set_use_server_name_indication(!disable_sni);
+        connect_config.set_verify_hostname(!ignore_name_mismatch);
+        let mut ssl = connect_config.into_ssl(upstream_host)?;
+        if let Some(sni) = configured_sni.as_deref() {
+            ssl.set_hostname(sni)?;
+        }
+        let mut tls = SslStream::new(ssl, upstream).context("wrapping upstream TLS stream")?;
+        timeout(CONNECT_TIMEOUT, Pin::new(&mut tls).connect())
+            .await.context("upstream TLS handshake timed out")??;
+        Ok(tls)
+    }
+
+    pub(crate) async fn intercept(&self, client: TcpStream, connect_host: &str, config: Arc<AppConfig>, resolver: DomainResolver, domains: Vec<String>, tls_proxy: Arc<TlsProxy>) -> Result<()> {
         let default_certificate = self.certificates.server_certificate(connect_host)?;
         let mut ssl = Ssl::new(self.acceptor.context()).context("creating inbound TLS session")?;
         ssl.set_certificate(&default_certificate.certificate)?;
@@ -156,26 +181,8 @@ impl TlsProxy {
             .await.context("inbound TLS handshake timed out")??;
         let requested_host = client_tls.ssl().servername(NameType::HOST_NAME).unwrap_or(connect_host).to_owned();
 
-        let domain_config = config.domain_config(&requested_host);
-        let configured_sni = domain_config.and_then(|value| value.tls_sni_value(&requested_host, upstream_ip));
-        // Preserve normal hostname SNI even when there is no matching domain rule.
-        // Only an explicit TlsSni=false setting suppresses the SNI extension.
-        let disable_sni = domain_config.is_some_and(|value| value.tls_sni == Some(false));
-        let ignore_name_mismatch = domain_config.is_some_and(|value| value.tls_ignore_name_mismatch == Some(true));
-        let mut connect_config = self.connector.configure()?;
-        connect_config.set_use_server_name_indication(!disable_sni);
-        // Keep certificate-chain validation enabled; this option suppresses only
-        // the hostname check for servers that return a certificate for another name.
-        connect_config.set_verify_hostname(!ignore_name_mismatch);
-        let mut upstream_ssl = connect_config.into_ssl(&requested_host)?;
-        if let Some(sni) = configured_sni.as_deref() {
-            upstream_ssl.set_hostname(sni)?;
-        }
-        let mut upstream_tls = SslStream::new(upstream_ssl, upstream).context("wrapping upstream TLS stream")?;
-        timeout(CONNECT_TIMEOUT, Pin::new(&mut upstream_tls).connect())
-            .await.context("upstream TLS handshake timed out")??;
-        let (sent, received) = tokio::io::copy_bidirectional(&mut client_tls, &mut upstream_tls).await?;
-        Ok((sent, received))
+        tracing::debug!(host = %requested_host, "TLS interception established; handing decrypted HTTP to Hyper");
+        crate::http_server::serve(client_tls, "https", config, resolver, domains, tls_proxy).await
     }
 }
 

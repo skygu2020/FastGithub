@@ -13,7 +13,7 @@ type ResponseBody = UnsyncBoxBody<Bytes, BoxError>;
 
 /// Serve one HTTP/1 connection over a plain TCP or decrypted TLS stream.
 /// Already-consumed bytes can be restored by wrapping the stream in PrefixedIo.
-pub async fn serve<S>(io: S, scheme: &'static str, config: Arc<AppConfig>, resolver: DomainResolver, domains: Vec<String>) -> anyhow::Result<()>
+pub async fn serve<S>(io: S, scheme: &'static str, config: Arc<AppConfig>, resolver: DomainResolver, domains: Vec<String>, tls_proxy: Arc<crate::http_proxy::TlsProxy>) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -21,14 +21,15 @@ where
         let config = Arc::clone(&config);
         let resolver = resolver.clone();
         let domains = domains.clone();
-        async move { Ok::<_, Infallible>(handle_request(request, scheme, &config, &resolver, &domains).await) }
+        let tls_proxy = Arc::clone(&tls_proxy);
+        async move { Ok::<_, Infallible>(handle_request(request, scheme, &config, &resolver, &domains, &tls_proxy).await) }
     });
     http1::Builder::new().keep_alive(false)
         .serve_connection(TokioIo::new(io), service).await?;
     Ok(())
 }
 
-async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppConfig, resolver: &DomainResolver, domains: &[String]) -> Response<ResponseBody> {
+async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppConfig, resolver: &DomainResolver, domains: &[String], tls_proxy: &crate::http_proxy::TlsProxy) -> Response<ResponseBody> {
     let method = request.method().clone();
     let target = request.uri().to_string();
     let host = request.headers().get(header::HOST).and_then(|value| value.to_str().ok());
@@ -45,7 +46,7 @@ async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppCo
                     return empty_response(StatusCode::BAD_GATEWAY);
                 }
             };
-            let forwarding = forward_request(request, uri, request_target, original_host, resolver, domains, config);
+            let forwarding = forward_request(request, uri, request_target, original_host, domain, resolver, domains, config, tls_proxy);
             match timeout_duration {
                 Some(duration) => match tokio::time::timeout(duration, forwarding).await {
                     Ok(Ok(response)) => response,
@@ -76,17 +77,22 @@ async fn forward_request(
     uri: url::Url,
     request_target: String,
     original_host: String,
+    domain: Option<crate::config::DomainConfig>,
     resolver: &DomainResolver,
     domains: &[String],
     config: &AppConfig,
+    tls_proxy: &crate::http_proxy::TlsProxy,
 ) -> anyhow::Result<Response<ResponseBody>> {
-    if uri.scheme() != "http" {
-        anyhow::bail!("HTTPS upstream forwarding is not connected yet");
-    }
     let host = uri.host_str().context("upstream URI has no host")?;
-    let port = uri.port().unwrap_or(80);
-    let (stream, _) = crate::http_proxy::connect_target(host, port, resolver, domains, config).await?;
-    let io = TokioIo::new(stream);
+    let port = uri.port().unwrap_or(if uri.scheme() == "https" { 443 } else { 80 });
+    let (stream, upstream_ip) = crate::http_proxy::connect_target(host, port, resolver, domains, config).await?;
+    let io = if uri.scheme() == "https" {
+        TokioIo::new(tls_proxy.connect_upstream(stream, host, &original_host, upstream_ip, domain.as_ref()).await?)
+    } else if uri.scheme() == "http" {
+        TokioIo::new(stream)
+    } else {
+        anyhow::bail!("unsupported upstream URI scheme '{}'", uri.scheme());
+    };
     let (mut sender, connection) = client_http1::handshake(io).await?;
     tokio::spawn(async move {
         if let Err(error) = connection.await {
@@ -95,7 +101,7 @@ async fn forward_request(
     });
 
     let (mut parts, body) = request.into_parts();
-    parts.uri = format!("http://{}{}", host_authority(&uri), request_target).parse()
+    parts.uri = format!("{}://{}{}", uri.scheme(), host_authority(&uri), request_target).parse()
         .context("building upstream request URI")?;
     parts.headers.remove(header::CONNECTION);
     parts.headers.remove("proxy-connection");
