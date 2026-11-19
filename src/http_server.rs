@@ -241,6 +241,7 @@ async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppCo
         let authority = request.uri().authority();
         let host_values = request.headers().get_all(header::HOST);
         if authority.is_none()
+            || !http2_scheme_matches(request.uri().scheme_str(), scheme)
             || host_values.iter().count() > 1
             || host_header.is_some_and(|value| {
                 value.to_str().ok().map_or(true, |host| {
@@ -431,6 +432,12 @@ async fn forward_request_http2(
     let remaining = body_timeout.map(|duration| duration.saturating_sub(request_started.elapsed()));
     let response_body = TimeoutBody::new(boxed_body, remaining, connection_guard).boxed_unsync();
     Ok(Response::from_parts(response_parts, response_body))
+}
+
+/// HTTP/2 non-CONNECT requests must use the scheme of the accepted
+/// transport. The proxy currently exposes HTTP/2 only after TLS interception.
+fn http2_scheme_matches(request_scheme: Option<&str>, transport_scheme: &str) -> bool {
+    request_scheme.is_some_and(|value| value.eq_ignore_ascii_case(transport_scheme))
 }
 
 /// Compare an HTTP/2 Host field with :authority. Host names are
@@ -1401,6 +1408,15 @@ mod header_tests {
 
         let error = super::empty_response(http::StatusCode::BAD_GATEWAY);
         assert!(!error.headers().contains_key(header::CONNECTION));
+    }
+
+    #[test]
+    fn http2_scheme_must_match_transport_scheme() {
+        use super::http2_scheme_matches;
+        assert!(http2_scheme_matches(Some("https"), "https"));
+        assert!(http2_scheme_matches(Some("HTTPS"), "https"));
+        assert!(!http2_scheme_matches(Some("http"), "https"));
+        assert!(!http2_scheme_matches(None, "https"));
     }
 
     #[test]
