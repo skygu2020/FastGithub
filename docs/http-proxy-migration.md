@@ -60,3 +60,9 @@
 ## 当前决策
 
 不在现有 TLS 字节隧道上叠加不完整的 Response/Destination 特判。下一阶段应引入明确的 HTTP/1.1 请求处理层，并让明文 HTTP 与 CONNECT 解密后的 HTTP 共用请求转发逻辑。这样才能避免两套规则逐渐分叉。
+
+## Current HTTP Response implementation (2026-11)
+
+The native listener now recognizes configured `Response` rules for plain HTTP proxy requests. It obtains the host from absolute-form `http://` request targets or the `Host` header, applies the existing ordered domain-rule matcher, and returns the configured status, content type, and optional UTF-8 body without opening an upstream connection. `HEAD` suppresses the body while retaining its representation length; 1xx, 204, and 304 responses are bodyless. The configured content type is checked for CR/LF before it is written to the response.
+
+This is deliberately a narrow first step: unmatched plain HTTP requests still return 501, and HTTPS CONNECT traffic still uses the existing TLS byte tunnel after interception. This does not yet implement the original middleware's complete reverse proxy, `Destination` URI resolution, or per-request timeout behavior. Request-body consumption and persistent HTTP keep-alive are also not implemented on this short-circuit path; the connection is closed after the configured response.

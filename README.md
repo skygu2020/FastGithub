@@ -22,8 +22,7 @@ management, a native DNS-over-TCP/UDP client, endpoint persistence/health orderi
 DNSCrypt process management, and an initial HTTP CONNECT forward-proxy listener. CONNECT
 supports opaque TCP tunnels for non-TLS CONNECT traffic and an initial TLS interception path for
 TLS CONNECT traffic. TLS interception uses generated per-host leaf certificates and verifies the
-upstream certificate chain and hostname. Plain HTTP absolute-form proxying, reverse-proxy rules,
-and statistics are not yet implemented. The local CA lifecycle is implemented: `fastgithub cert` creates or loads
+upstream certificate chain and hostname. Plain HTTP requests matching a domain rule with `Response` are now short-circuited with the configured status, content type, and optional body. General plain HTTP upstream forwarding, `Destination`, request-scoped timeout, TLS-intercepted HTTP request processing, and statistics are not yet implemented. The local CA lifecycle is implemented: `fastgithub cert` creates or loads
 `certs/fastgithub.crt` and `certs/fastgithub.key` beside the selected configuration file. Normal
 proxy startup also creates or loads this CA and logs both paths. The CA is not automatically
 installed into the operating-system trust store.
