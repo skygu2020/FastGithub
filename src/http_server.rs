@@ -436,6 +436,7 @@ mod header_tests {
                 Ok::<_, Infallible>(response)
             });
             server_http1::Builder::new()
+                .keep_alive(false)
                 .serve_connection(TokioIo::new(stream), service)
                 .await
                 .unwrap();
@@ -480,7 +481,7 @@ mod header_tests {
         );
 
         drop(sender);
-        driver.abort();
+        driver.await.unwrap();
         server.await.unwrap();
     }
 
