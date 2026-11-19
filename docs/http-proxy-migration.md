@@ -42,7 +42,7 @@
 2. **Upgrade / WebSocket**：当前移除 Upgrade 等 hop-by-hop headers，不提供 WebSocket 升级隧道。
 3. **HTTP/2**：当前依赖和代理实现以 HTTP/1 为主，尚未移植原版可能依赖的 HTTP/2 上游/下游协商行为。
 4. **代理兼容性与边界测试**：继续补充 Expect: 100-continue、超大/分块请求体、Trailer、客户端提前断开、上游提前断开、超时发生在请求体上传期间等集成测试。
-5. **代理标记**：原版使用 `FastGithub/1.0` User-Agent 标记避免自转发；Rust 版目前写入响应 Server 标记，但尚未核对并补齐请求 User-Agent 标记语义。
+5. **代理标记**：已恢复原版 `FastGithub/1.0` User-Agent 标记：上游请求保留原 User-Agent 并追加标记；若入站请求已经包含该产品标记，则拒绝转发以防止 Destination 造成代理环路。响应 Server 头也会写入 `FastGithub`。
 6. **完整互操作测试**：目前有模块单元测试，但本分支近期修改尚未取得可确认的 cargo fmt / cargo test / cargo build 结果。不能把源码测试数量当成实际通过的构建结果。
 
 ## 实现约束
