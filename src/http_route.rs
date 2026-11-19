@@ -49,9 +49,12 @@ pub fn route_request(
         Some(uri)
     };
 
-    let original_host = match absolute.as_ref().and_then(Url::host_str) {
-        Some(host) => host.to_owned(),
-        None => parse_host_authority(host_header.context("origin-form request requires Host header")?)?,
+    let (original_host, original_authority) = match absolute.as_ref() {
+        Some(uri) => (uri.host_str().expect("absolute URI host checked").to_owned(), authority_from_url(uri)),
+        None => {
+            let authority = host_header.context("origin-form request requires Host header")?;
+            (parse_host_authority(authority)?, authority.to_owned())
+        }
     };
     let matched = config.domain_config(&original_host);
     if let Some(response) = matched.and_then(|domain| domain.response.as_ref()) {
@@ -69,7 +72,7 @@ pub fn route_request(
         }
     };
     let uri = match matched.and_then(|domain| domain.destination.as_deref()) {
-        Some(destination) => resolve_destination(scheme, &original_host, destination)?,
+        Some(destination) => resolve_destination(scheme, &original_authority, destination)?,
         None => original_uri,
     };
     let request_target = if request_target == "*" && matched.and_then(|d| d.destination.as_deref()).is_none() {
@@ -87,6 +90,16 @@ pub fn route_request(
         domain: matched.cloned(),
         original_host,
     })
+}
+
+
+fn authority_from_url(uri: &Url) -> String {
+    let host = uri.host_str().expect("URL host checked");
+    let host = if host.contains(':') { format!("[{host}]") } else { host.to_owned() };
+    match uri.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    }
 }
 
 fn is_http_token(byte: u8) -> bool {
@@ -162,6 +175,15 @@ mod tests {
                 assert_eq!(request_target, "/assets/");
                 assert_eq!(original_host, "origin.example");
             }
+            _ => panic!("expected forwarding"),
+        }
+    }
+
+    #[test]
+    fn relative_destination_preserves_original_host_port() {
+        let rule = DomainConfig { destination: Some("mirror/path".into()), ..Default::default() };
+        match route_request("GET", "/x", Some("origin.example:8443"), "https", &config(&[("origin.example", rule)])).unwrap() {
+            RouteDecision::Forward { uri, .. } => assert_eq!(uri.as_str(), "https://origin.example:8443/mirror/path"),
             _ => panic!("expected forwarding"),
         }
     }
