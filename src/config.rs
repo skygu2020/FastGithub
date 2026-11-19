@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::{
     collections::BTreeMap,
     fs,
@@ -39,8 +38,24 @@ pub struct DomainConfig {
     pub timeout: Option<String>,
     pub ip_address: Option<String>,
     pub destination: Option<String>,
-    pub response: Option<Value>,
+    pub response: Option<ResponseConfig>,
 }
+
+
+/// A locally generated HTTP response for a matching domain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ResponseConfig {
+    #[serde(default = "default_response_status")]
+    pub status_code: u16,
+    #[serde(default = "default_response_content_type")]
+    pub content_type: String,
+    #[serde(default)]
+    pub content_value: Option<String>,
+}
+
+fn default_response_status() -> u16 { 200 }
+fn default_response_content_type() -> String { "text/plain;charset=utf-8".to_owned() }
 
 impl DomainConfig {
     /// Parse the .NET TimeSpan constant format used by FastGithub configuration.
@@ -194,8 +209,20 @@ fn wildcard_domain_match(pattern: &str, host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_for_test, parse_time_span, wildcard_domain_match, DomainConfig};
+    use super::{expand_for_test, parse_time_span, wildcard_domain_match, DomainConfig, ResponseConfig};
     use std::net::IpAddr;
+
+    #[test]
+    fn response_config_uses_original_defaults_and_fields() {
+        let response: ResponseConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(response.status_code, 200);
+        assert_eq!(response.content_type, "text/plain;charset=utf-8");
+        assert_eq!(response.content_value, None);
+        let response: ResponseConfig = serde_json::from_str(r#"{"StatusCode":404,"ContentType":"text/plain","ContentValue":"blocked"}"#).unwrap();
+        assert_eq!(response.status_code, 404);
+        assert_eq!(response.content_type, "text/plain");
+        assert_eq!(response.content_value.as_deref(), Some("blocked"));
+    }
 
     #[test]
     fn parses_dotnet_time_span_configuration() {
