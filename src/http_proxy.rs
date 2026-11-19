@@ -1,6 +1,6 @@
 use crate::{cert::CertificateService, config::AppConfig, dns::DnsClient, persistence::Persistence, resolver::DomainResolver};
 use anyhow::{bail, Context, Result};
-use openssl::ssl::{NameType, SniError, Ssl, SslAcceptor, SslConnector, SslMethod};
+use openssl::ssl::{AlpnError, NameType, SniError, Ssl, SslAcceptor, SslConnector, SslMethod};
 use std::{net::{IpAddr, SocketAddr}, pin::Pin, sync::Arc, time::Duration};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{lookup_host, TcpListener, TcpStream}, time::timeout};
 use tokio_openssl::SslStream;
@@ -129,6 +129,10 @@ impl TlsProxy {
     fn new(certificates: Arc<CertificateService>) -> Result<Self> {
         let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls())
             .context("creating inbound TLS acceptor")?;
+        acceptor.set_alpn_select_callback(|_, client_protocols| {
+            openssl::ssl::select_next_proto(b"\\x02h2\\x08http/1.1", client_protocols)
+                .ok_or(AlpnError::NOACK)
+        });
         let callback_certificates = Arc::clone(&certificates);
         acceptor.set_servername_callback(move |ssl, _alert| {
             if let Some(host) = ssl.servername(NameType::HOST_NAME) {
@@ -161,6 +165,7 @@ impl TlsProxy {
         let mut connect_config = self.connector.configure()?;
         connect_config.set_use_server_name_indication(!disable_sni);
         connect_config.set_verify_hostname(!ignore_name_mismatch);
+        connect_config.set_alpn_protos(b"\\x02h2\\x08http/1.1")?;
         let mut ssl = connect_config.into_ssl(upstream_host)?;
         if let Some(sni) = configured_sni.as_deref() {
             ssl.set_hostname(sni)?;
@@ -181,8 +186,12 @@ impl TlsProxy {
             .await.context("inbound TLS handshake timed out")??;
         let requested_host = client_tls.ssl().servername(NameType::HOST_NAME).unwrap_or(connect_host).to_owned();
 
-        tracing::debug!(host = %requested_host, "TLS interception established; handing decrypted HTTP to Hyper");
-        crate::http_server::serve(client_tls, "https", config, resolver, domains, tls_proxy).await
+        tracing::debug!(host = %requested_host, alpn = ?client_tls.ssl().selected_alpn_protocol(), "TLS interception established; handing decrypted HTTP to Hyper");
+        if client_tls.ssl().selected_alpn_protocol() == Some(b"h2") {
+            crate::http_server::serve_http2(client_tls, "https", config, resolver, domains, tls_proxy).await
+        } else {
+            crate::http_server::serve(client_tls, "https", config, resolver, domains, tls_proxy).await
+        }
     }
 }
 
