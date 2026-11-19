@@ -146,6 +146,9 @@ async fn forward_request(
     config: &AppConfig,
     tls_proxy: &crate::http_proxy::TlsProxy,
 ) -> anyhow::Result<Response<ResponseBody>> {
+    if has_fastgithub_user_agent(request.headers()) {
+        anyhow::bail!("request already contains FastGithub/1.0 User-Agent marker; refusing proxy loop");
+    }
     let host = uri.host_str().context("upstream URI has no host")?;
     let port = uri.port().unwrap_or(if uri.scheme() == "https" { 443 } else { 80 });
     let (stream, upstream_ip) = crate::http_proxy::connect_target(host, port, resolver, domains, config, domain.as_ref()).await?;
@@ -167,6 +170,7 @@ async fn forward_request(
     parts.uri = format!("{}://{}{}", uri.scheme(), host_authority(&uri), request_target).parse()
         .context("building upstream request URI")?;
     strip_hop_by_hop_headers(&mut parts.headers);
+    append_fastgithub_user_agent(&mut parts.headers)?;
     parts.headers.insert(header::HOST, HeaderValue::from_str(&host_header(&uri))?);
     tracing::debug!(%original_host, upstream = %uri, "forwarding HTTP request");
     let upstream_request = Request::from_parts(parts, body);
@@ -183,6 +187,31 @@ async fn forward_request(
         None => boxed_body,
     };
     Ok(Response::from_parts(response_parts, response_body))
+}
+
+const FASTGITHUB_USER_AGENT: &str = "FastGithub/1.0";
+
+/// The original HttpClient rejects requests that already carry its marker to
+/// prevent a Destination rule from sending traffic back through this proxy.
+fn has_fastgithub_user_agent(headers: &HeaderMap) -> bool {
+    headers.get_all(header::USER_AGENT).iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(str::split_ascii_whitespace)
+        .any(|product| product == FASTGITHUB_USER_AGENT)
+}
+
+/// Append the marker without discarding the caller's existing User-Agent.
+fn append_fastgithub_user_agent(headers: &mut HeaderMap) -> anyhow::Result<()> {
+    let existing = headers.get_all(header::USER_AGENT).iter()
+        .map(|value| value.to_str())
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut value = existing.join(" ");
+    if !value.is_empty() {
+        value.push(' ');
+    }
+    value.push_str(FASTGITHUB_USER_AGENT);
+    headers.insert(header::USER_AGENT, HeaderValue::from_str(&value)?);
+    Ok(())
 }
 
 /// Remove hop-by-hop fields, including every field nominated by Connection.
@@ -267,6 +296,24 @@ fn empty_response(status: StatusCode) -> Response<ResponseBody> {
 mod header_tests {
     use super::strip_hop_by_hop_headers;
     use http::{header, HeaderMap, HeaderValue};
+
+    #[test]
+    fn user_agent_marker_detects_proxy_loops_and_preserves_existing_agent() {
+        use super::{append_fastgithub_user_agent, has_fastgithub_user_agent};
+        use http::{header, HeaderMap, HeaderValue};
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::USER_AGENT, HeaderValue::from_static("curl/8.0"));
+        assert!(!has_fastgithub_user_agent(&headers));
+        append_fastgithub_user_agent(&mut headers).unwrap();
+        assert_eq!(headers.get(header::USER_AGENT).unwrap(), "curl/8.0 FastGithub/1.0");
+        assert!(has_fastgithub_user_agent(&headers));
+
+        headers.insert(header::USER_AGENT, HeaderValue::from_static("Other/2.0 (FastGithub/1.0)"));
+        assert!(!has_fastgithub_user_agent(&headers));
+        headers.insert(header::USER_AGENT, HeaderValue::from_static("FastGithub/1.0"));
+        assert!(has_fastgithub_user_agent(&headers));
+    }
 
     #[tokio::test]
     async fn timeout_body_emits_one_error_then_ends() {
