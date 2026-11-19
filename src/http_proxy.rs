@@ -62,7 +62,7 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, doma
     };
     if !method.eq_ignore_ascii_case("CONNECT") {
         let stream = crate::prefixed_io::PrefixedIo::new(client, header);
-        return crate::http_server::serve(stream, "http", config, resolver, domains.to_vec()).await
+        return crate::http_server::serve(stream, "http", config, resolver, domains.to_vec(), Arc::clone(&tls_proxy)).await
             .with_context(|| format!("serving plain HTTP request from {peer}"));
     }
     let (host, port) = match parse_authority(authority) {
@@ -120,7 +120,7 @@ fn classify_tls_prefix(prefix: &[u8]) -> Option<bool> {
     }
 }
 
-pub(crate) pub(crate) struct TlsProxy {
+pub(crate) struct TlsProxy {
     acceptor: SslAcceptor,
     connector: SslConnector,
     certificates: Arc<CertificateService>,
