@@ -8,6 +8,7 @@ mod http_response;
 mod http_route;
 mod destination;
 mod persistence;
+mod prefixed_io;
 mod resolver;
 mod service;
 mod tls;
