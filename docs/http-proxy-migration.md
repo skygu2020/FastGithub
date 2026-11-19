@@ -32,6 +32,12 @@
 - IPAddress 是优先候选，目标域名解析结果仍作为后备候选。
 - 对已匹配的 DomainConfig，TlsSni 遵循原版非 nullable bool 的默认值：缺省/false 均不发送 SNI，只有显式 true 才发送；未匹配配置的普通代理请求保留 TLS 库的正常 SNI 行为。启用时默认 SNI 使用最终上游 URI 主机名，自定义 SNI 只改变 ClientHello 的 SNI，不改变证书名称验证目标。证书名称验证目标仍是最终上游 URI 主机名。
 
+### 协议协商
+
+- TLS 拦截入口通过 ALPN 选择 HTTP/2 或 HTTP/1.1；未协商 ALPN 时回退 HTTP/1.1。
+- HTTPS 上游连接优先协商 HTTP/2，服务器未选择 `h2` 时回退 HTTP/1.1。HTTP/1 Upgrade/WebSocket 上游连接仅提供 `http/1.1`，避免误协商到不支持传统 Upgrade 的 HTTP/2。
+- 当前 HTTP/2 不做跨请求连接池复用；HTTP/2 只覆盖 TLS ALPN 路径，明文 h2c 和 RFC 8441 extended CONNECT 不在本轮范围内。
+
 ### 超时
 
 - TCP connect 和上游 TLS handshake 使用固定连接超时。
@@ -43,7 +49,7 @@
 
 1. **持久 HTTP/1 keep-alive：已实现第一阶段**：下游 Hyper HTTP/1 server 允许同一连接处理多个请求，响应生成器不再强制 `Connection: close`；新增同一连接发送两个请求的 TCP loopback 测试。上游仍是每请求独立连接，不做跨请求连接池复用。测试尚未执行，后续回归阶段验证连接关闭、客户端断开及请求超时隔离。
 2. **HTTP/1 Upgrade / WebSocket：已实现转发主路径**：识别 HTTP/1.1 `Connection: Upgrade` 请求，保留并规范化两端 Upgrade 协商头；上游只有返回匹配的 `101 Switching Protocols` 才建立隧道。Hyper 两端通过 `with_upgrades()` 交接底层 IO，隧道使用双向流式复制；上游拒绝升级时回到普通响应体转发并继续使用原请求 Timeout。该路径支持 WebSocket 及其他符合 HTTP/1 Upgrade 语义的协议。端到端握手、断连和半关闭行为尚待后续回归验证。
-3. **HTTP/2**：当前依赖和代理实现以 HTTP/1 为主，尚未移植 HTTP/2 上游/下游协商行为。
+3. **HTTP/2：已接入 ALPN 与 Hyper 双端处理**：TLS 拦截服务端通过 ALPN 协商 `h2` / `http/1.1`，协商为 `h2` 时使用 Hyper HTTP/2 server；访问 HTTPS Destination 时上游 TLS 客户端同时提供 `h2` 和 `http/1.1`，按协商结果选择 Hyper HTTP/2 或 HTTP/1 client。HTTP/2 请求仍进入同一套 DomainConfig、Response、Destination 和 Timeout 路由；HTTP/2 上游请求使用 URI authority 作为 `:authority`，不发送重复 Host/Transfer-Encoding，并把上游响应版本归一为下游版本。当前 HTTP/2 上游连接按请求建立，不做跨请求连接池复用；明文 HTTP proxy 入口仍使用 HTTP/1，暂不提供 h2c prior-knowledge / upgrade，也未实现 RFC 8441 WebSocket extended CONNECT。ALPN、流式 body/trailer、并发 stream 和超时隔离尚待后续回归验证。
 4. **代理兼容性与边界测试**：继续补充 Expect: 100-continue、超大/分块请求体、Trailer、客户端提前断开、上游提前断开、超时发生在请求体上传期间等集成测试。当前仅完成 Trailer frame 在 `TimeoutBody` 包装层中的透传单测，尚未完成真实 TCP 上下游验证。
 5. **Expect: 100-continue：已加入上游许可门控，仍需构建验证**：Hyper HTTP/1 client 会在收到上游 100 之前开始 poll 请求体；入站 Hyper HTTP/1 server 则在 Service 首次 poll `Incoming` body 时自动向下游发送 100。为协调这两个行为，`forward_request` 现对包含 `Expect: 100-continue` 的请求使用 `ExpectContinueBody`：先将请求头交给上游，body 保持 Pending；通过 `hyper::ext::on_informational()` 观察到上游 100 后才释放 body。这样首次 poll 入站 body 才会触发下游 100。若上游直接返回最终响应（例如 417），body 不会被释放，最终响应可以直接返回，下游上传也不会开始。请求体已经处于 end-stream 状态时，即使带有 Expect 头也不会启用门控，避免空请求体等待永远不会到来的 100。新增测试覆盖空 body 不启用门控、TCP loopback 中 gated body 在上游 100 后才上传、上游返回 417 时不上传，以及等待上游许可期间取消请求时关闭上游 driver；另保留原始 Hyper client 行为基线测试和入站 server 自动 100 触发时机测试。当前尚未在本地运行 cargo test，需用户构建验证 Hyper 版本解析/API 兼容性和测试时序。该实现只处理中继 100 Continue，不转发 103 Early Hints 等其他 1xx；项目 Hyper 依赖是 `version = "1"` 且没有 Cargo.lock，实际解析版本由用户构建环境的 Cargo 决定。
 6. **代理标记**：已恢复原版 `FastGithub/1.0` User-Agent 标记：上游请求保留原 User-Agent 并追加标记；若入站请求已经包含该产品标记，则拒绝转发以防止 Destination 造成代理环路。响应 Server 头也会写入 `FastGithub`。
