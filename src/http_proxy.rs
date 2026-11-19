@@ -8,6 +8,7 @@ use tokio_openssl::SslStream;
 const HEADER_LIMIT: usize = 16 * 1024;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const SYSTEM_DNS_TIMEOUT: Duration = Duration::from_secs(10);
 const BAD_REQUEST_RESPONSE: &[u8] = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
 
 pub async fn run(config: AppConfig, upstreams: Vec<SocketAddr>, certificates: Arc<CertificateService>) -> Result<()> {
@@ -221,7 +222,9 @@ async fn connect_target(host: &str, port: u16, resolver: &DomainResolver, domain
     } else if domains.iter().any(|pattern| crate::config::domain_matches(pattern, host)) {
         resolver.resolve(host, port).await?
     } else {
-        lookup_host((host, port)).await.with_context(|| format!("system DNS lookup for {host}"))?
+        timeout(SYSTEM_DNS_TIMEOUT, lookup_host((host, port))).await
+            .with_context(|| format!("system DNS lookup for {host} timed out"))?
+            .with_context(|| format!("system DNS lookup for {host}"))?
             .map(|endpoint| endpoint.ip()).collect()
     };
     if addresses.is_empty() { bail!("no IP addresses available for {host}"); }
