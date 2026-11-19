@@ -1404,6 +1404,7 @@ mod header_tests {
         assert!(!http_authorities_match(&authority, "example.com:8443"));
         assert!(!http_authorities_match(&authority, "user@example.com:443"));
         assert!(!http_authorities_match(&authority, "example.com/path"));
+        assert!(!http_authorities_match(&authority, "example.com:99999"));
     }
 
     #[test]
