@@ -379,7 +379,7 @@ mod header_tests {
     async fn hyper_http1_client_reports_upstream_informational_responses() {
         use bytes::Bytes;
         use http::{header, HeaderValue, Request, StatusCode};
-        use http_body_util::Full;
+        use http_body_util::{BodyExt, Full};
         use hyper::{client::conn::http1 as client_http1, ext::on_informational};
         use hyper_util::rt::TokioIo;
         use std::sync::{Arc, Mutex};
@@ -422,7 +422,7 @@ mod header_tests {
         let response = sender.send_request(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(informational.lock().unwrap().as_slice(), &[StatusCode::CONTINUE]);
-        drop(response);
+        assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), Bytes::from_static(b"ok"));
         drop(sender);
         driver.await.unwrap().unwrap();
         server.await.unwrap();
