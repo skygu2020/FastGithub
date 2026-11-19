@@ -132,9 +132,9 @@ async fn forward_request(
 ) -> anyhow::Result<Response<ResponseBody>> {
     let host = uri.host_str().context("upstream URI has no host")?;
     let port = uri.port().unwrap_or(if uri.scheme() == "https" { 443 } else { 80 });
-    let (stream, upstream_ip) = crate::http_proxy::connect_target(host, port, resolver, domains, config).await?;
+    let (stream, upstream_ip) = crate::http_proxy::connect_target(host, port, resolver, domains, config, domain.as_ref()).await?;
     let io: Box<dyn AsyncIo> = if uri.scheme() == "https" {
-        Box::new(tls_proxy.connect_upstream(stream, host, &original_host, upstream_ip, domain.as_ref()).await?)
+        Box::new(tls_proxy.connect_upstream(stream, host, upstream_ip, domain.as_ref()).await?)
     } else if uri.scheme() == "http" {
         Box::new(stream)
     } else {
@@ -151,7 +151,7 @@ async fn forward_request(
     parts.uri = format!("{}://{}{}", uri.scheme(), host_authority(&uri), request_target).parse()
         .context("building upstream request URI")?;
     strip_hop_by_hop_headers(&mut parts.headers);
-    parts.headers.insert(header::HOST, HeaderValue::from_str(&host_authority(&uri))?);
+    parts.headers.insert(header::HOST, HeaderValue::from_str(&host_header(&uri))?);
     tracing::debug!(%original_host, upstream = %uri, "forwarding HTTP request");
     let upstream_request = Request::from_parts(parts, body);
     let upstream_response = sender.send_request(upstream_request).await?;
@@ -190,6 +190,11 @@ fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
     ] {
         headers.remove(name);
     }
+}
+
+fn host_header(uri: &url::Url) -> String {
+    let host = uri.host_str().unwrap_or_default();
+    if host.contains(':') { format!("[{host}]") } else { host.to_owned() }
 }
 
 fn host_authority(uri: &url::Url) -> String {
@@ -243,6 +248,14 @@ fn empty_response(status: StatusCode) -> Response<ResponseBody> {
 mod header_tests {
     use super::strip_hop_by_hop_headers;
     use http::{header, HeaderMap, HeaderValue};
+
+    #[test]
+    fn host_header_uses_destination_host_without_port() {
+        let uri = url::Url::parse("https://cdn.example:8443/assets").unwrap();
+        assert_eq!(super::host_header(&uri), "cdn.example");
+        let ipv6 = url::Url::parse("https://[2001:db8::1]:8443/assets").unwrap();
+        assert_eq!(super::host_header(&ipv6), "[2001:db8::1]");
+    }
 
     #[test]
     fn removes_connection_nominated_and_standard_hop_by_hop_headers() {

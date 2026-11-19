@@ -87,7 +87,7 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, doma
 
     // A raw CONNECT tunnel has no HTTP request to route, so connect to its
     // authority only after determining that the client is not starting TLS.
-    let (mut upstream, _upstream_ip) = connect_target(&host, port, &resolver, domains, &config)
+    let (mut upstream, _upstream_ip) = connect_target(&host, port, &resolver, domains, &config, None)
         .await.with_context(|| format!("connecting to raw CONNECT target {host}:{port}"))?;
     let (up, down) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
     tracing::debug!(%peer, %host, port, client_to_upstream = up, upstream_to_client = down, tls_intercepted = is_tls, "HTTP CONNECT tunnel closed");
@@ -251,8 +251,11 @@ pub(crate) async fn connect_target(
     resolver: &DomainResolver,
     domains: &[String],
     config: &AppConfig,
+    inherited_rule: Option<&crate::config::DomainConfig>,
 ) -> Result<(TcpStream, IpAddr)> {
-    let domain_config = config.domain_config(host);
+    // Destination changes the upstream host, but the original request's DomainConfig
+    // remains authoritative for IPAddress and TLS policy (matching .NET HttpClientHandler).
+    let domain_config = inherited_rule.or_else(|| config.domain_config(host));
 
     // FastGithub's DomainConfig.Timeout is an HTTP request-lifecycle timeout,
     // not a TCP dial timeout. Keep connection establishment on its fixed limit;
@@ -261,7 +264,7 @@ pub(crate) async fn connect_target(
     let mut addresses = Vec::new();
     if let Ok(ip) = host.parse::<IpAddr>() {
         addresses.push(ip);
-    } else if domains.iter().any(|pattern| crate::config::domain_matches(pattern, host)) {
+    } else if inherited_rule.is_some() || domains.iter().any(|pattern| crate::config::domain_matches(pattern, host)) {
         // Match the .NET implementation: a configured IP is the first candidate,
         // not an exclusive override; DNS candidates remain available as fallback.
         if let Some(configured) = domain_config.and_then(|value| value.ip_address.as_deref()) {
