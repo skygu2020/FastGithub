@@ -219,6 +219,12 @@ where
 
 async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppConfig, resolver: &DomainResolver, domains: &[String], tls_proxy: &crate::http_proxy::TlsProxy) -> Response<ResponseBody> {
     let method = request.method().clone();
+    // CONNECT has different HTTP/2 pseudo-header and tunnel semantics. This
+    // proxy currently implements raw CONNECT only on the HTTP/1 entry path;
+    // do not reinterpret an HTTP/2 authority-form request as an ordinary URL.
+    if request.version() == http::Version::HTTP_2 && method == Method::CONNECT {
+        return empty_response(StatusCode::NOT_IMPLEMENTED);
+    }
     let target = if request.version() == http::Version::HTTP_2 {
         match request.uri().authority() {
             Some(authority) => {
@@ -444,6 +450,10 @@ fn http_authorities_match(authority: &http::uri::Authority, host: &str) -> bool 
     }
     authority.host().eq_ignore_ascii_case(host_authority.host())
         && authority.port_u16() == host_authority.port_u16()
+}
+
+fn http2_connect_unsupported(version: http::Version, method: &Method) -> bool {
+    version == http::Version::HTTP_2 && method == Method::CONNECT
 }
 
 /// Detect an HTTP/1.1 protocol upgrade before the ordinary forwarding path
@@ -1573,6 +1583,14 @@ mod header_tests {
         drop(sender);
         driver.await.unwrap();
         server.await.unwrap();
+    }
+
+    #[test]
+    fn http2_connect_is_explicitly_unsupported() {
+        use super::http2_connect_unsupported;
+        assert!(http2_connect_unsupported(http::Version::HTTP_2, &http::Method::CONNECT));
+        assert!(!http2_connect_unsupported(http::Version::HTTP_2, &http::Method::GET));
+        assert!(!http2_connect_unsupported(http::Version::HTTP_11, &http::Method::CONNECT));
     }
 
     #[test]
