@@ -481,7 +481,7 @@ mod header_tests {
         );
 
         drop(sender);
-        driver.await.unwrap();
+        driver.await.unwrap().unwrap();
         server.await.unwrap();
     }
 
