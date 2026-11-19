@@ -116,20 +116,66 @@ fn is_http_token(byte: u8) -> bool {
 }
 
 fn parse_host_authority(authority: &str) -> Result<String> {
-    // Parse only the authority component here. Url::parse alone is too lenient:
-    // delimiters such as '#', '?', and '/' can terminate the authority while
-    // leaving a syntactically valid URL, silently changing the host we route on.
     if authority.is_empty()
         || authority.bytes().any(|byte| byte <= 0x20 || byte >= 0x7f)
         || authority.chars().any(|character| matches!(character, '@' | '/' | '\\' | '?' | '#')) {
         bail!("invalid Host authority");
     }
-    let uri = Url::parse(&format!("http://{authority}/")).context("invalid Host authority")?;
-    if uri.host_str().is_none() || !uri.username().is_empty() || uri.password().is_some()
-        || uri.port() == Some(0) {
-        bail!("invalid Host authority");
+
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let (host, suffix) = rest.split_once(']').context("invalid bracketed IPv6 Host")?;
+        host.parse::<std::net::Ipv6Addr>().context("invalid IPv6 Host address")?;
+        if suffix.is_empty() {
+            (host, None)
+        } else {
+            let port = suffix.strip_prefix(':').context("invalid IPv6 Host port")?;
+            (host, Some(port))
+        }
+    } else {
+        if authority.matches(':').count() > 1 {
+            bail!("IPv6 Host must use brackets");
+        }
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+
+    if let Some(port) = port {
+        if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("invalid Host port");
+        }
+        let port = port.parse::<u16>().context("Host port is outside the valid range")?;
+        if port == 0 {
+            bail!("Host port must be non-zero");
+        }
     }
-    Ok(uri.host_str().expect("host checked").to_owned())
+
+    if host.is_empty() {
+        bail!("empty Host name");
+    }
+    if host.parse::<std::net::IpAddr>().is_err() {
+        validate_hostname(host)?;
+    }
+    Ok(host.to_owned())
+}
+
+fn validate_hostname(host: &str) -> Result<()> {
+    if host.len() > 253 {
+        bail!("HTTP hostname is too long");
+    }
+    let hostname = host.strip_suffix('.').unwrap_or(host);
+    if hostname.is_empty() {
+        bail!("invalid HTTP hostname");
+    }
+    for label in hostname.split('.') {
+        if label.is_empty() || label.len() > 63
+            || label.starts_with('-') || label.ends_with('-')
+            || !label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') {
+            bail!("invalid HTTP hostname label");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
