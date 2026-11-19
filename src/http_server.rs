@@ -410,7 +410,7 @@ async fn forward_request_http2(
 
 /// Detect an HTTP/1.1 protocol upgrade before the ordinary forwarding path
 /// strips hop-by-hop headers.
-fn is_upgrade_request(request: &Request<Incoming>) -> bool {
+fn is_upgrade_request<B>(request: &Request<B>) -> bool {
     request.version() == http::Version::HTTP_11
         && request.method() == Method::GET
         && has_connection_token(request.headers(), "upgrade")
@@ -1344,6 +1344,86 @@ mod header_tests {
 
         let error = super::empty_response(http::StatusCode::BAD_GATEWAY);
         assert!(!error.headers().contains_key(header::CONNECTION));
+    }
+
+    #[test]
+    fn detects_and_preserves_http1_upgrade_headers() {
+        use super::{is_upgrade_request, preserve_upgrade_hop_by_hop_headers};
+        use bytes::Bytes;
+        use http::{Request, Version};
+        use http_body_util::Full;
+
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .version(Version::HTTP_11)
+            .uri("/socket")
+            .header(header::CONNECTION, "keep-alive, Upgrade")
+            .header(header::UPGRADE, "websocket")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert!(is_upgrade_request(&request));
+
+        let mut headers = request.headers().clone();
+        preserve_upgrade_hop_by_hop_headers(&mut headers);
+        assert_eq!(headers.get(header::CONNECTION).unwrap(), "Upgrade");
+        assert_eq!(headers.get(header::UPGRADE).unwrap(), "websocket");
+        assert!(!headers.contains_key("keep-alive"));
+
+        let ordinary = Request::builder()
+            .method(http::Method::GET)
+            .version(Version::HTTP_11)
+            .uri("/")
+            .header(header::CONNECTION, "keep-alive")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert!(!is_upgrade_request(&ordinary));
+    }
+
+    #[tokio::test]
+    async fn hyper_http2_loopback_serves_request_and_response_body() {
+        use super::{client_http2, server_http2, TokioExecutor};
+        use bytes::Bytes;
+        use http::{Request, Response, StatusCode, Version};
+        use http_body_util::{BodyExt, Full};
+        use hyper::{body::Incoming, service::service_fn};
+        use hyper_util::rt::TokioIo;
+        use std::convert::Infallible;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = service_fn(|request: Request<Incoming>| async move {
+                assert_eq!(request.version(), Version::HTTP_2);
+                assert_eq!(request.uri().path(), "/h2");
+                let response = Response::new(Full::new(Bytes::from_static(b"h2-ok")));
+                Ok::<_, Infallible>(response)
+            });
+            server_http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) =
+            client_http2::handshake(TokioExecutor::new(), TokioIo::new(stream)).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await.unwrap() });
+
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .version(Version::HTTP_2)
+            .uri("https://localhost/h2")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let response = sender.send_request(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), Bytes::from_static(b"h2-ok"));
+
+        drop(sender);
+        driver.await.unwrap();
+        server.await.unwrap();
     }
 
 }
