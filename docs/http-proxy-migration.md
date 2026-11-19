@@ -44,7 +44,7 @@
 2. **Upgrade / WebSocket**：当前移除 Upgrade 等 hop-by-hop headers，不提供 WebSocket 升级隧道。
 3. **HTTP/2**：当前依赖和代理实现以 HTTP/1 为主，尚未移植原版可能依赖的 HTTP/2 上游/下游协商行为。
 4. **代理兼容性与边界测试**：继续补充 Expect: 100-continue、超大/分块请求体、Trailer、客户端提前断开、上游提前断开、超时发生在请求体上传期间等集成测试。当前仅完成 Trailer frame 在 `TimeoutBody` 包装层中的透传单测，尚未完成真实 TCP 上下游验证。
-5. **Expect: 100-continue 尚未完整代理**：对照 Hyper v1.7.0 源码，HTTP/1 server 在开始 poll 带 Expect 的请求体时自动写入 `100 Continue`；HTTP/1 client parser 会识别 1xx，但当前 `send_request` 只向调用方交付最终响应，当前转发代码没有安装/转发 informational-response callback。因此不能声称上游的 100 Continue 被原样中继；需要专门的双端 loopback 测试，并评估手动控制请求体读取/临时响应转发的实现方式。项目的 Hyper 依赖是 `version = "1"` 且没有 Cargo.lock，实际解析版本仍需在用户构建环境确认。
+5. **Expect: 100-continue 尚未完整代理**：Hyper changelog 记录 `hyper::ext::on_informational()` 从 v1.6.0 起提供；它可在 HTTP/1 client 收到上游 1xx 时触发回调，但 `send_request` 仍只返回最终响应。新增 TCP loopback 测试使用原始上游 peer 发送 `100 Continue` + `200 OK`，检查 callback 收到 `100`。这只证明上游 1xx 可被观察，不代表它已转发给下游。当前 `forward_request` 尚未注册 callback，也没有把 1xx 写回下游的通道；Hyper HTTP/1 server 的普通 `Service` 响应接口只返回一个最终 `Response`。此外，Hyper client 不应被假定会等待上游 100 才开始 poll/发送请求体；需继续验证请求体背压和上游提前返回最终响应的行为，再设计真正的双向 interim-response relay。项目 Hyper 依赖是 `version = "1"` 且没有 Cargo.lock，实际解析版本仍由用户构建环境的 Cargo 解析结果决定。
 6. **代理标记**：已恢复原版 `FastGithub/1.0` User-Agent 标记：上游请求保留原 User-Agent 并追加标记；若入站请求已经包含该产品标记，则拒绝转发以防止 Destination 造成代理环路。响应 Server 头也会写入 `FastGithub`。
 7. **完整互操作测试**：目前有模块单元测试，但本分支近期修改尚未取得可确认的 cargo fmt / cargo test / cargo build 结果。不能把源码测试数量当成实际通过的构建结果。
 
