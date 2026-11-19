@@ -27,14 +27,18 @@ impl<S: AsyncRead + Unpin> AsyncRead for PrefixedIo<S> {
         cx: &mut Context<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let remaining = &self.prefix[self.offset..];
-        if !remaining.is_empty() && buffer.remaining() > 0 {
-            let count = remaining.len().min(buffer.remaining());
-            buffer.put_slice(&remaining[..count]);
-            self.offset += count;
+        let this = self.get_mut();
+        if buffer.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-        Pin::new(&mut self.inner).poll_read(cx, buffer)
+        if this.offset < this.prefix.len() {
+            let remaining = &this.prefix[this.offset..];
+            let count = remaining.len().min(buffer.remaining());
+            buffer.put_slice(&remaining[..count]);
+            this.offset += count;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buffer)
     }
 }
 
@@ -44,15 +48,15 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedIo<S> {
         cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, bytes)
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, bytes)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 
