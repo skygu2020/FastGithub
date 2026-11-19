@@ -130,7 +130,7 @@ impl TlsProxy {
         let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls())
             .context("creating inbound TLS acceptor")?;
         acceptor.set_alpn_select_callback(|_, client_protocols| {
-            openssl::ssl::select_next_proto(b"\\x02h2\\x08http/1.1", client_protocols)
+            openssl::ssl::select_next_proto(b"\x02h2\x08http/1.1", client_protocols)
                 .ok_or(AlpnError::NOACK)
         });
         let callback_certificates = Arc::clone(&certificates);
@@ -165,7 +165,7 @@ impl TlsProxy {
         let mut connect_config = self.connector.configure()?;
         connect_config.set_use_server_name_indication(!disable_sni);
         connect_config.set_verify_hostname(!ignore_name_mismatch);
-        connect_config.set_alpn_protos(b"\\x02h2\\x08http/1.1")?;
+        connect_config.set_alpn_protos(b"\x02h2\x08http/1.1")?;
         let mut ssl = connect_config.into_ssl(upstream_host)?;
         if let Some(sni) = configured_sni.as_deref() {
             ssl.set_hostname(sni)?;
