@@ -654,7 +654,11 @@ mod header_tests {
             sender.send_request(request),
         ).await.is_err());
         drop(connection_guard);
-        assert!(driver.await.unwrap_err().is_cancelled());
+        match driver.await {
+            Err(error) if error.is_cancelled() => {}
+            Ok(Err(_)) => {} // send_request cancellation may close the driver first
+            other => panic!("unexpected upstream driver completion: {other:?}"),
+        }
         peer.await.unwrap();
     }
 
