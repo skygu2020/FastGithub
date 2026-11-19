@@ -7,7 +7,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::OnceLock,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
@@ -43,6 +43,11 @@ pub struct DomainConfig {
 }
 
 impl DomainConfig {
+    /// Parse the .NET TimeSpan constant format used by FastGithub configuration.
+    pub fn request_timeout(&self) -> Result<Option<Duration>> {
+        self.timeout.as_deref().map(parse_time_span).transpose()
+    }
+
     /// Return the configured upstream SNI name. SNI is enabled unless explicitly disabled.
     pub fn tls_sni_value(&self, domain: &str, address: IpAddr) -> Option<String> {
         if self.tls_sni == Some(false) {
@@ -54,6 +59,40 @@ impl DomainConfig {
         let value = replace_ascii_case_insensitive(&value, "@random", &uptime_ms.to_string());
         Some(replace_ascii_case_insensitive(&value, "@ipaddress", &address.to_string()))
     }
+}
+
+/// Parse non-negative .NET TimeSpan values such as "00:02:00" or "1.02:03:04.5".
+fn parse_time_span(value: &str) -> Result<Duration> {
+    let (days, clock) = match value.split_once('.') {
+        Some((days, clock)) if !days.is_empty() && days.bytes().all(|b| b.is_ascii_digit()) =>
+            (days.parse::<u64>().context("invalid TimeSpan day component")?, clock),
+        _ => (0, value),
+    };
+    let parts = clock.split(':').collect::<Vec<_>>();
+    if parts.len() != 3 { anyhow::bail!("invalid TimeSpan '{value}'"); }
+    let hours = parts[0].parse::<u64>().context("invalid TimeSpan hours")?;
+    let minutes = parts[1].parse::<u64>().context("invalid TimeSpan minutes")?;
+    let (sec_text, fraction_text) = parts[2].split_once('.').unwrap_or((parts[2], ""));
+    let seconds = sec_text.parse::<u64>().context("invalid TimeSpan seconds")?;
+    if minutes >= 60 || seconds >= 60 || fraction_text.len() > 9
+        || !fraction_text.bytes().all(|b| b.is_ascii_digit()) {
+        anyhow::bail!("invalid TimeSpan '{value}'");
+    }
+    let nanos = if fraction_text.is_empty() { 0 } else {
+        fraction_text.parse::<u32>().context("invalid TimeSpan fraction")?
+            * 10u32.pow((9 - fraction_text.len()) as u32)
+    };
+    let total = (days as u128).checked_mul(86400)
+        .and_then(|v| v.checked_add((hours as u128) * 3600))
+        .and_then(|v| v.checked_add((minutes as u128) * 60))
+        .and_then(|v| v.checked_add(seconds as u128))
+        .context("TimeSpan is too large")?;
+    let nanos_total = total.checked_mul(1_000_000_000)
+        .and_then(|v| v.checked_add(nanos as u128))
+        .context("TimeSpan is too large")?;
+    let secs = u64::try_from(nanos_total / 1_000_000_000)
+        .context("TimeSpan exceeds supported duration")?;
+    Ok(Duration::new(secs, (nanos_total % 1_000_000_000) as u32))
 }
 
 fn system_uptime_ms() -> u128 {
@@ -155,8 +194,16 @@ fn wildcard_domain_match(pattern: &str, host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_for_test, wildcard_domain_match, DomainConfig};
+    use super::{expand_for_test, parse_time_span, wildcard_domain_match, DomainConfig};
     use std::net::IpAddr;
+
+    #[test]
+    fn parses_dotnet_time_span_configuration() {
+        assert_eq!(parse_time_span("00:02:00").unwrap(), std::time::Duration::from_secs(120));
+        assert_eq!(parse_time_span("1.02:03:04.5").unwrap(), std::time::Duration::new(93_784, 500_000_000));
+        assert!(parse_time_span("00:60:00").is_err());
+        assert!(parse_time_span("invalid").is_err());
+    }
 
     #[test]
     fn wildcard_does_not_cross_label_separator() {

@@ -228,6 +228,8 @@ async fn connect_target(
         .find(|(pattern, _)| crate::config::domain_matches(pattern, host))
         .map(|(_, value)| value);
 
+    let connect_timeout = domain_config.and_then(|value| value.request_timeout().transpose()).transpose()?
+        .flatten().unwrap_or(CONNECT_TIMEOUT);
     let mut addresses = Vec::new();
     if let Ok(ip) = host.parse::<IpAddr>() {
         addresses.push(ip);
@@ -262,7 +264,7 @@ async fn connect_target(
     let mut failures = Vec::new();
     for ip in unique_addresses {
         let endpoint = SocketAddr::new(ip, port);
-        match timeout(CONNECT_TIMEOUT, TcpStream::connect(endpoint)).await {
+        match timeout(connect_timeout, TcpStream::connect(endpoint)).await {
             Ok(Ok(stream)) => { stream.set_nodelay(true)?; return Ok((stream, ip)); }
             Ok(Err(error)) => failures.push(format!("{endpoint}: {error}")),
             Err(_) => failures.push(format!("{endpoint}: connection timed out")),
