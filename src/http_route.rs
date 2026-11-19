@@ -61,12 +61,16 @@ pub fn route_request(
         // Validate the parsed authority with the same strict rules as Host.
         // URL parsers can normalize or accept authority syntax that an HTTP
         // proxy should reject, including a zero port or malformed DNS labels.
-        parse_host_authority(&authority_from_url(&uri))?;
+        let raw_authority = absolute_authority(request_target)?;
+        parse_host_authority(raw_authority)?;
         Some(uri)
     };
 
     let (original_host, original_authority) = match absolute.as_ref() {
-        Some(uri) => (uri.host_str().expect("absolute URI host checked").to_owned(), authority_from_url(uri)),
+        Some(uri) => {
+            let authority = absolute_authority(request_target)?;
+            (uri.host_str().expect("absolute URI host checked").to_owned(), authority.to_owned())
+        }
         None => {
             let authority = host_header.context("origin-form request requires Host header")?;
             (parse_host_authority(authority)?, authority.to_owned())
@@ -109,13 +113,18 @@ pub fn route_request(
 }
 
 
-fn authority_from_url(uri: &Url) -> String {
-    let host = uri.host_str().expect("URL host checked");
-    let host = if host.contains(':') { format!("[{host}]") } else { host.to_owned() };
-    match uri.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host,
+/// Extract the authority exactly as written in an absolute-form request-target.
+/// Url::port() normalizes away explicit default ports (80/443), but relative
+/// Destination resolution must retain the original authority's explicit port.
+fn absolute_authority(request_target: &str) -> Result<&str> {
+    let (_, after_scheme) = request_target.split_once("://")
+        .context("absolute-form request-target is missing ://")?;
+    let end = after_scheme.find(['/', '?', '#']).unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..end];
+    if authority.is_empty() {
+        bail!("absolute-form request-target has an empty authority");
     }
+    Ok(authority)
 }
 
 fn is_http_token(byte: u8) -> bool {
@@ -252,6 +261,16 @@ mod tests {
             RouteDecision::Forward { uri, .. } => assert_eq!(uri.as_str(), "https://origin.example:8443/mirror/path"),
             _ => panic!("expected forwarding"),
         }
+    }
+
+    #[test]
+    fn absolute_form_relative_destination_preserves_explicit_default_port() {
+        let rule = DomainConfig { destination: Some("mirror/".into()), ..Default::default() };
+        match route_request("GET", "https://origin.example:443/x", None, "https", &config(&[("origin.example", rule)])).unwrap() {
+            RouteDecision::Forward { uri, .. } => assert_eq!(uri.as_str(), "https://origin.example/mirror/"),
+            _ => panic!("expected forwarding"),
+        }
+        assert_eq!(absolute_authority("https://[2001:db8::1]:443/a").unwrap(), "[2001:db8::1]:443");
     }
 
     #[test]
