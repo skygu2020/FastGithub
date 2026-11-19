@@ -5,6 +5,7 @@ mod dns;
 mod dnscrypt;
 mod http_proxy;
 mod http_response;
+mod http_route;
 mod destination;
 mod persistence;
 mod resolver;
