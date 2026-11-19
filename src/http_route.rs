@@ -116,9 +116,12 @@ fn is_http_token(byte: u8) -> bool {
 }
 
 fn parse_host_authority(authority: &str) -> Result<String> {
-    if authority.is_empty() || authority.bytes().any(|byte| byte <= 0x20 || byte >= 0x7f)
-        || authority.contains('@') || authority.contains('/') || authority.contains('\\')
-        || authority.contains('?') || authority.contains('#') {
+    // Parse only the authority component here. Url::parse alone is too lenient:
+    // delimiters such as '#', '?', and '/' can terminate the authority while
+    // leaving a syntactically valid URL, silently changing the host we route on.
+    if authority.is_empty()
+        || authority.bytes().any(|byte| byte <= 0x20 || byte >= 0x7f)
+        || authority.chars().any(|character| matches!(character, '@' | '/' | '\\' | '?' | '#')) {
         bail!("invalid Host authority");
     }
     let uri = Url::parse(&format!("http://{authority}/")).context("invalid Host authority")?;
@@ -210,6 +213,18 @@ mod tests {
     fn rejects_zero_port_in_host_authority() {
         let cfg = config(&[]);
         assert!(route_request("GET", "/", Some("example.com:0"), "http", &cfg).is_err());
+    }
+
+    #[test]
+    fn rejects_host_authority_url_delimiters() {
+        let cfg = config(&[]);
+        for authority in [
+            "example.com/path", "example.com?query", "example.com#fragment",
+            "example.com\\\\evil", "user@example.com",
+        ] {
+            assert!(route_request("GET", "/", Some(authority), "http", &cfg).is_err(),
+                "accepted Host authority {authority}");
+        }
     }
 
     #[test]
