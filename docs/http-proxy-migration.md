@@ -66,3 +66,6 @@
 The native listener now recognizes configured `Response` rules for plain HTTP proxy requests. It obtains the host from absolute-form `http://` request targets or the `Host` header, applies the existing ordered domain-rule matcher, and returns the configured status, content type, and optional UTF-8 body without opening an upstream connection. `HEAD` suppresses the body while retaining its representation length; 1xx, 204, and 304 responses are bodyless. The configured content type is checked for CR/LF before it is written to the response.
 
 This is deliberately a narrow first step: unmatched plain HTTP requests still return 501, and HTTPS CONNECT traffic still uses the existing TLS byte tunnel after interception. This does not yet implement the original middleware's complete reverse proxy, `Destination` URI resolution, or per-request timeout behavior. Request-body consumption and persistent HTTP keep-alive are also not implemented on this short-circuit path; the connection is closed after the configured response.
+
+
+The domain `Timeout` setting is deliberately not used as a TCP connect timeout. The original implementation applies it to the HTTP request lifecycle; until the Rust HTTP forwarding layer exists, TCP connection attempts retain the fixed 10-second connect limit and request-level timeout remains unsupported.

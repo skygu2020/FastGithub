@@ -57,3 +57,6 @@ executable until those gaps are implemented or explicitly accepted and tested.
 ### Destination URI groundwork
 
 The Rust branch now has a dedicated URI resolver for the original middleware's Destination semantics. It constructs the base URI as `{scheme}://{host}/` and resolves the configured value as a URI reference, covering absolute destinations, relative paths, root-relative paths, parent segments, and query-only references. Only HTTP and HTTPS destinations are accepted. This helper is groundwork only: it is not yet wired into upstream request forwarding, which remains unimplemented.
+
+
+The domain `Timeout` setting is deliberately not used as a TCP connect timeout. The original implementation applies it to the HTTP request lifecycle; until the Rust HTTP forwarding layer exists, TCP connection attempts retain the fixed 10-second connect limit and request-level timeout remains unsupported.
