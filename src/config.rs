@@ -160,7 +160,17 @@ impl AppConfig {
     }
 
     pub fn matches_domain(&self, host: &str) -> bool {
-        self.fast_github.domain_configs.keys().any(|pattern| wildcard_domain_match(pattern, host))
+        self.domain_config(host).is_some()
+    }
+
+    /// Resolve a domain rule using the same ordering as the original DomainPattern:
+    /// fewer labels first, then compare labels from right to left, with '*' sorting last.
+    pub fn domain_config(&self, host: &str) -> Option<&DomainConfig> {
+        let mut patterns = self.fast_github.domain_configs.keys().collect::<Vec<_>>();
+        patterns.sort_by(|left, right| compare_domain_patterns(left, right));
+        patterns.into_iter()
+            .find(|pattern| wildcard_domain_match(pattern, host))
+            .and_then(|pattern| self.fast_github.domain_configs.get(pattern))
     }
 }
 
@@ -185,6 +195,20 @@ fn merge(base: &mut Value, overlay: Value) {
 
 pub fn domain_matches(pattern: &str, host: &str) -> bool { wildcard_domain_match(pattern, host) }
 
+fn compare_domain_patterns(left: &str, right: &str) -> std::cmp::Ordering {
+    let left_labels = left.split('.').collect::<Vec<_>>();
+    let right_labels = right.split('.').collect::<Vec<_>>();
+    left_labels.len().cmp(&right_labels.len()).then_with(|| {
+        for (left, right) in left_labels.iter().rev().zip(right_labels.iter().rev()) {
+            let left = left.replace('*', "\\u{10ffff}");
+            let right = right.replace('*', "\\u{10ffff}");
+            let order = left.cmp(&right);
+            if !order.is_eq() { return order; }
+        }
+        std::cmp::Ordering::Equal
+    })
+}
+
 fn wildcard_domain_match(pattern: &str, host: &str) -> bool {
     let pattern: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
     let host: Vec<char> = host.trim_end_matches('.').to_ascii_lowercase().chars().collect();
@@ -200,7 +224,7 @@ fn wildcard_domain_match(pattern: &str, host: &str) -> bool {
         } else {
             for index in 1..=host.len() {
                 current[index] = previous[index - 1] && host[index - 1] != '.'
-                    && (token == '?' || token == host[index - 1]);
+                    && token == host[index - 1];
             }
         }
         previous = current;
@@ -243,6 +267,16 @@ mod tests {
     #[test]
     fn matching_is_case_insensitive_and_ignores_trailing_dot() {
         assert!(wildcard_domain_match("*.GitHub.com", "API.GITHUB.COM."));
+        assert!(!wildcard_domain_match("?.github.com", "a.github.com"));
+    }
+
+    #[test]
+    fn domain_rules_follow_original_specificity_order() {
+        use super::compare_domain_patterns;
+        assert!(compare_domain_patterns("github.com", "*.github.com").is_lt());
+        assert!(compare_domain_patterns("api.github.com", "*.github.com").is_lt());
+        assert!(compare_domain_patterns("*.example.com", "*.github.com").is_lt());
+        assert!(compare_domain_patterns("*.github.com", "api.*.com").is_lt());
     }
 
     #[test]

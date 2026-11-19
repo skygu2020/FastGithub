@@ -224,9 +224,7 @@ async fn connect_target(
     domains: &[String],
     config: &AppConfig,
 ) -> Result<(TcpStream, IpAddr)> {
-    let domain_config = config.fast_github.domain_configs.iter()
-        .find(|(pattern, _)| crate::config::domain_matches(pattern, host))
-        .map(|(_, value)| value);
+    let domain_config = config.domain_config(host);
 
     let connect_timeout = match domain_config {
         Some(value) => value.request_timeout()?.unwrap_or(CONNECT_TIMEOUT),
