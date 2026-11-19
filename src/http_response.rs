@@ -1,4 +1,4 @@
-use crate::config::AppConfig;
+use crate::{config::AppConfig, http_route::{route_request, RouteDecision}};
 use anyhow::{bail, Context, Result};
 use tokio::{io::AsyncWriteExt, net::TcpStream};
 
@@ -14,15 +14,15 @@ pub async fn try_respond(stream: &mut TcpStream, header: &[u8], config: &AppConf
     if fields.next().is_some() || !matches!(version, "HTTP/1.0" | "HTTP/1.1") { bail!("invalid HTTP request line"); }
     if method.eq_ignore_ascii_case("CONNECT") { return Ok(false); }
 
-    let host = match request_target_host(target)? {
-        Some(host) => host,
-        None => match parse_host_header(lines)? {
-            Some(value) => host_from_authority(value)?,
-            None => return Ok(false),
-        },
+    let host_header = parse_host_header(lines)?;
+    let response = match route_request(method, target, host_header, "http", config)? {
+        RouteDecision::Respond(response) => response,
+        RouteDecision::Forward { .. } => return Ok(false),
     };
-    let Some(response) = config.domain_config(&host).and_then(|domain| domain.response.as_ref()) else {
-        return Ok(false);
+    let host = if target.get(..7).is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://")) {
+        url::Url::parse(target)?.host_str().unwrap_or_default().to_owned()
+    } else {
+        host_header.map(host_from_authority).transpose()?.unwrap_or_default()
     };
     validate_response_status(response.status_code)?;
     if response.content_type.chars().any(|character| character.is_control() && character != '\t') {
@@ -58,21 +58,6 @@ fn validate_response_status(status: u16) -> Result<()> {
     Ok(())
 }
 
-fn request_target_host(target: &str) -> Result<Option<String>> {
-    if target.get(..7).is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://")) {
-        let uri = url::Url::parse(target).context("invalid absolute-form HTTP request target")?;
-        if uri.scheme() != "http" || uri.host_str().is_none()
-            || !uri.username().is_empty() || uri.password().is_some() || uri.fragment().is_some() {
-            bail!("invalid absolute-form HTTP request target");
-        }
-        return Ok(Some(uri.host_str().expect("host checked").to_owned()));
-    }
-    if target.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://")) {
-        bail!("HTTPS absolute-form is not valid on the plain HTTP proxy listener");
-    }
-    if target.starts_with('/') || target == "*" { return Ok(None); }
-    bail!("unsupported HTTP request-target form")
-}
 
 fn parse_host_header<'a>(lines: impl Iterator<Item = &'a str>) -> Result<Option<&'a str>> {
     let mut host = None;
@@ -121,25 +106,6 @@ fn host_from_authority(authority: &str) -> Result<String> {
     Ok(host.to_owned())
 }
 
-/// Validate the ASCII DNS host syntax accepted by the proxy's domain matcher.
-/// Internationalized names must arrive in their IDNA ASCII (punycode) form.
-fn validate_http_hostname(host: &str) -> Result<()> {
-    if host.is_empty() || host.len() > 253 {
-        bail!("invalid HTTP hostname length");
-    }
-    let hostname = host.strip_suffix('.').unwrap_or(host);
-    if hostname.is_empty() {
-        bail!("empty HTTP hostname");
-    }
-    for label in hostname.split('.') {
-        if label.is_empty() || label.len() > 63
-            || !label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            || label.starts_with('-') || label.ends_with('-') {
-            bail!("invalid HTTP hostname label");
-        }
-    }
-    Ok(())
-}
 
 fn reason_phrase(status: u16) -> &'static str {
     match status {
@@ -154,7 +120,7 @@ fn reason_phrase(status: u16) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_from_authority, parse_host_header, request_target_host, validate_response_status};
+    use super::{host_from_authority, parse_host_header, validate_response_status};
     #[test]
     fn accepts_only_final_http_status_code_range() {
         assert!(validate_response_status(200).is_ok());
@@ -163,24 +129,6 @@ mod tests {
         assert!(validate_response_status(199).is_err());
         assert!(validate_response_status(600).is_err());
         assert!(validate_response_status(999).is_err());
-    }
-
-    #[test]
-    fn extracts_absolute_and_origin_form_hosts() {
-        assert_eq!(request_target_host("http://example.com:8080/a?q=1").unwrap().as_deref(), Some("example.com"));
-        assert_eq!(request_target_host("HTTP://EXAMPLE.COM/a").unwrap().as_deref(), Some("EXAMPLE.COM"));
-        assert!(request_target_host("https://example.com/a").is_err());
-        assert_eq!(request_target_host("/path?q=1").unwrap(), None);
-    }
-    #[test]
-    fn validates_absolute_form_request_targets() {
-        assert_eq!(request_target_host("http://example.com:8080/a?q=1").unwrap().as_deref(), Some("example.com"));
-        assert_eq!(request_target_host("HTTP://EXAMPLE.COM/a").unwrap().as_deref(), Some("example.com"));
-        assert_eq!(request_target_host("http://[2001:db8::1]:8080/").unwrap().as_deref(), Some("2001:db8::1"));
-        assert!(request_target_host("http://user@example.com/").is_err());
-        assert!(request_target_host("http://example.com/#fragment").is_err());
-        assert!(request_target_host("http://example.com:bad/").is_err());
-        assert!(request_target_host("http:///missing-host").is_err());
     }
 
     #[test]
