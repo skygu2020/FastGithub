@@ -593,6 +593,63 @@ mod header_tests {
     }
 
     #[tokio::test]
+    async fn gated_expect_body_stops_when_upstream_rejects_without_continue() {
+        use bytes::Bytes;
+        use http::{header, HeaderValue, Request, StatusCode};
+        use http_body_util::{BodyExt, Full};
+        use hyper::client::conn::http1 as client_http1;
+        use hyper_util::rt::TokioIo;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                head.push(byte[0]);
+            }
+            assert!(String::from_utf8_lossy(&head).to_ascii_lowercase().contains("expect: 100-continue"));
+            let mut probe = [0_u8; 1];
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                stream.read(&mut probe),
+            ).await.is_err());
+            stream.write_all(b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            // The client must not upload the gated body after the final rejection.
+            assert_eq!(stream.read(&mut probe).await.unwrap(), 0);
+        });
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) = client_http1::handshake(TokioIo::new(stream)).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await.unwrap() });
+        let (_continue_tx, continue_rx) = oneshot::channel();
+        let body = ExpectContinueBody::new(
+            Full::new(Bytes::from_static(b"payload")).map_err(|never| match never {}),
+            Some(continue_rx),
+        );
+        let mut request = Request::new(body);
+        *request.method_mut() = http::Method::POST;
+        *request.uri_mut() = "/upload".parse().unwrap();
+        request.headers_mut().insert(header::HOST, HeaderValue::from_static("localhost"));
+        request.headers_mut().insert(header::EXPECT, HeaderValue::from_static("100-continue"));
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            sender.send_request(request),
+        ).await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::EXPECTATION_FAILED);
+        response.into_body().collect().await.unwrap();
+        drop(sender);
+        let _ = driver.await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn hyper_http1_client_reports_upstream_informational_responses() {
         use bytes::Bytes;
         use http::{header, HeaderValue, Request, StatusCode};
