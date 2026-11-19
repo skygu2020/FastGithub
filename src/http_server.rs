@@ -433,6 +433,15 @@ fn http_authorities_match(authority: &http::uri::Authority, host: &str) -> bool 
     let Ok(host_authority) = host.parse::<http::uri::Authority>() else {
         return false;
     };
+    // Userinfo is not valid in an HTTP Host / :authority value. Also reject
+    // ports that cannot be represented as u16 instead of treating them as
+    // equivalent to an omitted port.
+    if authority.as_str().contains('@') || host_authority.as_str().contains('@')
+        || (authority.port().is_some() && authority.port_u16().is_none())
+        || (host_authority.port().is_some() && host_authority.port_u16().is_none())
+    {
+        return false;
+    }
     authority.host().eq_ignore_ascii_case(host_authority.host())
         && authority.port_u16() == host_authority.port_u16()
 }
