@@ -377,6 +377,7 @@ mod header_tests {
 
     #[tokio::test]
     async fn hyper_http1_loopback_preserves_request_and_response_trailers() {
+        use super::BoxError;
         use bytes::Bytes;
         use http::{HeaderMap, HeaderValue, Request, Response};
         use http_body::Frame;
