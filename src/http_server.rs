@@ -400,6 +400,15 @@ mod header_tests {
             assert!(String::from_utf8_lossy(&request_head)
                 .to_ascii_lowercase()
                 .contains("expect: 100-continue"));
+            // Hyper's HTTP/1 client does not hold this body until it sees
+            // the upstream 100 response: it starts streaming after the head.
+            // Read the complete body before allowing the peer to send 100.
+            let mut request_body = [0_u8; 7];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                stream.read_exact(&mut request_body),
+            ).await.unwrap().unwrap();
+            assert_eq!(&request_body, b"payload");
             stream.write_all(
                 b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
             ).await.unwrap();
