@@ -207,7 +207,7 @@ async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppCo
             // is available for streaming it.
             let request_started = tokio::time::Instant::now();
             let forwarding = if is_upgrade_request(&request) {
-                forward_upgrade_request(request, uri, request_target, original_host, domain, resolver, domains, config, tls_proxy)
+                forward_upgrade_request(request, uri, request_target, original_host, domain, timeout_duration, request_started, resolver, domains, config, tls_proxy)
             } else {
                 forward_request(request, uri, request_target, original_host, domain, timeout_duration, request_started, resolver, domains, config, tls_proxy)
             };
@@ -365,6 +365,8 @@ async fn forward_upgrade_request(
     request_target: String,
     original_host: String,
     domain: Option<crate::config::DomainConfig>,
+    body_timeout: Option<Duration>,
+    request_started: tokio::time::Instant,
     resolver: &DomainResolver,
     domains: &[String],
     config: &AppConfig,
@@ -411,7 +413,8 @@ async fn forward_upgrade_request(
         strip_hop_by_hop_headers(&mut response_parts.headers);
         response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
         let boxed_body = response_body.map_err(|error| Box::new(error) as BoxError).boxed_unsync();
-        let response_body = TimeoutBody::new(boxed_body, None, connection_guard).boxed_unsync();
+        let remaining = body_timeout.map(|duration| duration.saturating_sub(request_started.elapsed()));
+        let response_body = TimeoutBody::new(boxed_body, remaining, connection_guard).boxed_unsync();
         return Ok(Response::from_parts(response_parts, response_body));
     }
 
