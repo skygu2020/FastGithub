@@ -376,6 +376,47 @@ mod header_tests {
     }
 
     #[tokio::test]
+    async fn timeout_body_preserves_response_trailer_frames() {
+        use super::{BoxError, TimeoutBody};
+        use bytes::Bytes;
+        use http::{HeaderMap, HeaderValue};
+        use http_body::Frame;
+        use std::{collections::VecDeque, pin::Pin, task::{Context, Poll}};
+
+        struct Frames(VecDeque<Frame<Bytes>>);
+        impl http_body::Body for Frames {
+            type Data = Bytes;
+            type Error = BoxError;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                Poll::Ready(self.0.pop_front().map(Ok))
+            }
+        }
+
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-checksum", HeaderValue::from_static("sha256-test"));
+        let inner = Frames(VecDeque::from([
+            Frame::data(Bytes::from_static(b"payload")),
+            Frame::trailers(trailers),
+        ]));
+        let task = tokio::spawn(std::future::pending::<()>());
+        let guard = super::UpstreamConnectionGuard(task.abort_handle());
+        let mut body = TimeoutBody::new(inner, None, guard);
+
+        assert_eq!(
+            body.frame().await.unwrap().unwrap().into_data().unwrap(),
+            Bytes::from_static(b"payload"),
+        );
+        let forwarded_trailers = body.frame().await.unwrap().unwrap().into_trailers().unwrap();
+        assert_eq!(forwarded_trailers.get("x-checksum").unwrap(), "sha256-test");
+        assert!(body.frame().await.is_none());
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
     async fn upstream_body_error_releases_connection_driver() {
         use super::{BoxError, TimeoutBody};
         use bytes::Bytes;
