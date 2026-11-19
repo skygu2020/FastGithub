@@ -382,7 +382,7 @@ mod header_tests {
         use http_body_util::{BodyExt, Full};
         use hyper::{server::conn::http1 as server_http1, service::service_fn, Request};
         use hyper_util::rt::TokioIo;
-        use std::convert::Infallible;
+        use std::{convert::Infallible, sync::Mutex};
         use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener, sync::oneshot};
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -391,11 +391,11 @@ mod header_tests {
         let (poll_tx, poll_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut received_tx = Some(received_tx);
-            let mut poll_rx = Some(poll_rx);
+            let received_tx = Mutex::new(Some(received_tx));
+            let poll_rx = Mutex::new(Some(poll_rx));
             let service = service_fn(move |request: Request<hyper::body::Incoming>| {
-                let received_tx = received_tx.take().unwrap();
-                let poll_rx = poll_rx.take().unwrap();
+                let received_tx = received_tx.lock().unwrap().take().unwrap();
+                let poll_rx = poll_rx.lock().unwrap().take().unwrap();
                 async move {
                     received_tx.send(()).unwrap();
                     // Do not touch Incoming until the test explicitly permits it.
