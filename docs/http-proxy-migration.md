@@ -53,7 +53,7 @@
 4. **代理兼容性与边界测试**：继续补充 Expect: 100-continue、超大/分块请求体、Trailer、客户端提前断开、上游提前断开、超时发生在请求体上传期间等集成测试。当前仅完成 Trailer frame 在 `TimeoutBody` 包装层中的透传单测，尚未完成真实 TCP 上下游验证。
 5. **Expect: 100-continue：已加入上游许可门控，仍需构建验证**：Hyper HTTP/1 client 会在收到上游 100 之前开始 poll 请求体；入站 Hyper HTTP/1 server 则在 Service 首次 poll `Incoming` body 时自动向下游发送 100。为协调这两个行为，`forward_request` 现对包含 `Expect: 100-continue` 的请求使用 `ExpectContinueBody`：先将请求头交给上游，body 保持 Pending；通过 `hyper::ext::on_informational()` 观察到上游 100 后才释放 body。这样首次 poll 入站 body 才会触发下游 100。若上游直接返回最终响应（例如 417），body 不会被释放，最终响应可以直接返回，下游上传也不会开始。请求体已经处于 end-stream 状态时，即使带有 Expect 头也不会启用门控，避免空请求体等待永远不会到来的 100。新增测试覆盖空 body 不启用门控、TCP loopback 中 gated body 在上游 100 后才上传、上游返回 417 时不上传，以及等待上游许可期间取消请求时关闭上游 driver；另保留原始 Hyper client 行为基线测试和入站 server 自动 100 触发时机测试。当前尚未在本地运行 cargo test，需用户构建验证 Hyper 版本解析/API 兼容性和测试时序。该实现只处理中继 100 Continue，不转发 103 Early Hints 等其他 1xx；项目 Hyper 依赖是 `version = "1"` 且没有 Cargo.lock，实际解析版本由用户构建环境的 Cargo 决定。
 6. **代理标记**：已恢复原版 `FastGithub/1.0` User-Agent 标记：上游请求保留原 User-Agent 并追加标记；若入站请求已经包含该产品标记，则拒绝转发以防止 Destination 造成代理环路。响应 Server 头也会写入 `FastGithub`。
-7. **完整互操作测试**：目前有模块单元测试，但本分支近期修改尚未取得可确认的 cargo fmt / cargo test / cargo build 结果。不能把源码测试数量当成实际通过的构建结果。
+7. **完整互操作测试**：已新增下游 HTTP/1 同连接多请求、Upgrade 头保留/识别、Hyper HTTP/2 client/server loopback 等主线协议测试；仍未取得可确认的 cargo fmt / cargo test / cargo build 结果。后续回归阶段继续覆盖真实代理链路中的 Expect、分块上传、Trailer、上下游提前断开、超时取消、TLS ALPN 与 WebSocket 双向隧道。不能把源码测试数量当成实际通过的构建结果。
 
 ## 实现约束
 
