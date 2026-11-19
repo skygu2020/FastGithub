@@ -1426,4 +1426,68 @@ mod header_tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn hyper_http1_upgrade_handoff_carries_bidirectional_bytes() {
+        use super::client_http1;
+        use bytes::Bytes;
+        use http::{Request, Response, StatusCode};
+        use http_body_util::Full;
+        use hyper::{body::Incoming, service::service_fn, server::conn::http1 as server_http1};
+        use hyper_util::rt::TokioIo;
+        use std::convert::Infallible;
+        use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = service_fn(|mut request: Request<Incoming>| async move {
+                let on_upgrade = hyper::upgrade::on(&mut request);
+                tokio::spawn(async move {
+                    let upgraded = on_upgrade.await.unwrap();
+                    let mut io = TokioIo::new(upgraded);
+                    let mut payload = [0u8; 4];
+                    io.read_exact(&mut payload).await.unwrap();
+                    io.write_all(&payload).await.unwrap();
+                });
+                let mut response = Response::new(Full::new(Bytes::new()));
+                *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+                response.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+                response.headers_mut().insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+                Ok::<_, Infallible>(response)
+            });
+            server_http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .with_upgrades()
+                .await
+                .unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) = client_http1::handshake(TokioIo::new(stream)).await.unwrap();
+        let driver = tokio::spawn(async move { connection.with_upgrades().await.unwrap() });
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri("/ws")
+            .header(header::HOST, "localhost")
+            .header(header::CONNECTION, "Upgrade")
+            .header(header::UPGRADE, "websocket")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let response = sender.send_request(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+        let upgraded = hyper::upgrade::on(response).await.unwrap();
+        let mut io = TokioIo::new(upgraded);
+        io.write_all(b"ping").await.unwrap();
+        let mut echoed = [0u8; 4];
+        io.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+
+        drop(io);
+        drop(sender);
+        driver.await.unwrap();
+        server.await.unwrap();
+    }
+
 }
