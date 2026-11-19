@@ -288,6 +288,7 @@ async fn forward_request(
     if has_fastgithub_user_agent(request.headers()) {
         anyhow::bail!("request already contains FastGithub/1.0 User-Agent marker; refusing proxy loop");
     }
+    let downstream_version = request.version();
     let host = uri.host_str().context("upstream URI has no host")?;
     let port = uri.port().unwrap_or(if uri.scheme() == "https" { 443 } else { 80 });
     let (stream, upstream_ip) = crate::http_proxy::connect_target(host, port, resolver, domains, config, domain.as_ref()).await?;
@@ -302,7 +303,7 @@ async fn forward_request(
     };
     if upstream_http2 {
         return forward_request_http2(
-            request, uri, request_target, original_host, body_timeout, request_started, io,
+            request, uri, request_target, original_host, downstream_version, body_timeout, request_started, io,
         ).await;
     }
     let (mut sender, connection) = client_http1::handshake(TokioIo::new(io)).await?;
@@ -342,6 +343,7 @@ async fn forward_request(
     }
     let upstream_response = sender.send_request(upstream_request).await?;
     let (mut response_parts, response_body) = upstream_response.into_parts();
+    response_parts.version = downstream_version;
     strip_hop_by_hop_headers(&mut response_parts.headers);
     response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
     let boxed_body = response_body.map_err(|error| Box::new(error) as BoxError).boxed_unsync();
@@ -355,6 +357,7 @@ async fn forward_request_http2(
     uri: url::Url,
     request_target: String,
     original_host: String,
+    downstream_version: http::Version,
     body_timeout: Option<Duration>,
     request_started: tokio::time::Instant,
     io: Box<dyn AsyncIo>,
@@ -375,6 +378,7 @@ async fn forward_request_http2(
     parts.version = http::Version::HTTP_2;
     strip_hop_by_hop_headers(&mut parts.headers);
     parts.headers.remove(header::HOST);
+    parts.headers.remove(header::TRANSFER_ENCODING);
     append_fastgithub_user_agent(&mut parts.headers)?;
     tracing::debug!(%original_host, upstream = %uri, "forwarding HTTP/2 request");
 
@@ -395,6 +399,7 @@ async fn forward_request_http2(
 
     let upstream_response = sender.send_request(upstream_request).await?;
     let (mut response_parts, response_body) = upstream_response.into_parts();
+    response_parts.version = downstream_version;
     strip_hop_by_hop_headers(&mut response_parts.headers);
     response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
     let boxed_body = response_body.map_err(|error| Box::new(error) as BoxError).boxed_unsync();
