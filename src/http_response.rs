@@ -107,6 +107,27 @@ fn host_from_authority(authority: &str) -> Result<String> {
 }
 
 
+/// Validate the ASCII DNS hostname syntax used by HTTP Host authorities.
+/// Internationalized names must be supplied in their ASCII/Punycode form.
+fn validate_http_hostname(host: &str) -> Result<()> {
+    if host.is_empty() || host.len() > 253 {
+        bail!("invalid HTTP hostname length");
+    }
+    let hostname = host.strip_suffix('.').unwrap_or(host);
+    if hostname.is_empty() {
+        bail!("invalid HTTP hostname");
+    }
+    for label in hostname.split('.') {
+        if label.is_empty() || label.len() > 63
+            || label.starts_with('-') || label.ends_with('-')
+            || !label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') {
+            bail!("invalid HTTP hostname label");
+        }
+    }
+    Ok(())
+}
+
+
 fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK", 201 => "Created", 202 => "Accepted", 204 => "No Content",
