@@ -193,7 +193,7 @@ impl TlsProxy {
         let requested_host = client_tls.ssl().servername(NameType::HOST_NAME).unwrap_or(connect_host).to_owned();
 
         tracing::debug!(host = %requested_host, alpn = ?client_tls.ssl().selected_alpn_protocol(), "TLS interception established; handing decrypted HTTP to Hyper");
-        if client_tls.ssl().selected_alpn_protocol() == Some(b"h2") {
+        if client_tls.ssl().selected_alpn_protocol() == Some(&b"h2"[..]) {
             crate::http_server::serve_http2(client_tls, "https", config, resolver, domains, tls_proxy).await
         } else {
             crate::http_server::serve(client_tls, "https", config, resolver, domains, tls_proxy).await
