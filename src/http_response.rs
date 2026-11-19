@@ -60,9 +60,12 @@ fn validate_response_status(status: u16) -> Result<()> {
 
 fn request_target_host(target: &str) -> Result<Option<String>> {
     if target.get(..7).is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://")) {
-        let rest = &target[7..];
-        let authority = rest.split(|character| character == '/' || character == '?' || character == '#').next().unwrap_or_default();
-        return Ok(Some(host_from_authority(authority)?));
+        let uri = url::Url::parse(target).context("invalid absolute-form HTTP request target")?;
+        if uri.scheme() != "http" || uri.host_str().is_none()
+            || !uri.username().is_empty() || uri.password().is_some() || uri.fragment().is_some() {
+            bail!("invalid absolute-form HTTP request target");
+        }
+        return Ok(Some(uri.host_str().expect("host checked").to_owned()));
     }
     if target.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://")) {
         bail!("HTTPS absolute-form is not valid on the plain HTTP proxy listener");
@@ -169,6 +172,17 @@ mod tests {
         assert!(request_target_host("https://example.com/a").is_err());
         assert_eq!(request_target_host("/path?q=1").unwrap(), None);
     }
+    #[test]
+    fn validates_absolute_form_request_targets() {
+        assert_eq!(request_target_host("http://example.com:8080/a?q=1").unwrap().as_deref(), Some("example.com"));
+        assert_eq!(request_target_host("HTTP://EXAMPLE.COM/a").unwrap().as_deref(), Some("example.com"));
+        assert_eq!(request_target_host("http://[2001:db8::1]:8080/").unwrap().as_deref(), Some("2001:db8::1"));
+        assert!(request_target_host("http://user@example.com/").is_err());
+        assert!(request_target_host("http://example.com/#fragment").is_err());
+        assert!(request_target_host("http://example.com:bad/").is_err());
+        assert!(request_target_host("http:///missing-host").is_err());
+    }
+
     #[test]
     fn rejects_duplicate_host_headers() {
         assert!(parse_host_header(["Host: one.example", "host: two.example"].into_iter()).is_err());
