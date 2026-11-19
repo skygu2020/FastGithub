@@ -156,6 +156,7 @@ impl TlsProxy {
         upstream_host: &str,
         upstream_ip: IpAddr,
         domain_config: Option<&crate::config::DomainConfig>,
+        allow_http2: bool,
     ) -> Result<SslStream<TcpStream>> {
         let configured_sni = domain_config.and_then(|rule| rule.tls_sni_value(upstream_host, upstream_ip));
         // A configured DomainConfig defaults TlsSni to false in the .NET
@@ -165,7 +166,12 @@ impl TlsProxy {
         let mut connect_config = self.connector.configure()?;
         connect_config.set_use_server_name_indication(!disable_sni);
         connect_config.set_verify_hostname(!ignore_name_mismatch);
-        connect_config.set_alpn_protos(b"\x02h2\x08http/1.1")?;
+        let alpn_protocols: &[u8] = if allow_http2 {
+            b"\x02h2\x08http/1.1"
+        } else {
+            b"\x08http/1.1"
+        };
+        connect_config.set_alpn_protos(alpn_protocols)?;
         let mut ssl = connect_config.into_ssl(upstream_host)?;
         if let Some(sni) = configured_sni.as_deref() {
             ssl.set_hostname(sni)?;
