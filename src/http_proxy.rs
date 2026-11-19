@@ -207,7 +207,7 @@ fn parse_authority(authority: &str) -> Result<(String, u16)> {
     if authority.is_empty()
         || authority.bytes().any(|byte| byte <= 0x20 || byte >= 0x7f)
         || authority.contains("://")
-        || authority.contains(['/', '\\\\', '@', '?', '#']) {
+        || authority.chars().any(|character| matches!(character, '/' | '\\\\' | '@' | '?' | '#')) {
         bail!("CONNECT target must be a valid host:port authority");
     }
 
