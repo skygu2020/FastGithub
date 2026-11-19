@@ -268,6 +268,21 @@ mod header_tests {
     use super::strip_hop_by_hop_headers;
     use http::{header, HeaderMap, HeaderValue};
 
+    #[tokio::test]
+    async fn timeout_body_emits_one_error_then_ends() {
+        use super::TimeoutBody;
+        use bytes::Bytes;
+        use http_body_util::{BodyExt, Full};
+
+        let inner = Full::new(Bytes::from_static(b"response"))
+            .map_err(|never| match never {})
+            .boxed_unsync();
+        let mut body = TimeoutBody::new(inner, std::time::Duration::ZERO);
+
+        assert!(body.frame().await.expect("timeout error frame").is_err());
+        assert!(body.frame().await.is_none());
+    }
+
     #[test]
     fn host_header_uses_destination_host_without_port() {
         let uri = url::Url::parse("https://cdn.example:8443/assets").unwrap();
