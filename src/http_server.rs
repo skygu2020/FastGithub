@@ -1023,6 +1023,7 @@ mod header_tests {
     }
     #[tokio::test]
     async fn http1_server_keeps_one_connection_open_for_multiple_requests() {
+        use super::client_http1;
         use bytes::Bytes;
         use http::{Request, Response, StatusCode};
         use http_body_util::{BodyExt, Full};
