@@ -31,7 +31,7 @@ pub async fn try_respond(stream: &mut TcpStream, header: &[u8], config: &AppConf
         return Ok(false);
     };
     if !(100..=999).contains(&response.status_code) { bail!("configured Response.StatusCode must be between 100 and 999"); }
-    if response.content_type.contains(['\r', '\n']) { bail!("configured Response.ContentType contains a line break"); }
+    if response.content_type.chars().any(|character| character == '\r' || character == '\n') { bail!("configured Response.ContentType contains a line break"); }
 
     let body = response.content_value.as_deref().unwrap_or("").as_bytes();
     let no_body_status = (100..200).contains(&response.status_code) || matches!(response.status_code, 204 | 304);
@@ -48,7 +48,7 @@ pub async fn try_respond(stream: &mut TcpStream, header: &[u8], config: &AppConf
 
 fn request_target_host(target: &str) -> Result<Option<String>> {
     if let Some(rest) = target.strip_prefix("http://") {
-        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        let authority = rest.split(|character| character == '/' || character == '?' || character == '#').next().unwrap_or_default();
         return Ok(Some(host_from_authority(authority)?));
     }
     if target.starts_with("https://") || target.starts_with('/') || target == "*" { return Ok(None); }
@@ -56,7 +56,7 @@ fn request_target_host(target: &str) -> Result<Option<String>> {
 }
 
 fn host_from_authority(authority: &str) -> Result<String> {
-    if authority.is_empty() || authority.contains('@') || authority.contains(['/', '\\', '\r', '\n']) {
+    if authority.is_empty() || authority.contains('@') || authority.chars().any(|character| matches!(character, '/' | '\\' | '\r' | '\n')) {
         bail!("invalid HTTP Host authority");
     }
     if let Some(rest) = authority.strip_prefix('[') {
