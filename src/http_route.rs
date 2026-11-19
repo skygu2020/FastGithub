@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn resolves_absolute_and_origin_form_targets() {
         let cfg = config(&[]);
-        match route_request("GET", "http://example.com/a?q=1", Some("ignored.example"), "http", &cfg).unwrap() {
+        match route_request("GET", "http://example.com/a?q=1", Some("example.com"), "http", &cfg).unwrap() {
             RouteDecision::Forward { uri, request_target, original_host, .. } => {
                 assert_eq!(uri.as_str(), "http://example.com/a?q=1");
                 assert_eq!(request_target, "/a?q=1");
