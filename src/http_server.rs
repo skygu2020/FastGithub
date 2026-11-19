@@ -158,6 +158,13 @@ fn expects_continue(headers: &HeaderMap) -> bool {
         .any(|value| value.trim().eq_ignore_ascii_case("100-continue"))
 }
 
+fn should_gate_expect_continue<B>(headers: &HeaderMap, body: &B) -> bool
+where
+    B: http_body::Body,
+{
+    expects_continue(headers) && !body.is_end_stream()
+}
+
 /// Serve one HTTP/1 connection over a plain TCP or decrypted TLS stream.
 /// Already-consumed bytes can be restored by wrapping the stream in PrefixedIo.
 pub async fn serve<S>(io: S, scheme: &'static str, config: Arc<AppConfig>, resolver: DomainResolver, domains: Vec<String>, tls_proxy: Arc<crate::http_proxy::TlsProxy>) -> anyhow::Result<()>
@@ -267,7 +274,7 @@ async fn forward_request(
     parts.headers.insert(header::HOST, HeaderValue::from_str(&host_header(&uri))?);
     tracing::debug!(%original_host, upstream = %uri, "forwarding HTTP request");
 
-    let expect_continue = expects_continue(&parts.headers) && !body.is_end_stream();
+    let expect_continue = should_gate_expect_continue(&parts.headers, &body);
     let (continue_tx, continue_rx) = oneshot::channel();
     let gated_body = ExpectContinueBody::new(body, expect_continue.then_some(continue_rx));
     let mut upstream_request = Request::from_parts(parts, gated_body);
@@ -541,7 +548,7 @@ mod header_tests {
         let body = Full::new(Bytes::new());
         assert!(expects_continue(&headers));
         assert!(body.is_end_stream());
-        assert!(!(expects_continue(&headers) && !body.is_end_stream()));
+        assert!(!should_gate_expect_continue(&headers, &body));
     }
 
     #[tokio::test]
