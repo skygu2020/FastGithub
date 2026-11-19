@@ -289,7 +289,7 @@ mod tests {
                 assert_eq!(uri.as_str(), "https://cdn.example/assets/");
                 assert_eq!(request_target, "/assets/");
                 assert_eq!(original_host, "origin.example");
-                assert_eq!(domain.and_then(|rule| rule.ip_address.as_deref()), Some("192.0.2.10"));
+                assert_eq!(domain.as_ref().and_then(|rule| rule.ip_address.as_deref()), Some("192.0.2.10"));
             }
             _ => panic!("expected forwarding"),
         }
