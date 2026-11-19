@@ -13,7 +13,6 @@ const BAD_REQUEST_RESPONSE: &[u8] = b"HTTP/1.1 400 Bad Request\r\nConnection: cl
 
 pub async fn run(config: AppConfig, upstreams: Vec<SocketAddr>, certificates: Arc<CertificateService>) -> Result<()> {
     let port = config.fast_github.http_proxy_port;
-    let configured_domains = config.fast_github.domain_configs.keys().cloned().collect::<Vec<_>>();
     let resolver = DomainResolver::new(DnsClient::new(upstreams), Persistence::new("dnsendpoints.json")).await?;
     let tls_proxy = Arc::new(TlsProxy::new(certificates)?);
     let config = Arc::new(config);
@@ -25,11 +24,10 @@ pub async fn run(config: AppConfig, upstreams: Vec<SocketAddr>, certificates: Ar
             accepted = listener.accept() => {
                 let (stream, peer) = accepted.context("accepting proxy connection")?;
                 let resolver = resolver.clone();
-                let domains = configured_domains.clone();
                 let tls_proxy = Arc::clone(&tls_proxy);
                 let config = Arc::clone(&config);
                 tokio::spawn(async move {
-                    if let Err(error) = handle_connection(stream, resolver, &domains, config, tls_proxy, peer).await {
+                    if let Err(error) = handle_connection(stream, resolver, config, tls_proxy, peer).await {
                         tracing::debug!(%peer, %error, "proxy connection ended");
                     }
                 });
@@ -44,7 +42,7 @@ pub async fn run(config: AppConfig, upstreams: Vec<SocketAddr>, certificates: Ar
     Ok(())
 }
 
-async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, domains: &[String], config: Arc<AppConfig>, tls_proxy: Arc<TlsProxy>, peer: SocketAddr) -> Result<()> {
+async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, config: Arc<AppConfig>, tls_proxy: Arc<TlsProxy>, peer: SocketAddr) -> Result<()> {
     let header = match timeout(HEADER_TIMEOUT, read_header(&mut client)).await {
         Ok(Ok(header)) => header,
         Ok(Err(error)) => return Err(error),
@@ -62,7 +60,7 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, doma
     };
     if !method.eq_ignore_ascii_case("CONNECT") {
         let stream = crate::prefixed_io::PrefixedIo::new(client, header);
-        return crate::http_server::serve(stream, "http", config, resolver, domains.to_vec(), Arc::clone(&tls_proxy)).await
+        return crate::http_server::serve(stream, "http", config, resolver, Arc::clone(&tls_proxy)).await
             .with_context(|| format!("serving plain HTTP request from {peer}"));
     }
     let (host, port) = match parse_authority(authority) {
@@ -81,7 +79,7 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, doma
     if is_tls {
         // Intercepted TLS requests are routed by the decrypted HTTP Host and
         // configured Destination; the CONNECT authority is not an upstream.
-        tls_proxy.intercept(client, host.as_str(), Arc::clone(&config), resolver.clone(), domains.to_vec(), Arc::clone(&tls_proxy)).await?;
+        tls_proxy.intercept(client, host.as_str(), Arc::clone(&config), resolver.clone(), Arc::clone(&tls_proxy)).await?;
         return Ok(());
     }
 
@@ -170,7 +168,7 @@ impl TlsProxy {
         Ok(tls)
     }
 
-    pub(crate) async fn intercept(&self, client: TcpStream, connect_host: &str, config: Arc<AppConfig>, resolver: DomainResolver, domains: Vec<String>, tls_proxy: Arc<TlsProxy>) -> Result<()> {
+    pub(crate) async fn intercept(&self, client: TcpStream, connect_host: &str, config: Arc<AppConfig>, resolver: DomainResolver, tls_proxy: Arc<TlsProxy>) -> Result<()> {
         let default_certificate = self.certificates.server_certificate(connect_host)?;
         let mut ssl = Ssl::new(self.acceptor.context()).context("creating inbound TLS session")?;
         ssl.set_certificate(&default_certificate.certificate)?;
@@ -181,7 +179,7 @@ impl TlsProxy {
         let requested_host = client_tls.ssl().servername(NameType::HOST_NAME).unwrap_or(connect_host).to_owned();
 
         tracing::debug!(host = %requested_host, "TLS interception established; handing decrypted HTTP to Hyper");
-        crate::http_server::serve(client_tls, "https", config, resolver, domains, tls_proxy).await
+        crate::http_server::serve(client_tls, "https", config, resolver, tls_proxy).await
     }
 }
 
