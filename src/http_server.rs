@@ -252,10 +252,15 @@ async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppCo
             // after a slow DNS/connect/TLS/header phase, only the remaining budget
             // is available for streaming it.
             let request_started = tokio::time::Instant::now();
-            let forwarding = if is_upgrade_request(&request) {
-                forward_upgrade_request(request, uri, request_target, original_host, domain, timeout_duration, request_started, resolver, domains, config, tls_proxy)
-            } else {
-                forward_request(request, uri, request_target, original_host, domain, timeout_duration, request_started, resolver, domains, config, tls_proxy)
+            // Each async fn has a distinct opaque Future type. Await both
+            // branches inside one async block so the timeout wrapper receives
+            // a single concrete future type.
+            let forwarding = async {
+                if is_upgrade_request(&request) {
+                    forward_upgrade_request(request, uri, request_target, original_host, domain, timeout_duration, request_started, resolver, domains, config, tls_proxy).await
+                } else {
+                    forward_request(request, uri, request_target, original_host, domain, timeout_duration, request_started, resolver, domains, config, tls_proxy).await
+                }
             };
             match timeout_duration {
                 Some(duration) => match tokio::time::timeout(duration, forwarding).await {
