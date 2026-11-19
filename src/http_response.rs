@@ -24,9 +24,7 @@ pub async fn try_respond(stream: &mut TcpStream, header: &[u8], config: &AppConf
     let Some(response) = config.domain_config(&host).and_then(|domain| domain.response.as_ref()) else {
         return Ok(false);
     };
-    // A 1xx response is provisional and requires a subsequent final response;
-    // this short-circuit handler cannot implement that exchange.
-    if !(200..=999).contains(&response.status_code) { bail!("configured Response.StatusCode must be between 200 and 999"); }
+    validate_response_status(response.status_code)?;
     if response.content_type.chars().any(|character| character.is_control() && character != '\t') {
         bail!("configured Response.ContentType contains an invalid control character");
     }
@@ -42,6 +40,16 @@ pub async fn try_respond(stream: &mut TcpStream, header: &[u8], config: &AppConf
     if !method.eq_ignore_ascii_case("HEAD") && !no_body_status && !body.is_empty() { stream.write_all(body).await?; }
     tracing::debug!(%host, status = response.status_code, "returned configured domain response");
     Ok(true)
+}
+
+
+/// Validate a configured final HTTP status code. Informational responses require
+/// a second response, and values above 599 are outside the HTTP status-code range.
+fn validate_response_status(status: u16) -> Result<()> {
+    if !(200..=599).contains(&status) {
+        bail!("configured Response.StatusCode must be between 200 and 599");
+    }
+    Ok(())
 }
 
 fn request_target_host(target: &str) -> Result<Option<String>> {
@@ -111,7 +119,17 @@ fn reason_phrase(status: u16) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_from_authority, parse_host_header, request_target_host};
+    use super::{host_from_authority, parse_host_header, request_target_host, validate_response_status};
+    #[test]
+    fn accepts_only_final_http_status_code_range() {
+        assert!(validate_response_status(200).is_ok());
+        assert!(validate_response_status(599).is_ok());
+        assert!(validate_response_status(100).is_err());
+        assert!(validate_response_status(199).is_err());
+        assert!(validate_response_status(600).is_err());
+        assert!(validate_response_status(999).is_err());
+    }
+
     #[test]
     fn extracts_absolute_and_origin_form_hosts() {
         assert_eq!(request_target_host("http://example.com:8080/a?q=1").unwrap().as_deref(), Some("example.com"));
