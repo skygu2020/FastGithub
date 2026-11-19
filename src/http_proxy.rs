@@ -61,8 +61,11 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, doma
         }
     };
     if !method.eq_ignore_ascii_case("CONNECT") {
+        if crate::http_response::try_respond(&mut client, &header, &config).await? {
+            return Ok(());
+        }
         client.write_all(b"HTTP/1.1 501 Not Implemented\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").await?;
-        bail!("only HTTP CONNECT is implemented in this migration stage");
+        bail!("plain HTTP forwarding is not implemented; only configured Response rules can short-circuit");
     }
     let (host, port) = match parse_authority(authority) {
         Ok(value) => value,
