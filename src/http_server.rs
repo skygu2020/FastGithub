@@ -9,6 +9,8 @@ use std::{convert::Infallible, error::Error, sync::Arc};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 type BoxError = Box<dyn Error + Send + Sync>;
+trait AsyncIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AsyncIo for T {}
 type ResponseBody = UnsyncBoxBody<Bytes, BoxError>;
 
 /// Serve one HTTP/1 connection over a plain TCP or decrypted TLS stream.
@@ -86,14 +88,14 @@ async fn forward_request(
     let host = uri.host_str().context("upstream URI has no host")?;
     let port = uri.port().unwrap_or(if uri.scheme() == "https" { 443 } else { 80 });
     let (stream, upstream_ip) = crate::http_proxy::connect_target(host, port, resolver, domains, config).await?;
-    let io = if uri.scheme() == "https" {
-        TokioIo::new(tls_proxy.connect_upstream(stream, host, &original_host, upstream_ip, domain.as_ref()).await?)
+    let io: Box<dyn AsyncIo> = if uri.scheme() == "https" {
+        Box::new(tls_proxy.connect_upstream(stream, host, &original_host, upstream_ip, domain.as_ref()).await?)
     } else if uri.scheme() == "http" {
-        TokioIo::new(stream)
+        Box::new(stream)
     } else {
         anyhow::bail!("unsupported upstream URI scheme '{}'", uri.scheme());
     };
-    let (mut sender, connection) = client_http1::handshake(io).await?;
+    let (mut sender, connection) = client_http1::handshake(TokioIo::new(io)).await?;
     tokio::spawn(async move {
         if let Err(error) = connection.await {
             tracing::debug!(%error, "upstream HTTP connection ended");
