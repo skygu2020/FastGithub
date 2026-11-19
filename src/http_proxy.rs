@@ -227,10 +227,10 @@ async fn connect_target(
 ) -> Result<(TcpStream, IpAddr)> {
     let domain_config = config.domain_config(host);
 
-    let connect_timeout = match domain_config {
-        Some(value) => value.request_timeout()?.unwrap_or(CONNECT_TIMEOUT),
-        None => CONNECT_TIMEOUT,
-    };
+    // FastGithub's DomainConfig.Timeout is an HTTP request-lifecycle timeout,
+    // not a TCP dial timeout. Keep connection establishment on its fixed limit;
+    // request-scoped cancellation will be applied by the HTTP forwarding layer.
+    let connect_timeout = CONNECT_TIMEOUT;
     let mut addresses = Vec::new();
     if let Ok(ip) = host.parse::<IpAddr>() {
         addresses.push(ip);
