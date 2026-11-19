@@ -20,6 +20,7 @@
 - 请求和响应的 hop-by-hop headers，以及 `Connection` 指定的逐跳字段会被移除；请求中的端到端 `Expect` 和 `Trailer` 声明会保留（`TE` 仍按逐跳字段移除）；响应 Server 标记为 `FastGithub`。
 - 响应体包装层逐 frame 透传 data 和 trailer frame；单元测试覆盖 `TimeoutBody` 不吞掉 `x-checksum` trailer。另有 TCP loopback 测试验证 Hyper HTTP/1 client/server 对请求和响应 trailer frame 的编码、解析。该测试验证 Hyper 双端互操作，不等同于经过 `forward_request`、TLS 和真实代理入口的完整端到端验证。
 - 下游 HTTP/1 server 已启用持久连接；同一客户端连接可连续承载多个请求。Hyper 按 HTTP 版本和请求的 Connection 语义处理关闭。上游转发目前仍为每个请求独立建立 HTTP/1 client connection，不跨请求复用上游连接。
+- HTTP/1 server/client connection 均启用 Hyper Upgrade 交接能力；符合条件的 `101` 会在下游和上游之间建立透明双向隧道。
 
 ### DomainConfig 处理
 
@@ -41,7 +42,7 @@
 ## 与原版仍有差异 / 待完成
 
 1. **持久 HTTP/1 keep-alive：已实现第一阶段**：下游 Hyper HTTP/1 server 允许同一连接处理多个请求，响应生成器不再强制 `Connection: close`；新增同一连接发送两个请求的 TCP loopback 测试。上游仍是每请求独立连接，不做跨请求连接池复用。测试尚未执行，后续回归阶段验证连接关闭、客户端断开及请求超时隔离。
-2. **Upgrade / WebSocket**：当前普通转发仍移除 Upgrade 等 hop-by-hop headers，不提供 WebSocket 升级隧道。
+2. **HTTP/1 Upgrade / WebSocket：已实现转发主路径**：识别 HTTP/1.1 `Connection: Upgrade` 请求，保留并规范化两端 Upgrade 协商头；上游只有返回匹配的 `101 Switching Protocols` 才建立隧道。Hyper 两端通过 `with_upgrades()` 交接底层 IO，隧道使用双向流式复制；上游拒绝升级时回到普通响应体转发并继续使用原请求 Timeout。该路径支持 WebSocket 及其他符合 HTTP/1 Upgrade 语义的协议。端到端握手、断连和半关闭行为尚待后续回归验证。
 3. **HTTP/2**：当前依赖和代理实现以 HTTP/1 为主，尚未移植 HTTP/2 上游/下游协商行为。
 4. **代理兼容性与边界测试**：继续补充 Expect: 100-continue、超大/分块请求体、Trailer、客户端提前断开、上游提前断开、超时发生在请求体上传期间等集成测试。当前仅完成 Trailer frame 在 `TimeoutBody` 包装层中的透传单测，尚未完成真实 TCP 上下游验证。
 5. **Expect: 100-continue：已加入上游许可门控，仍需构建验证**：Hyper HTTP/1 client 会在收到上游 100 之前开始 poll 请求体；入站 Hyper HTTP/1 server 则在 Service 首次 poll `Incoming` body 时自动向下游发送 100。为协调这两个行为，`forward_request` 现对包含 `Expect: 100-continue` 的请求使用 `ExpectContinueBody`：先将请求头交给上游，body 保持 Pending；通过 `hyper::ext::on_informational()` 观察到上游 100 后才释放 body。这样首次 poll 入站 body 才会触发下游 100。若上游直接返回最终响应（例如 417），body 不会被释放，最终响应可以直接返回，下游上传也不会开始。请求体已经处于 end-stream 状态时，即使带有 Expect 头也不会启用门控，避免空请求体等待永远不会到来的 100。新增测试覆盖空 body 不启用门控、TCP loopback 中 gated body 在上游 100 后才上传、上游返回 417 时不上传，以及等待上游许可期间取消请求时关闭上游 driver；另保留原始 Hyper client 行为基线测试和入站 server 自动 100 触发时机测试。当前尚未在本地运行 cargo test，需用户构建验证 Hyper 版本解析/API 兼容性和测试时序。该实现只处理中继 100 Continue，不转发 103 Early Hints 等其他 1xx；项目 Hyper 依赖是 `version = "1"` 且没有 Cargo.lock，实际解析版本由用户构建环境的 Cargo 决定。
