@@ -222,7 +222,7 @@ async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppCo
     // CONNECT has different HTTP/2 pseudo-header and tunnel semantics. This
     // proxy currently implements raw CONNECT only on the HTTP/1 entry path;
     // do not reinterpret an HTTP/2 authority-form request as an ordinary URL.
-    if request.version() == http::Version::HTTP_2 && method == Method::CONNECT {
+    if http2_connect_unsupported(request.version(), &method) {
         return empty_response(StatusCode::NOT_IMPLEMENTED);
     }
     let target = if request.version() == http::Version::HTTP_2 {
