@@ -11,7 +11,7 @@ pub enum RouteDecision {
     /// Response takes precedence over Destination, matching the original middleware.
     Respond(ResponseConfig),
     Forward {
-        /// The selected upstream URI. Its path/query comes from Destination when configured.
+        /// The selected upstream URI. Destination supplies a prefix; the incoming request path and query are appended.
         uri: Url,
         /// The request-target to send upstream (normally origin-form).
         request_target: String,
