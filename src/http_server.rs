@@ -5,7 +5,7 @@ use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::{body::Incoming, client::conn::http1 as client_http1, server::conn::http1, service::service_fn, Request};
 use hyper_util::rt::TokioIo;
 use anyhow::Context;
-use std::{convert::Infallible, error::Error, io, pin::Pin, sync::Arc, task::{Context as TaskContext, Poll}, time::Duration};
+use std::{convert::Infallible, error::Error, future::Future, io, pin::Pin, sync::Arc, task::{Context as TaskContext, Poll}, time::Duration};
 use tokio::{io::{AsyncRead, AsyncWrite}, time::Sleep};
 
 type BoxError = Box<dyn Error + Send + Sync>;
