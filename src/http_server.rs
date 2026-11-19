@@ -614,7 +614,7 @@ mod header_tests {
         use http_body_util::Full;
         use hyper::client::conn::http1 as client_http1;
         use hyper_util::rt::TokioIo;
-        use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener, sync::oneshot};
+        use tokio::{io::AsyncReadExt, net::TcpListener, sync::oneshot};
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
