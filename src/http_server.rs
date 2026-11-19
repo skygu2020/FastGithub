@@ -1,6 +1,6 @@
 use crate::{config::AppConfig, http_route::{route_request, RouteDecision}, resolver::DomainResolver};
 use bytes::Bytes;
-use http::{header, HeaderValue, Method, Response, StatusCode};
+use http::{header, HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode};
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::{body::Incoming, client::conn::http1 as client_http1, server::conn::http1, service::service_fn, Request};
 use hyper_util::rt::TokioIo;
@@ -105,22 +105,42 @@ async fn forward_request(
     let (mut parts, body) = request.into_parts();
     parts.uri = format!("{}://{}{}", uri.scheme(), host_authority(&uri), request_target).parse()
         .context("building upstream request URI")?;
-    parts.headers.remove(header::CONNECTION);
-    parts.headers.remove("proxy-connection");
-    parts.headers.remove("keep-alive");
-    parts.headers.remove(header::UPGRADE);
+    strip_hop_by_hop_headers(&mut parts.headers);
     parts.headers.insert(header::HOST, HeaderValue::from_str(&host_authority(&uri))?);
     tracing::debug!(%original_host, upstream = %uri, "forwarding HTTP request");
     let upstream_request = Request::from_parts(parts, body);
     let upstream_response = sender.send_request(upstream_request).await?;
     let (mut response_parts, response_body) = upstream_response.into_parts();
-    response_parts.headers.remove(header::CONNECTION);
-    response_parts.headers.remove("proxy-connection");
-    response_parts.headers.remove("keep-alive");
-    response_parts.headers.remove(header::UPGRADE);
+    strip_hop_by_hop_headers(&mut response_parts.headers);
     response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
     let boxed_body = response_body.map_err(|error| Box::new(error) as BoxError).boxed_unsync();
     Ok(Response::from_parts(response_parts, boxed_body))
+}
+
+/// Remove hop-by-hop fields, including every field nominated by Connection.
+fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
+    let nominated = headers.get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|name| HeaderName::from_bytes(name.trim().as_bytes()).ok())
+        .collect::<Vec<_>>();
+
+    for name in nominated {
+        headers.remove(name);
+    }
+    for name in [
+        HeaderName::from_static("connection"),
+        HeaderName::from_static("proxy-connection"),
+        HeaderName::from_static("keep-alive"),
+        HeaderName::from_static("proxy-authenticate"),
+        HeaderName::from_static("proxy-authorization"),
+        HeaderName::from_static("te"),
+        HeaderName::from_static("trailer"),
+        HeaderName::from_static("upgrade"),
+    ] {
+        headers.remove(name);
+    }
 }
 
 fn host_authority(uri: &url::Url) -> String {
@@ -168,4 +188,35 @@ fn empty_response(status: StatusCode) -> Response<ResponseBody> {
     response.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("close"));
     response.headers_mut().insert(header::SERVER, HeaderValue::from_static("FastGithub"));
     response
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::strip_hop_by_hop_headers;
+    use http::{header, HeaderMap, HeaderValue};
+
+    #[test]
+    fn removes_connection_nominated_and_standard_hop_by_hop_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONNECTION, HeaderValue::from_static("x-private, keep-alive"));
+        headers.insert("x-private", HeaderValue::from_static("secret"));
+        headers.insert("keep-alive", HeaderValue::from_static("timeout=5"));
+        headers.insert("proxy-connection", HeaderValue::from_static("keep-alive"));
+        headers.insert("proxy-authenticate", HeaderValue::from_static("Basic"));
+        headers.insert("proxy-authorization", HeaderValue::from_static("Basic abc"));
+        headers.insert("te", HeaderValue::from_static("trailers"));
+        headers.insert("trailer", HeaderValue::from_static("x-checksum"));
+        headers.insert("upgrade", HeaderValue::from_static("websocket"));
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+
+        strip_hop_by_hop_headers(&mut headers);
+
+        for name in [
+            "connection", "x-private", "keep-alive", "proxy-connection",
+            "proxy-authenticate", "proxy-authorization", "te", "trailer", "upgrade",
+        ] {
+            assert!(!headers.contains_key(name), "header {name} was retained");
+        }
+        assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "text/plain");
+    }
 }
