@@ -174,12 +174,12 @@ mod tests {
             "Bad Header: value",
             " Host: example.com",
             ": empty-name",
-            "X-Test: bad\\u{0001}value",
+            "X-Test: bad\u{0001}value",
         ] {
             assert!(parse_host_header([line].into_iter()).is_err(), "accepted {line:?}");
         }
         assert_eq!(
-            parse_host_header(["X-Test: value", "Host: example.com\\t"].into_iter()).unwrap(),
+            parse_host_header(["X-Test: value", "Host: example.com\t"].into_iter()).unwrap(),
             Some("example.com")
         );
     }
