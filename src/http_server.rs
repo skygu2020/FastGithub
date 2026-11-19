@@ -376,6 +376,114 @@ mod header_tests {
     }
 
     #[tokio::test]
+    async fn hyper_http1_loopback_preserves_request_and_response_trailers() {
+        use bytes::Bytes;
+        use http::{HeaderMap, HeaderValue, Request, Response};
+        use http_body::Frame;
+        use http_body_util::BodyExt;
+        use hyper::{client::conn::http1 as client_http1, server::conn::http1 as server_http1, service::service_fn};
+        use hyper_util::rt::TokioIo;
+        use std::{collections::VecDeque, convert::Infallible, pin::Pin, task::{Context, Poll}};
+        use tokio::net::TcpListener;
+
+        struct Frames(VecDeque<Frame<Bytes>>);
+        impl http_body::Body for Frames {
+            type Data = Bytes;
+            type Error = BoxError;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                Poll::Ready(self.0.pop_front().map(Ok))
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = service_fn(|request: Request<hyper::body::Incoming>| async move {
+                let mut body = request.into_body();
+                let mut received_data = Vec::new();
+                let mut received_trailers = None;
+                while let Some(frame) = body.frame().await {
+                    let frame = frame.unwrap();
+                    if let Ok(data) = frame.into_data() {
+                        received_data.extend_from_slice(&data);
+                    } else if let Ok(trailers) = frame.into_trailers() {
+                        received_trailers = Some(trailers);
+                    }
+                }
+                assert_eq!(received_data, b"request-body");
+                assert_eq!(
+                    received_trailers.unwrap().get("x-request-checksum").unwrap(),
+                    "request-ok",
+                );
+
+                let mut trailers = HeaderMap::new();
+                trailers.insert("x-response-checksum", HeaderValue::from_static("response-ok"));
+                let body = Frames(VecDeque::from([
+                    Frame::data(Bytes::from_static(b"response-body")),
+                    Frame::trailers(trailers),
+                ]));
+                let mut response = Response::new(body);
+                response.headers_mut().insert(
+                    "trailer",
+                    HeaderValue::from_static("x-response-checksum"),
+                );
+                Ok::<_, Infallible>(response)
+            });
+            server_http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) = client_http1::handshake(TokioIo::new(stream)).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await.unwrap() });
+
+        let mut request_trailers = HeaderMap::new();
+        request_trailers.insert("x-request-checksum", HeaderValue::from_static("request-ok"));
+        let request_body = Frames(VecDeque::from([
+            Frame::data(Bytes::from_static(b"request-body")),
+            Frame::trailers(request_trailers),
+        ]));
+        let mut request = Request::new(request_body);
+        *request.method_mut() = http::Method::POST;
+        *request.uri_mut() = "/upload".parse().unwrap();
+        request.headers_mut().insert(http::header::HOST, HeaderValue::from_static("localhost"));
+        request.headers_mut().insert(
+            "trailer",
+            HeaderValue::from_static("x-request-checksum"),
+        );
+
+        let response = sender.send_request(request).await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let mut body = response.into_body();
+        let mut received_data = Vec::new();
+        let mut received_trailers = None;
+        while let Some(frame) = body.frame().await {
+            let frame = frame.unwrap();
+            if let Ok(data) = frame.into_data() {
+                received_data.extend_from_slice(&data);
+            } else if let Ok(trailers) = frame.into_trailers() {
+                received_trailers = Some(trailers);
+            }
+        }
+        assert_eq!(received_data, b"response-body");
+        assert_eq!(
+            received_trailers.unwrap().get("x-response-checksum").unwrap(),
+            "response-ok",
+        );
+
+        drop(sender);
+        driver.abort();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn timeout_body_preserves_response_trailer_frames() {
         use super::{BoxError, TimeoutBody};
         use bytes::Bytes;
