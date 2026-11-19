@@ -6,7 +6,7 @@ use hyper::{body::Incoming, client::conn::http1 as client_http1, server::conn::h
 use hyper_util::rt::TokioIo;
 use anyhow::Context;
 use std::{convert::Infallible, error::Error, future::Future, io, pin::Pin, sync::Arc, task::{Context as TaskContext, Poll}, time::Duration};
-use tokio::{io::{AsyncRead, AsyncWrite}, time::Sleep};
+use tokio::{io::{AsyncRead, AsyncWrite}, sync::oneshot, time::Sleep};
 
 type BoxError = Box<dyn Error + Send + Sync>;
 trait AsyncIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
@@ -93,6 +93,66 @@ where
     fn size_hint(&self) -> http_body::SizeHint {
         if self.terminated { http_body::SizeHint::with_exact(0) } else { self.inner.as_ref().get_ref().size_hint() }
     }
+}
+
+/// Hold an incoming request body until the upstream explicitly sends 100 Continue.
+struct ExpectContinueBody {
+    inner: Pin<Box<Incoming>>,
+    continue_rx: Option<oneshot::Receiver<()>>,
+    released: bool,
+}
+
+impl ExpectContinueBody {
+    fn new(inner: Incoming, continue_rx: Option<oneshot::Receiver<()>>) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            released: continue_rx.is_none(),
+            continue_rx,
+        }
+    }
+}
+
+impl http_body::Body for ExpectContinueBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if !this.released {
+            let Some(continue_rx) = this.continue_rx.as_mut() else {
+                this.released = true;
+                return this.inner.as_mut().poll_frame(cx);
+            };
+            match Pin::new(continue_rx).poll(cx) {
+                Poll::Ready(Ok(())) => {
+                    this.released = true;
+                    this.continue_rx = None;
+                }
+                // If upstream returns a final response without 100, keep the
+                // upload gated. The response future is driven independently.
+                Poll::Ready(Err(_)) | Poll::Pending => return Poll::Pending,
+            }
+        }
+        this.inner.as_mut().poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.released && self.inner.as_ref().get_ref().is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.as_ref().get_ref().size_hint()
+    }
+}
+
+fn expects_continue(headers: &HeaderMap) -> bool {
+    headers.get_all(header::EXPECT).iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|value| value.trim().eq_ignore_ascii_case("100-continue"))
 }
 
 /// Serve one HTTP/1 connection over a plain TCP or decrypted TLS stream.
@@ -203,7 +263,24 @@ async fn forward_request(
     append_fastgithub_user_agent(&mut parts.headers)?;
     parts.headers.insert(header::HOST, HeaderValue::from_str(&host_header(&uri))?);
     tracing::debug!(%original_host, upstream = %uri, "forwarding HTTP request");
-    let upstream_request = Request::from_parts(parts, body);
+
+    let expect_continue = expects_continue(&parts.headers);
+    let (continue_tx, continue_rx) = oneshot::channel();
+    let gated_body = ExpectContinueBody::new(body, expect_continue.then_some(continue_rx));
+    let mut upstream_request = Request::from_parts(parts, gated_body);
+    if expect_continue {
+        // Hyper's client polls the body after writing request headers. Gate it
+        // until the upstream's actual 100 arrives. Polling Incoming only after
+        // this signal also prevents a premature downstream 100 Continue.
+        let continue_sender = std::sync::Mutex::new(Some(continue_tx));
+        hyper::ext::on_informational(&mut upstream_request, move |response| {
+            if response.status() == StatusCode::CONTINUE {
+                if let Some(sender) = continue_sender.lock().expect("continue sender mutex").take() {
+                    let _ = sender.send(());
+                }
+            }
+        });
+    }
     let upstream_response = sender.send_request(upstream_request).await?;
     let (mut response_parts, response_body) = upstream_response.into_parts();
     strip_hop_by_hop_headers(&mut response_parts.headers);
