@@ -379,19 +379,19 @@ mod tests {
     }
     #[test]
     fn alpn_selection_prefers_h2_and_can_force_http1_for_upgrades() {
-        let both = b"\\x02h2\\x08http/1.1";
-        let client = b"\\x08http/1.1\\x02h2";
+        let both = b"\x02h2\x08http/1.1";
+        let client = b"\x08http/1.1\x02h2";
         assert_eq!(
             openssl::ssl::select_next_proto(both, client),
             Some(&b"h2"[..]),
         );
 
-        let http1_only = b"\\x08http/1.1";
+        let http1_only = b"\x08http/1.1";
         assert_eq!(
             openssl::ssl::select_next_proto(http1_only, client),
             Some(&b"http/1.1"[..]),
         );
-        assert!(openssl::ssl::select_next_proto(http1_only, b"\\x02h2").is_none());
+        assert!(openssl::ssl::select_next_proto(http1_only, b"\x02h2").is_none());
     }
 
 }
