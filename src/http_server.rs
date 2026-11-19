@@ -72,7 +72,15 @@ where
         match this.inner.as_mut().poll_frame(cx) {
             Poll::Ready(None) => {
                 this.terminated = true;
+                // The response is fully consumed. Do not leave an idle upstream
+                // keep-alive driver running after the last response frame.
+                this.connection.take();
                 Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                this.terminated = true;
+                this.connection.take();
+                Poll::Ready(Some(Err(error)))
             }
             other => other,
         }
@@ -348,6 +356,24 @@ mod header_tests {
         assert!(body.frame().await.expect("timeout error frame").is_err());
         assert!(body.frame().await.is_none());
         assert!(connection_task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn completed_response_body_releases_upstream_driver() {
+        use super::TimeoutBody;
+        use bytes::Bytes;
+        use http_body_util::{BodyExt, Full};
+
+        let inner = Full::new(Bytes::from_static(b"ok"))
+            .map_err(|never| match never {})
+            .boxed_unsync();
+        let task = tokio::spawn(std::future::pending::<()>());
+        let guard = super::UpstreamConnectionGuard(task.abort_handle());
+        let mut body = TimeoutBody::new(inner, None, guard);
+
+        assert_eq!(body.frame().await.unwrap().unwrap().into_data().unwrap(), Bytes::from_static(b"ok"));
+        assert!(body.frame().await.is_none());
+        assert!(task.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
