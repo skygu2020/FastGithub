@@ -18,13 +18,29 @@ type ResponseBody = UnsyncBoxBody<Bytes, BoxError>;
 /// The forwarding future has its own timeout for DNS, connect, TLS and response headers.
 struct TimeoutBody<B> {
     inner: Pin<Box<B>>,
-    sleep: Pin<Box<Sleep>>,
+    sleep: Option<Pin<Box<Sleep>>>,
+    connection: Option<UpstreamConnectionGuard>,
     terminated: bool,
 }
 
+/// Owns the upstream driver task for as long as its response body is usable.
+/// Dropping the body (including when the downstream client disconnects) aborts it.
+struct UpstreamConnectionGuard(tokio::task::AbortHandle);
+
+impl Drop for UpstreamConnectionGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 impl<B> TimeoutBody<B> {
-    fn new(inner: B, duration: Duration) -> Self {
-        Self { inner: Box::pin(inner), sleep: Box::pin(tokio::time::sleep(duration)), terminated: false }
+    fn new(inner: B, duration: Option<Duration>, connection: UpstreamConnectionGuard) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            sleep: duration.map(|duration| Box::pin(tokio::time::sleep(duration))),
+            connection: Some(connection),
+            terminated: false,
+        }
     }
 }
 
@@ -43,8 +59,11 @@ where
         if this.terminated {
             return Poll::Ready(None);
         }
-        if this.sleep.as_mut().poll(cx).is_ready() {
+        if this.sleep.as_mut().is_some_and(|sleep| sleep.as_mut().poll(cx).is_ready()) {
             this.terminated = true;
+            // Stop the Hyper connection driver immediately; otherwise it may
+            // remain parked on a body that nobody will consume after timeout.
+            this.connection.take();
             return Poll::Ready(Some(Err(Box::new(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "configured HTTP request timeout elapsed while streaming the response body",
@@ -160,11 +179,14 @@ async fn forward_request(
         anyhow::bail!("unsupported upstream URI scheme '{}'", uri.scheme());
     };
     let (mut sender, connection) = client_http1::handshake(TokioIo::new(io)).await?;
-    tokio::spawn(async move {
+    let connection_task = tokio::spawn(async move {
         if let Err(error) = connection.await {
             tracing::debug!(%error, "upstream HTTP connection ended");
         }
     });
+    // Keep the driver alive through response-body streaming, but make every
+    // early-return/cancellation path abort it through this guard's Drop.
+    let connection_guard = UpstreamConnectionGuard(connection_task.abort_handle());
 
     let (mut parts, body) = request.into_parts();
     parts.uri = format!("{}://{}{}", uri.scheme(), host_authority(&uri), request_target).parse()
@@ -179,13 +201,8 @@ async fn forward_request(
     strip_hop_by_hop_headers(&mut response_parts.headers);
     response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
     let boxed_body = response_body.map_err(|error| Box::new(error) as BoxError).boxed_unsync();
-    let response_body = match body_timeout {
-        Some(duration) => {
-            let remaining = duration.saturating_sub(request_started.elapsed());
-            TimeoutBody::new(boxed_body, remaining).boxed_unsync()
-        }
-        None => boxed_body,
-    };
+    let remaining = body_timeout.map(|duration| duration.saturating_sub(request_started.elapsed()));
+    let response_body = TimeoutBody::new(boxed_body, remaining, connection_guard).boxed_unsync();
     Ok(Response::from_parts(response_parts, response_body))
 }
 
