@@ -65,11 +65,21 @@ fn validate_response_status(status: u16) -> Result<()> {
 }
 
 
+fn is_http_token(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
 fn parse_host_header<'a>(lines: impl Iterator<Item = &'a str>) -> Result<Option<&'a str>> {
     let mut host = None;
     for line in lines {
         if line.is_empty() { break; }
         let (name, value) = line.split_once(':').context("malformed HTTP header field")?;
+        if name.is_empty() || !name.bytes().all(is_http_token) {
+            bail!("invalid HTTP header field name");
+        }
+        if value.bytes().any(|byte| (byte < 0x20 && byte != b'\\t') || byte == 0x7f) {
+            bail!("invalid control character in HTTP header value");
+        }
         if name.eq_ignore_ascii_case("host") {
             if host.is_some() { bail!("duplicate Host header"); }
             host = Some(value.trim());
@@ -156,6 +166,22 @@ mod tests {
         assert!(validate_response_status(199).is_err());
         assert!(validate_response_status(600).is_err());
         assert!(validate_response_status(999).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_header_field_syntax_and_controls() {
+        for line in [
+            "Bad Header: value",
+            " Host: example.com",
+            ": empty-name",
+            "X-Test: bad\\u{0001}value",
+        ] {
+            assert!(parse_host_header([line].into_iter()).is_err(), "accepted {line:?}");
+        }
+        assert_eq!(
+            parse_host_header(["X-Test: value", "Host: example.com\\t"].into_iter()).unwrap(),
+            Some("example.com")
+        );
     }
 
     #[test]
