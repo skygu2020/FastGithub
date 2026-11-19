@@ -155,9 +155,7 @@ impl TlsProxy {
             .await.context("inbound TLS handshake timed out")??;
         let requested_host = client_tls.ssl().servername(NameType::HOST_NAME).unwrap_or(connect_host).to_owned();
 
-        let domain_config = config.fast_github.domain_configs.iter()
-            .find(|(pattern, _)| crate::config::domain_matches(pattern, &requested_host))
-            .map(|(_, value)| value);
+        let domain_config = config.domain_config(&requested_host);
         let configured_sni = domain_config.and_then(|value| value.tls_sni_value(&requested_host, upstream_ip));
         // Preserve normal hostname SNI even when there is no matching domain rule.
         // Only an explicit TlsSni=false setting suppresses the SNI extension.

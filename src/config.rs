@@ -200,8 +200,8 @@ fn compare_domain_patterns(left: &str, right: &str) -> std::cmp::Ordering {
     let right_labels = right.split('.').collect::<Vec<_>>();
     left_labels.len().cmp(&right_labels.len()).then_with(|| {
         for (left, right) in left_labels.iter().rev().zip(right_labels.iter().rev()) {
-            let left = left.replace('*', "\\u{10ffff}");
-            let right = right.replace('*', "\\u{10ffff}");
+            let left = left.replace('*', "\u{10ffff}");
+            let right = right.replace('*', "\u{10ffff}");
             let order = left.cmp(&right);
             if !order.is_eq() { return order; }
         }
