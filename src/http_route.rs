@@ -17,7 +17,8 @@ pub enum RouteDecision {
         request_target: String,
         /// Snapshot of the matched rule for DNS, SNI, and timeout handling.
         domain: Option<DomainConfig>,
-        /// Original authority used for rule selection and upstream TLS verification.
+        /// Original hostname used for rule selection and diagnostics. Upstream TLS
+        /// SNI and certificate verification use the Destination URI's hostname.
         original_host: String,
     },
 }
@@ -278,12 +279,17 @@ mod tests {
 
     #[test]
     fn destination_rewrites_upstream_uri_but_keeps_original_host_for_rule() {
-        let rule = DomainConfig { destination: Some("https://cdn.example/assets/".into()), ..Default::default() };
+        let rule = DomainConfig {
+            destination: Some("https://cdn.example/assets/".into()),
+            ip_address: Some("192.0.2.10".into()),
+            ..Default::default()
+        };
         match route_request("GET", "/logo.png?v=2", Some("origin.example"), "https", &config(&[("origin.example", rule)])).unwrap() {
-            RouteDecision::Forward { uri, request_target, original_host, .. } => {
+            RouteDecision::Forward { uri, request_target, original_host, domain, .. } => {
                 assert_eq!(uri.as_str(), "https://cdn.example/assets/");
                 assert_eq!(request_target, "/assets/");
                 assert_eq!(original_host, "origin.example");
+                assert_eq!(domain.and_then(|rule| rule.ip_address.as_deref()), Some("192.0.2.10"));
             }
             _ => panic!("expected forwarding"),
         }
