@@ -77,17 +77,22 @@ fn host_from_authority(authority: &str) -> Result<String> {
     }
     if let Some(rest) = authority.strip_prefix('[') {
         let (host, suffix) = rest.split_once(']').context("invalid bracketed IPv6 Host")?;
-        if !suffix.is_empty() && (!suffix.starts_with(':') || !suffix[1..].bytes().all(|b| b.is_ascii_digit())) {
-            bail!("invalid IPv6 Host port");
+        if !suffix.is_empty() {
+            let port = suffix.strip_prefix(':').context("invalid IPv6 Host port")?;
+            let port = port.parse::<u16>().context("invalid IPv6 Host port")?;
+            if port == 0 { bail!("HTTP Host port must be non-zero"); }
         }
         host.parse::<std::net::Ipv6Addr>().context("invalid IPv6 Host address")?;
         return Ok(host.to_owned());
     }
     if authority.matches(':').count() > 1 { bail!("IPv6 Host must use brackets"); }
     let host = match authority.rsplit_once(':') {
-        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
-        Some(_) if authority.contains(':') => bail!("invalid Host port"),
-        _ => authority,
+        Some((host, port)) => {
+            let port = port.parse::<u16>().context("invalid Host port")?;
+            if port == 0 { bail!("HTTP Host port must be non-zero"); }
+            host
+        }
+        None => authority,
     };
     if host.is_empty() { bail!("empty HTTP Host"); }
     Ok(host.to_owned())
@@ -113,7 +118,6 @@ mod tests {
         assert_eq!(request_target_host("HTTP://EXAMPLE.COM/a").unwrap().as_deref(), Some("EXAMPLE.COM"));
         assert!(request_target_host("https://example.com/a").is_err());
         assert_eq!(request_target_host("/path?q=1").unwrap(), None);
-        assert_eq!(request_target_host("https://example.com/path").unwrap(), None);
     }
     #[test]
     fn rejects_duplicate_host_headers() {
@@ -128,5 +132,8 @@ mod tests {
         assert!(host_from_authority("user@example.com").is_err());
         assert!(host_from_authority("example.com:bad").is_err());
         assert!(host_from_authority("example.com extra").is_err());
+        assert!(host_from_authority("example.com:99999").is_err());
+        assert!(host_from_authority("example.com:0").is_err());
+        assert!(host_from_authority("example.com:").is_err());
     }
 }
