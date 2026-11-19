@@ -1,6 +1,6 @@
-# HTTP 代理语义移植记录
+# HTTP 代理移植记录
 
-本记录依据原版 `creazyboyone/FastGithub` 的以下实现整理：
+本文记录 `linux-rust` 分支当前 HTTP/1 代理实现，避免把已经完成的功能误判为待实现。原版行为参考：
 
 - `FastGithub.HttpServer/HttpMiddlewares/HttpReverseProxyMiddleware.cs`
 - `FastGithub.Configuration/DomainConfig.cs`
@@ -9,63 +9,51 @@
 - `FastGithub.Http/HttpClientHandler.cs`
 - `FastGithub.Http/HttpClientFactory.cs`
 
-## 原版请求处理顺序
+## 已实现
 
-1. 从 HTTP 请求的 Host 提取域名并查找 DomainConfig。
-2. 未匹配配置时调用下一个中间件。
-3. 匹配且 `Response` 非空时，直接返回自定义状态码、Content-Type 和可选正文；不会执行上游转发。该分支优先于 Destination。
-4. 匹配且 `Response` 为空时，执行反向代理。
+### HTTP/1 请求入口和转发
 
-`ResponseConfig` 的原版默认值为 StatusCode=200、ContentType=`text/plain;charset=utf-8`、ContentValue=null。
+- 普通 HTTP proxy 请求由 Hyper HTTP/1 server 解析，支持 absolute-form 请求目标。
+- CONNECT 根据隧道首批数据判断 TLS；TLS 隧道完成客户端握手和证书动态选择后，将解密流交给同一套 Hyper HTTP/1 请求处理器。
+- 未拦截的非 TLS CONNECT 仍作为原始 TCP 隧道转发。
+- 上游使用 Hyper HTTP/1 client handshake 和 `send_request`，请求体、响应体通过 Hyper body 流转发，不把整份响应缓存到内存。
+- 请求和响应的 hop-by-hop headers，以及 `Connection` 指定的逐跳字段会被移除；响应 Server 标记为 `FastGithub`。
+- 当前 HTTP/1 server 显式关闭 keep-alive：每条客户端连接只服务一个请求后关闭。不是持久连接实现。
 
-## Destination 的真实含义
+### DomainConfig 处理
 
-原版将默认基准 URI 构造为 `{scheme}://{host}/`。若 Destination 非空，则执行 .NET `new Uri(baseUri, destination)`，所得 URI 字符串作为 YARP Forwarder 的 destinationPrefix。
+- 按原始请求 Host 匹配域名规则；Response 优先于 Destination。
+- Response 支持配置状态码、Content-Type 和可选 UTF-8 正文；HEAD 不发送正文，204/205/304 按无正文响应处理。
+- Destination 先以 `{scheme}://{original-host}/` 为基准解析 URI reference，再作为上游 destination prefix；原始请求 path/query 会追加到该前缀。
+- 相对 Destination、绝对 Destination 和显式原始端口均有单元测试。
+- 原始 Host 匹配出的 DomainConfig 会继续用于上游 IPAddress、TLS SNI、证书名称不匹配策略和请求超时，即使 Destination 改写了上游主机名。
+- IPAddress 是优先候选，目标域名解析结果仍作为后备候选。
+- TLS SNI 使用最终上游 URI 的主机名作为默认值；自定义 SNI 只改变 ClientHello 的 SNI，不改变证书名称验证目标。证书名称验证目标仍是最终上游 URI 主机名。
 
-因此 Destination 是 URI 解析规则，支持相对 URI 和绝对 URI；不是简单的目标 IP 覆盖。相对路径的解析遵循 URI 基准解析语义，不能用字符串拼接代替。
+### 超时
 
-## 原版请求超时和连接行为
+- TCP connect 和上游 TLS handshake 使用固定连接超时。
+- DomainConfig.Timeout 按单个 HTTP 请求处理：DNS、连接、TLS 握手、等待上游响应头受同一个请求超时预算约束；响应体流式传输使用剩余预算，而不是从响应头到达后重新计时。
+- 响应体超时会以 body error 终止流；此时如果响应头或部分响应体已经发送给客户端，无法再改写成新的 HTTP 状态码。
 
-`HttpClientHandler.SendAsync` 在每个请求上创建 Timeout 对应的 CancellationTokenSource，并将其与调用方取消令牌链接，再调用底层 SendAsync。因此 DomainConfig.Timeout 是请求发送生命周期超时，不只是 TCP connect timeout。
+## 与原版仍有差异 / 待完成
 
-底层连接另有固定 10 秒 connect timeout，并逐个尝试候选 IP。候选顺序为：
-- 请求主机本身是 IP 时，直接使用该 IP；
-- 否则先尝试 DomainConfig.IPAddress（如果设置）；
-- 再枚举域名解析器返回的地址。
+1. **持久 HTTP/1 keep-alive**：目前 `keep_alive(false)`，每连接单请求。需要先验证 Hyper 的连接复用和请求级 timeout 取消语义，再启用。
+2. **Upgrade / WebSocket**：当前移除 Upgrade 等 hop-by-hop headers，不提供 WebSocket 升级隧道。
+3. **HTTP/2**：当前依赖和代理实现以 HTTP/1 为主，尚未移植原版可能依赖的 HTTP/2 上游/下游协商行为。
+4. **代理兼容性与边界测试**：继续补充 Expect: 100-continue、超大/分块请求体、Trailer、客户端提前断开、上游提前断开、超时发生在请求体上传期间等集成测试。
+5. **代理标记**：原版使用 `FastGithub/1.0` User-Agent 标记避免自转发；Rust 版目前写入响应 Server 标记，但尚未核对并补齐请求 User-Agent 标记语义。
+6. **完整互操作测试**：目前有模块单元测试，但本分支近期修改尚未取得可确认的 cargo fmt / cargo test / cargo build 结果。不能把源码测试数量当成实际通过的构建结果。
 
-原版关闭自动代理、Cookie、自动重定向和自动解压缩。转发请求会插入 `FastGithub/1.0` User-Agent 标记，防止请求再次转发到 FastGithub 自身；响应 Server 头也会尝试加入 FastGithub 标记。
+## 实现约束
 
-## 与当前 Rust 实现的差异
+- 不得删除普通 HTTP 与 TLS 解密后共用的 `http_server::serve` 路径。
+- 不得移除 `domains` 配置规则列表在 Listener、TLS intercept 和 HTTP server 之间的传递。
+- 不得把 HTTP/1 的 Hyper server/client、`send_request` 或 body streaming 替换回原始字节拷贝。
+- Destination 改写目标主机时，必须区分 TCP 连接 IP、TLS SNI、证书验证主机名和 HTTP Host。
+- DomainConfig 仍按原始请求主机匹配；Destination 只改变上游 URI。
+- 每次修改后检查现有测试和调用链，先做最小补丁，再执行格式化、单元测试和构建验证。
 
-截至本记录对应的 `linux-rust` HEAD：
+## 历史说明
 
-- 入口只接受 CONNECT；普通 HTTP 方法返回 501。
-- CONNECT 的 TLS 流量完成 TLS 握手后，当前直接 `copy_bidirectional`，不会解析解密后的 HTTP 请求。
-- 因此当前无法在普通 HTTP 或已解密 HTTPS 请求级别实现 Response、Destination 和原版 Timeout 语义。
-- 现有 per-domain Timeout 只用于上游 TCP connect；TLS 握手仍使用独立固定超时，隧道数据转发没有总超时。这是有意避免把长下载、长连接和 keep-alive 误判为超时，但不能称为原版请求超时的完整移植。
-- 现有 CONNECT authority、域名解析、SNI 和证书拦截逻辑应保留，不能为了支持 HTTP 请求而退化为仅按 IP 转发。
-
-## 后续实现约束
-
-要忠实支持原版功能，代理需要具备 HTTP 请求层，而不只是 TCP 隧道层：
-
-1. 普通 HTTP 代理请求应解析 absolute-form URI，保留 path/query、请求方法、请求体和必要的端到端头。
-2. CONNECT 仍先建立隧道并完成客户端 TLS 握手；TLS 解密后也必须进入同一套 HTTP 请求处理路径，才能按每个请求应用 Response、Destination 和 Timeout。
-3. 对每个请求，根据原始 scheme/Host 匹配 DomainConfig；Response 分支先于 Destination。
-4. Destination 使用标准 URI reference resolution，以 `{scheme}://{host}/` 为基准，不得手工拼接。
-5. Timeout 应覆盖单个请求的发送/响应生命周期，而不能套在整个持久 TLS 连接或 `copy_bidirectional` 上。
-6. 上游连接仍应使用 FastGithub 域名解析候选和 IPAddress 优先策略；HTTPS 的上游 TLS SNI 与证书验证名称必须分开处理。
-7. 需要正确处理请求/响应 framing、chunked body、keep-alive、hop-by-hop headers、Connection: close 和上游错误响应。不得通过只读一段 header 后直接转发字节来声称支持完整 HTTP。
-
-## 当前决策
-
-不在现有 TLS 字节隧道上叠加不完整的 Response/Destination 特判。下一阶段应引入明确的 HTTP/1.1 请求处理层，并让明文 HTTP 与 CONNECT 解密后的 HTTP 共用请求转发逻辑。这样才能避免两套规则逐渐分叉。
-
-## Current HTTP Response implementation (2026-11)
-
-The native listener now recognizes configured `Response` rules for plain HTTP proxy requests. It obtains the host from absolute-form `http://` request targets or the `Host` header, applies the existing ordered domain-rule matcher, and returns the configured status, content type, and optional UTF-8 body without opening an upstream connection. `HEAD` suppresses the body while retaining its representation length; 1xx, 204, and 304 responses are bodyless. The configured content type is checked for CR/LF before it is written to the response.
-
-This is deliberately a narrow first step: unmatched plain HTTP requests still return 501, and HTTPS CONNECT traffic still uses the existing TLS byte tunnel after interception. This does not yet implement the original middleware's complete reverse proxy, `Destination` URI resolution, or per-request timeout behavior. Request-body consumption and persistent HTTP keep-alive are also not implemented on this short-circuit path; the connection is closed after the configured response.
-
-
-The domain `Timeout` setting is deliberately not used as a TCP connect timeout. The original implementation applies it to the HTTP request lifecycle; until the Rust HTTP forwarding layer exists, TCP connection attempts retain the fixed 10-second connect limit and request-level timeout remains unsupported.
+早期迁移阶段曾只有 Response 短路分支，普通 HTTP 未匹配请求返回 501，CONNECT TLS 仅作字节隧道。该状态已经过时，不应作为当前分支功能描述。
