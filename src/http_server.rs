@@ -382,21 +382,10 @@ async fn forward_request_http2(
     append_fastgithub_user_agent(&mut parts.headers)?;
     tracing::debug!(%original_host, upstream = %uri, "forwarding HTTP/2 request");
 
-    let expect_continue = should_gate_expect_continue(&parts.headers, &body);
-    let (continue_tx, continue_rx) = oneshot::channel();
-    let gated_body = ExpectContinueBody::new(body, expect_continue.then_some(continue_rx));
-    let mut upstream_request = Request::from_parts(parts, gated_body);
-    if expect_continue {
-        let continue_sender = std::sync::Mutex::new(Some(continue_tx));
-        hyper::ext::on_informational(&mut upstream_request, move |response| {
-            if response.status() == StatusCode::CONTINUE {
-                if let Some(sender) = continue_sender.lock().expect("continue sender mutex").take() {
-                    let _ = sender.send(());
-                }
-            }
-        });
-    }
-
+    // Hyper's informational callback is currently HTTP/1-only. Keep HTTP/2
+    // request bodies flowing rather than gating them on a 100 that we cannot
+    // observe through this API.
+    let upstream_request = Request::from_parts(parts, body);
     let upstream_response = sender.send_request(upstream_request).await?;
     let (mut response_parts, response_body) = upstream_response.into_parts();
     response_parts.version = downstream_version;
