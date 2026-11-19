@@ -38,6 +38,15 @@ pub fn route_request(
         bail!("invalid HTTP method");
     }
 
+    // Only origin-form starts with exactly one slash. A leading "//" is a
+    // network-path reference, not a valid origin-form request-target; accepting
+    // it through Url::join would let the target silently replace the Host authority.
+    if request_target.starts_with("//") {
+        bail!("network-path request-target is not valid in HTTP origin-form");
+    }
+    if request_target == "*" && !method.eq_ignore_ascii_case("OPTIONS") {
+        bail!("asterisk-form request-target is only valid for OPTIONS");
+    }
     let absolute = if request_target.starts_with('/') || request_target == "*" {
         None
     } else {
@@ -113,7 +122,8 @@ fn parse_host_authority(authority: &str) -> Result<String> {
         bail!("invalid Host authority");
     }
     let uri = Url::parse(&format!("http://{authority}/")).context("invalid Host authority")?;
-    if uri.host_str().is_none() || !uri.username().is_empty() || uri.password().is_some() {
+    if uri.host_str().is_none() || !uri.username().is_empty() || uri.password().is_some()
+        || uri.port() == Some(0) {
         bail!("invalid Host authority");
     }
     Ok(uri.host_str().expect("host checked").to_owned())
@@ -186,6 +196,20 @@ mod tests {
             RouteDecision::Forward { uri, .. } => assert_eq!(uri.as_str(), "https://origin.example:8443/mirror/path"),
             _ => panic!("expected forwarding"),
         }
+    }
+
+    #[test]
+    fn rejects_network_path_and_non_options_asterisk_targets() {
+        let cfg = config(&[]);
+        assert!(route_request("GET", "//attacker.example/path", Some("trusted.example"), "http", &cfg).is_err());
+        assert!(route_request("GET", "*", Some("trusted.example"), "http", &cfg).is_err());
+        assert!(route_request("OPTIONS", "*", Some("trusted.example"), "http", &cfg).is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_port_in_host_authority() {
+        let cfg = config(&[]);
+        assert!(route_request("GET", "/", Some("example.com:0"), "http", &cfg).is_err());
     }
 
     #[test]
