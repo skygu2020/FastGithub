@@ -409,10 +409,10 @@ mod header_tests {
                 let mut received_trailers = None;
                 while let Some(frame) = body.frame().await {
                     let frame = frame.unwrap();
-                    if let Ok(data) = frame.into_data() {
-                        received_data.extend_from_slice(&data);
-                    } else if let Ok(trailers) = frame.into_trailers() {
-                        received_trailers = Some(trailers);
+                    if frame.is_data() {
+                        received_data.extend_from_slice(&frame.into_data().unwrap());
+                    } else if frame.is_trailers() {
+                        received_trailers = Some(frame.into_trailers().unwrap());
                     }
                 }
                 assert_eq!(received_data, b"request-body");
@@ -466,10 +466,10 @@ mod header_tests {
         let mut received_trailers = None;
         while let Some(frame) = body.frame().await {
             let frame = frame.unwrap();
-            if let Ok(data) = frame.into_data() {
-                received_data.extend_from_slice(&data);
-            } else if let Ok(trailers) = frame.into_trailers() {
-                received_trailers = Some(trailers);
+            if frame.is_data() {
+                received_data.extend_from_slice(&frame.into_data().unwrap());
+            } else if frame.is_trailers() {
+                received_trailers = Some(frame.into_trailers().unwrap());
             }
         }
         assert_eq!(received_data, b"response-body");
