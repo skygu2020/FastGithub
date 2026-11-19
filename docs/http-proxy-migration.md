@@ -17,7 +17,7 @@
 - CONNECT 根据隧道首批数据判断 TLS；TLS 隧道完成客户端握手和证书动态选择后，将解密流交给同一套 Hyper HTTP/1 请求处理器。
 - 未拦截的非 TLS CONNECT 仍作为原始 TCP 隧道转发。
 - 上游使用 Hyper HTTP/1 client handshake 和 `send_request`，请求体、响应体通过 Hyper body 流转发，不把整份响应缓存到内存。
-- 请求和响应的 hop-by-hop headers，以及 `Connection` 指定的逐跳字段会被移除；请求中的端到端 `Expect` 不会被当作逐跳字段删除；响应 Server 标记为 `FastGithub`。
+- 请求和响应的 hop-by-hop headers，以及 `Connection` 指定的逐跳字段会被移除；请求中的端到端 `Expect` 和 `Trailer` 声明会保留（`TE` 仍按逐跳字段移除）；响应 Server 标记为 `FastGithub`。
 - 当前 HTTP/1 server 显式关闭 keep-alive：每条客户端连接只服务一个请求后关闭。不是持久连接实现。
 
 ### DomainConfig 处理
