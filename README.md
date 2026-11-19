@@ -19,14 +19,18 @@ cargo build --release
 The Rust implementation includes JSON5 configuration loading and sorted
 `appsettings/appsettings.*.json` overlays, label-safe domain wildcard matching, systemd unit
 management, a native DNS-over-TCP/UDP client, endpoint persistence/health ordering, bundled
-DNSCrypt process management, and an initial HTTP CONNECT forward-proxy listener. CONNECT
-supports opaque TCP tunnels for non-TLS CONNECT traffic and an initial TLS interception path for
-TLS CONNECT traffic. TLS interception uses generated per-host leaf certificates and verifies the
-upstream certificate chain and hostname. Plain HTTP requests matching a domain rule with `Response` are now short-circuited with the configured status, content type, and optional body. General plain HTTP upstream forwarding, `Destination`, request-scoped timeout, TLS-intercepted HTTP request processing, and statistics are not yet implemented. The local CA lifecycle is implemented: `fastgithub cert` creates or loads
-`certs/fastgithub.crt` and `certs/fastgithub.key` beside the selected configuration file. Normal
-proxy startup also creates or loads this CA and logs both paths. The CA is not automatically
-installed into the operating-system trust store.
+DNSCrypt process management, and an HTTP forward-proxy listener. The proxy supports ordinary
+HTTP forwarding, opaque non-TLS CONNECT tunnels, and TLS interception that routes decrypted
+HTTP through the same Hyper request layer. Domain rules support Response, Destination, IPAddress,
+TLS SNI policy, and request-scoped Timeout. HTTP request and response bodies are streamed; the
+downstream HTTP/1 connection supports multiple requests. The local CA lifecycle is implemented:
+`fastgithub cert` creates or loads `certs/fastgithub.crt` and `certs/fastgithub.key` beside the
+selected configuration file. Normal proxy startup also creates or loads this CA and logs both
+paths. The CA is not automatically installed into the operating-system trust store.
 
+The remaining proxy protocol work is HTTP/1 Upgrade/WebSocket tunneling and HTTP/2 negotiation.
+The existing HTTP/1 Expect: 100-continue gate and body/trailer handling have source-level tests,
+but the latest changes still require user-side Cargo build and integration verification.
 A bounded TLS ClientHello parser is retained for protocol analysis; the active TLS interception path uses OpenSSL's ClientHello/SNI callback to select per-host certificates.
 
 The active configuration layer preserves the original `TlsSni` semantics: SNI is omitted only
@@ -54,9 +58,3 @@ executable until those gaps are implemented or explicitly accepted and tested.
 - No .NET SDK/runtime, C#, Mono, ASP.NET Core, or Native AOT in the Linux build.
 
 
-### Destination URI groundwork
-
-The Rust branch now has a dedicated URI resolver for the original middleware's Destination semantics. It constructs the base URI as `{scheme}://{host}/` and resolves the configured value as a URI reference, covering absolute destinations, relative paths, root-relative paths, parent segments, and query-only references. Only HTTP and HTTPS destinations are accepted. This helper is groundwork only: it is not yet wired into upstream request forwarding, which remains unimplemented.
-
-
-The domain `Timeout` setting is deliberately not used as a TCP connect timeout. The original implementation applies it to the HTTP request lifecycle; until the Rust HTTP forwarding layer exists, TCP connection attempts retain the fixed 10-second connect limit and request-level timeout remains unsupported.
