@@ -4,7 +4,8 @@ use http::{header, HeaderValue, Method, Response, StatusCode};
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::{body::Incoming, client::conn::http1 as client_http1, server::conn::http1, service::service_fn, Request};
 use hyper_util::rt::TokioIo;
-use std::{convert::Infallible, error::Error, sync::Arc, time::Duration};
+use anyhow::Context;
+use std::{convert::Infallible, error::Error, sync::Arc};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -94,13 +95,14 @@ async fn forward_request(
     });
 
     let (mut parts, body) = request.into_parts();
-    parts.uri = format!("http://{}:{}{}", host_authority(&uri), port, request_target).parse()
+    parts.uri = format!("http://{}{}", host_authority(&uri), request_target).parse()
         .context("building upstream request URI")?;
     parts.headers.remove(header::CONNECTION);
     parts.headers.remove("proxy-connection");
     parts.headers.remove("keep-alive");
     parts.headers.remove(header::UPGRADE);
     parts.headers.insert(header::HOST, HeaderValue::from_str(&host_authority(&uri))?);
+    tracing::debug!(%original_host, upstream = %uri, "forwarding HTTP request");
     let upstream_request = Request::from_parts(parts, body);
     let upstream_response = sender.send_request(upstream_request).await?;
     let (mut response_parts, response_body) = upstream_response.into_parts();
@@ -114,9 +116,11 @@ async fn forward_request(
 }
 
 fn host_authority(uri: &url::Url) -> String {
+    let host = uri.host_str().unwrap_or_default();
+    let host = if host.contains(':') { format!("[{host}]") } else { host.to_owned() };
     match uri.port() {
-        Some(port) => format!("{}:{}", uri.host_str().unwrap_or_default(), port),
-        None => uri.host_str().unwrap_or_default().to_owned(),
+        Some(port) => format!("{host}:{port}"),
+        None => host,
     }
 }
 
