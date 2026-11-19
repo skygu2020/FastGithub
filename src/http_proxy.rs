@@ -13,6 +13,7 @@ const BAD_REQUEST_RESPONSE: &[u8] = b"HTTP/1.1 400 Bad Request\r\nConnection: cl
 
 pub async fn run(config: AppConfig, upstreams: Vec<SocketAddr>, certificates: Arc<CertificateService>) -> Result<()> {
     let port = config.fast_github.http_proxy_port;
+    let configured_domains = config.fast_github.domain_configs.keys().cloned().collect::<Vec<_>>();
     let resolver = DomainResolver::new(DnsClient::new(upstreams), Persistence::new("dnsendpoints.json")).await?;
     let tls_proxy = Arc::new(TlsProxy::new(certificates)?);
     let config = Arc::new(config);
@@ -24,10 +25,11 @@ pub async fn run(config: AppConfig, upstreams: Vec<SocketAddr>, certificates: Ar
             accepted = listener.accept() => {
                 let (stream, peer) = accepted.context("accepting proxy connection")?;
                 let resolver = resolver.clone();
+                let domains = configured_domains.clone();
                 let tls_proxy = Arc::clone(&tls_proxy);
                 let config = Arc::clone(&config);
                 tokio::spawn(async move {
-                    if let Err(error) = handle_connection(stream, resolver, config, tls_proxy, peer).await {
+                    if let Err(error) = handle_connection(stream, resolver, &domains, config, tls_proxy, peer).await {
                         tracing::debug!(%peer, %error, "proxy connection ended");
                     }
                 });
@@ -42,7 +44,7 @@ pub async fn run(config: AppConfig, upstreams: Vec<SocketAddr>, certificates: Ar
     Ok(())
 }
 
-async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, config: Arc<AppConfig>, tls_proxy: Arc<TlsProxy>, peer: SocketAddr) -> Result<()> {
+async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, domains: &[String], config: Arc<AppConfig>, tls_proxy: Arc<TlsProxy>, peer: SocketAddr) -> Result<()> {
     let header = match timeout(HEADER_TIMEOUT, read_header(&mut client)).await {
         Ok(Ok(header)) => header,
         Ok(Err(error)) => return Err(error),
@@ -60,7 +62,7 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, conf
     };
     if !method.eq_ignore_ascii_case("CONNECT") {
         let stream = crate::prefixed_io::PrefixedIo::new(client, header);
-        return crate::http_server::serve(stream, "http", config, resolver, Arc::clone(&tls_proxy)).await
+        return crate::http_server::serve(stream, "http", config, resolver, domains.to_vec(), Arc::clone(&tls_proxy)).await
             .with_context(|| format!("serving plain HTTP request from {peer}"));
     }
     let (host, port) = match parse_authority(authority) {
@@ -79,13 +81,13 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, conf
     if is_tls {
         // Intercepted TLS requests are routed by the decrypted HTTP Host and
         // configured Destination; the CONNECT authority is not an upstream.
-        tls_proxy.intercept(client, host.as_str(), Arc::clone(&config), resolver.clone(), Arc::clone(&tls_proxy)).await?;
+        tls_proxy.intercept(client, host.as_str(), Arc::clone(&config), resolver.clone(), domains.to_vec(), Arc::clone(&tls_proxy)).await?;
         return Ok(());
     }
 
     // A raw CONNECT tunnel has no HTTP request to route, so connect to its
     // authority only after determining that the client is not starting TLS.
-    let (mut upstream, _upstream_ip) = connect_target(&host, port, &resolver, config.domain_config(&host))
+    let (mut upstream, _upstream_ip) = connect_target(&host, port, &resolver, domains, &config)
         .await.with_context(|| format!("connecting to raw CONNECT target {host}:{port}"))?;
     let (up, down) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
     tracing::debug!(%peer, %host, port, client_to_upstream = up, upstream_to_client = down, tls_intercepted = is_tls, "HTTP CONNECT tunnel closed");
@@ -168,7 +170,7 @@ impl TlsProxy {
         Ok(tls)
     }
 
-    pub(crate) async fn intercept(&self, client: TcpStream, connect_host: &str, config: Arc<AppConfig>, resolver: DomainResolver, tls_proxy: Arc<TlsProxy>) -> Result<()> {
+    pub(crate) async fn intercept(&self, client: TcpStream, connect_host: &str, config: Arc<AppConfig>, resolver: DomainResolver, domains: Vec<String>, tls_proxy: Arc<TlsProxy>) -> Result<()> {
         let default_certificate = self.certificates.server_certificate(connect_host)?;
         let mut ssl = Ssl::new(self.acceptor.context()).context("creating inbound TLS session")?;
         ssl.set_certificate(&default_certificate.certificate)?;
@@ -179,7 +181,7 @@ impl TlsProxy {
         let requested_host = client_tls.ssl().servername(NameType::HOST_NAME).unwrap_or(connect_host).to_owned();
 
         tracing::debug!(host = %requested_host, "TLS interception established; handing decrypted HTTP to Hyper");
-        crate::http_server::serve(client_tls, "https", config, resolver, tls_proxy).await
+        crate::http_server::serve(client_tls, "https", config, resolver, domains, tls_proxy).await
     }
 }
 
@@ -247,28 +249,26 @@ pub(crate) async fn connect_target(
     host: &str,
     port: u16,
     resolver: &DomainResolver,
-    domain_config: Option<&crate::config::DomainConfig>,
+    domains: &[String],
+    config: &AppConfig,
 ) -> Result<(TcpStream, IpAddr)> {
+    let domain_config = config.domain_config(host);
 
     // FastGithub's DomainConfig.Timeout is an HTTP request-lifecycle timeout,
     // not a TCP dial timeout. Keep connection establishment on its fixed limit;
     // request-scoped cancellation will be applied by the HTTP forwarding layer.
     let connect_timeout = CONNECT_TIMEOUT;
     let mut addresses = Vec::new();
-    // DomainConfig belongs to the original request host, even when Destination
-    // rewrites the upstream authority. Its IPAddress must therefore be tried
-    // before resolving (or directly connecting to) the destination host.
-    if let Some(configured) = domain_config.and_then(|value| value.ip_address.as_deref()) {
-        let ip = configured.parse::<IpAddr>()
-            .with_context(|| format!("invalid IPAddress '{configured}' for {host}"))?;
-        addresses.push(ip);
-    }
-
     if let Ok(ip) = host.parse::<IpAddr>() {
         addresses.push(ip);
-    } else if domain_config.is_some() {
-        // A configured IP is the first candidate, not an exclusive override;
-        // resolver candidates remain available as fallback.
+    } else if domains.iter().any(|pattern| crate::config::domain_matches(pattern, host)) {
+        // Match the .NET implementation: a configured IP is the first candidate,
+        // not an exclusive override; DNS candidates remain available as fallback.
+        if let Some(configured) = domain_config.and_then(|value| value.ip_address.as_deref()) {
+            let ip = configured.parse::<IpAddr>()
+                .with_context(|| format!("invalid IPAddress '{configured}' for {host}"))?;
+            addresses.push(ip);
+        }
         match resolver.resolve(host, port).await {
             Ok(resolved) => addresses.extend(resolved),
             Err(error) if !addresses.is_empty() => {
