@@ -19,11 +19,12 @@ type ResponseBody = UnsyncBoxBody<Bytes, BoxError>;
 struct TimeoutBody<B> {
     inner: Pin<Box<B>>,
     sleep: Pin<Box<Sleep>>,
+    terminated: bool,
 }
 
 impl<B> TimeoutBody<B> {
     fn new(inner: B, duration: Duration) -> Self {
-        Self { inner: Box::pin(inner), sleep: Box::pin(tokio::time::sleep(duration)) }
+        Self { inner: Box::pin(inner), sleep: Box::pin(tokio::time::sleep(duration)), terminated: false }
     }
 }
 
@@ -39,21 +40,31 @@ where
         cx: &mut TaskContext<'_>,
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
+        if this.terminated {
+            return Poll::Ready(None);
+        }
         if this.sleep.as_mut().poll(cx).is_ready() {
+            this.terminated = true;
             return Poll::Ready(Some(Err(Box::new(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "configured HTTP response-body timeout elapsed",
+                "configured HTTP request timeout elapsed while streaming the response body",
             )))));
         }
-        this.inner.as_mut().poll_frame(cx)
+        match this.inner.as_mut().poll_frame(cx) {
+            Poll::Ready(None) => {
+                this.terminated = true;
+                Poll::Ready(None)
+            }
+            other => other,
+        }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.as_ref().get_ref().is_end_stream()
+        self.terminated || self.inner.as_ref().get_ref().is_end_stream()
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
-        self.inner.as_ref().get_ref().size_hint()
+        if self.terminated { http_body::SizeHint::with_exact(0) } else { self.inner.as_ref().get_ref().size_hint() }
     }
 }
 
@@ -92,7 +103,11 @@ async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppCo
                     return empty_response(StatusCode::BAD_GATEWAY);
                 }
             };
-            let forwarding = forward_request(request, uri, request_target, original_host, domain, timeout_duration, resolver, domains, config, tls_proxy);
+            // Keep one clock for the complete request. If the response body starts
+            // after a slow DNS/connect/TLS/header phase, only the remaining budget
+            // is available for streaming it.
+            let request_started = tokio::time::Instant::now();
+            let forwarding = forward_request(request, uri, request_target, original_host, domain, timeout_duration, request_started, resolver, domains, config, tls_proxy);
             match timeout_duration {
                 Some(duration) => match tokio::time::timeout(duration, forwarding).await {
                     Ok(Ok(response)) => response,
@@ -125,6 +140,7 @@ async fn forward_request(
     original_host: String,
     domain: Option<crate::config::DomainConfig>,
     body_timeout: Option<Duration>,
+    request_started: tokio::time::Instant,
     resolver: &DomainResolver,
     domains: &[String],
     config: &AppConfig,
@@ -160,7 +176,10 @@ async fn forward_request(
     response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
     let boxed_body = response_body.map_err(|error| Box::new(error) as BoxError).boxed_unsync();
     let response_body = match body_timeout {
-        Some(duration) => TimeoutBody::new(boxed_body, duration).boxed_unsync(),
+        Some(duration) => {
+            let remaining = duration.saturating_sub(request_started.elapsed());
+            TimeoutBody::new(boxed_body, remaining).boxed_unsync()
+        }
         None => boxed_body,
     };
     Ok(Response::from_parts(response_parts, response_body))
