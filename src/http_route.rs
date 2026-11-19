@@ -97,11 +97,17 @@ pub fn route_request(
             else { base.join(request_target).context("resolving origin-form request target")? }
         }
     };
-    let uri = match matched.and_then(|domain| domain.destination.as_deref()) {
-        Some(destination) => resolve_destination(scheme, &original_authority, destination)?,
+    // Destination is a YARP destination prefix, not a replacement request URI.
+    // The original request path and query are appended after the configured prefix.
+    let destination = matched.and_then(|domain| domain.destination.as_deref());
+    let uri = match destination {
+        Some(destination) => {
+            let prefix = resolve_destination(scheme, &original_authority, destination)?;
+            append_destination_path(prefix, &original_uri, request_target == "*")?
+        }
         None => original_uri,
     };
-    let request_target = if request_target == "*" && matched.and_then(|d| d.destination.as_deref()).is_none() {
+    let request_target = if request_target == "*" && destination.is_none() {
         "*".to_owned()
     } else {
         let path = if uri.path().is_empty() { "/" } else { uri.path() };
@@ -118,6 +124,26 @@ pub fn route_request(
     })
 }
 
+
+/// Append the incoming request path and query to a YARP-style destination prefix.
+/// YARP avoids a duplicate slash at the prefix boundary and preserves the incoming
+/// query by appending it to the prefix string.
+fn append_destination_path(prefix: Url, request_uri: &Url, asterisk_form: bool) -> Result<Url> {
+    let path = if asterisk_form { "" } else { request_uri.path() };
+    let query = if asterisk_form { None } else { request_uri.query() };
+    let mut target = prefix.as_str().to_owned();
+    if !path.is_empty() {
+        if target.ends_with('/') {
+            target.pop();
+        }
+        target.push_str(path);
+    }
+    if let Some(query) = query {
+        target.push('?');
+        target.push_str(query);
+    }
+    Url::parse(&target).context("appending request path to Destination prefix")
+}
 
 /// Extract the authority exactly as written in an absolute-form request-target.
 /// Url::port() normalizes away explicit default ports (80/443), but relative
@@ -286,8 +312,8 @@ mod tests {
         };
         match route_request("GET", "/logo.png?v=2", Some("origin.example"), "https", &config(&[("origin.example", rule)])).unwrap() {
             RouteDecision::Forward { uri, request_target, original_host, domain, .. } => {
-                assert_eq!(uri.as_str(), "https://cdn.example/assets/");
-                assert_eq!(request_target, "/assets/");
+                assert_eq!(uri.as_str(), "https://cdn.example/assets/logo.png?v=2");
+                assert_eq!(request_target, "/assets/logo.png?v=2");
                 assert_eq!(original_host, "origin.example");
                 assert_eq!(domain.as_ref().and_then(|rule| rule.ip_address.as_deref()), Some("192.0.2.10"));
             }
@@ -299,7 +325,7 @@ mod tests {
     fn relative_destination_preserves_original_host_port() {
         let rule = DomainConfig { destination: Some("mirror/path".into()), ..Default::default() };
         match route_request("GET", "/x", Some("origin.example:8443"), "https", &config(&[("origin.example", rule)])).unwrap() {
-            RouteDecision::Forward { uri, .. } => assert_eq!(uri.as_str(), "https://origin.example:8443/mirror/path"),
+            RouteDecision::Forward { uri, .. } => assert_eq!(uri.as_str(), "https://origin.example:8443/mirror/path/x"),
             _ => panic!("expected forwarding"),
         }
     }
@@ -308,10 +334,25 @@ mod tests {
     fn absolute_form_relative_destination_preserves_explicit_default_port() {
         let rule = DomainConfig { destination: Some("mirror/".into()), ..Default::default() };
         match route_request("GET", "https://origin.example:443/x", None, "https", &config(&[("origin.example", rule)])).unwrap() {
-            RouteDecision::Forward { uri, .. } => assert_eq!(uri.as_str(), "https://origin.example/mirror/"),
+            RouteDecision::Forward { uri, .. } => assert_eq!(uri.as_str(), "https://origin.example/mirror/x"),
             _ => panic!("expected forwarding"),
         }
         assert_eq!(absolute_authority("https://[2001:db8::1]:443/a").unwrap(), "[2001:db8::1]:443");
+    }
+
+    #[test]
+    fn destination_prefix_appends_path_and_query_without_duplicate_slashes() {
+        let rule = DomainConfig {
+            destination: Some("https://cdn.example/base/".into()),
+            ..Default::default()
+        };
+        match route_request("GET", "/assets/logo.png?v=2", Some("origin.example"), "https", &config(&[("origin.example", rule)])).unwrap() {
+            RouteDecision::Forward { uri, request_target, .. } => {
+                assert_eq!(uri.as_str(), "https://cdn.example/base/assets/logo.png?v=2");
+                assert_eq!(request_target, "/base/assets/logo.png?v=2");
+            }
+            _ => panic!("expected forwarding"),
+        }
     }
 
     #[test]
