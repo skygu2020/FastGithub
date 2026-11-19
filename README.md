@@ -28,8 +28,7 @@ downstream HTTP/1 connection supports multiple requests. The local CA lifecycle 
 selected configuration file. Normal proxy startup also creates or loads this CA and logs both
 paths. The CA is not automatically installed into the operating-system trust store.
 
-The proxy also supports persistent downstream HTTP/1 connections, HTTP/1 Upgrade tunneling (including WebSocket), and HTTP/2 over negotiated TLS ALPN on both the intercepted client side and HTTPS upstream side. HTTP/2 upstream connections are currently per-request; h2c and RFC 8441 extended CONNECT are not implemented. The HTTP/1 Expect: 100-continue gate and detailed body/cancellation edge cases still require the planned regression pass.
-The existing HTTP/1 Expect: 100-continue gate and body/trailer handling have source-level tests,
+The proxy also supports persistent downstream HTTP/1 connections, HTTP/1 Upgrade tunneling (including WebSocket), and HTTP/2 over negotiated TLS ALPN on both the intercepted client side and HTTPS upstream side. HTTP/2 upstream connections are currently per-request; h2c and RFC 8441 extended CONNECT are not implemented. The HTTP/1 Expect: 100-continue gate and body/trailer handling have source-level tests,
 but the latest changes still require user-side Cargo build and integration verification.
 A bounded TLS ClientHello parser is retained for protocol analysis; the active TLS interception path uses OpenSSL's ClientHello/SNI callback to select per-host certificates.
 
