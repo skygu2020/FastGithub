@@ -71,8 +71,8 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, doma
             return Err(error);
         }
     };
-    let mut upstream = match connect_target(&host, port, &resolver, domains).await {
-        Ok(stream) => stream,
+    let (mut upstream, upstream_ip) = match connect_target(&host, port, &resolver, domains, &config).await {
+        Ok(connection) => connection,
         Err(error) => {
             let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").await;
             return Err(error).with_context(|| format!("connecting to {host}:{port}"));
@@ -85,7 +85,7 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, doma
         Err(_) => bail!("timed out waiting for CONNECT tunnel data"),
     };
     let (up, down) = if is_tls {
-        tls_proxy.intercept(client, upstream, &host, &config).await?
+        tls_proxy.intercept(client, upstream, &host, upstream_ip, &config).await?
     } else {
         tokio::io::copy_bidirectional(&mut client, &mut upstream).await?
     };
@@ -145,7 +145,7 @@ impl TlsProxy {
         Ok(Self { acceptor: acceptor.build(), connector, certificates })
     }
 
-    async fn intercept(&self, client: TcpStream, upstream: TcpStream, connect_host: &str, config: &AppConfig) -> Result<(u64, u64)> {
+    async fn intercept(&self, client: TcpStream, upstream: TcpStream, connect_host: &str, upstream_ip: IpAddr, config: &AppConfig) -> Result<(u64, u64)> {
         let default_certificate = self.certificates.server_certificate(connect_host)?;
         let mut ssl = Ssl::new(self.acceptor.context()).context("creating inbound TLS session")?;
         ssl.set_certificate(&default_certificate.certificate)?;
@@ -158,10 +158,7 @@ impl TlsProxy {
         let domain_config = config.fast_github.domain_configs.iter()
             .find(|(pattern, _)| crate::config::domain_matches(pattern, &requested_host))
             .map(|(_, value)| value);
-        let configured_sni = domain_config.and_then(|value| {
-            let address = upstream.peer_addr().ok()?.ip();
-            value.tls_sni_value(&requested_host, address)
-        });
+        let configured_sni = domain_config.and_then(|value| value.tls_sni_value(&requested_host, upstream_ip));
         // Preserve normal hostname SNI even when there is no matching domain rule.
         // Only an explicit TlsSni=false setting suppresses the SNI extension.
         let disable_sni = domain_config.is_some_and(|value| value.tls_sni == Some(false));
@@ -220,23 +217,53 @@ fn parse_authority(authority: &str) -> Result<(String, u16)> {
     Ok((host.to_owned(), port))
 }
 
-async fn connect_target(host: &str, port: u16, resolver: &DomainResolver, domains: &[String]) -> Result<TcpStream> {
-    let addresses: Vec<IpAddr> = if let Ok(ip) = host.parse() {
-        vec![ip]
+async fn connect_target(
+    host: &str,
+    port: u16,
+    resolver: &DomainResolver,
+    domains: &[String],
+    config: &AppConfig,
+) -> Result<(TcpStream, IpAddr)> {
+    let domain_config = config.fast_github.domain_configs.iter()
+        .find(|(pattern, _)| crate::config::domain_matches(pattern, host))
+        .map(|(_, value)| value);
+
+    let mut addresses = Vec::new();
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        addresses.push(ip);
     } else if domains.iter().any(|pattern| crate::config::domain_matches(pattern, host)) {
-        resolver.resolve(host, port).await?
+        // Match the .NET implementation: a configured IP is the first candidate,
+        // not an exclusive override; DNS candidates remain available as fallback.
+        if let Some(configured) = domain_config.and_then(|value| value.ip_address.as_deref()) {
+            let ip = configured.parse::<IpAddr>()
+                .with_context(|| format!("invalid IPAddress '{configured}' for {host}"))?;
+            addresses.push(ip);
+        }
+        match resolver.resolve(host, port).await {
+            Ok(resolved) => addresses.extend(resolved),
+            Err(error) if !addresses.is_empty() => {
+                tracing::warn!(%host, %error, "configured IP is available; continuing without DNS candidates");
+            }
+            Err(error) => return Err(error).with_context(|| format!("resolving configured domain {host}")),
+        }
     } else {
-        timeout(SYSTEM_DNS_TIMEOUT, lookup_host((host, port))).await
+        addresses.extend(timeout(SYSTEM_DNS_TIMEOUT, lookup_host((host, port))).await
             .with_context(|| format!("system DNS lookup for {host} timed out"))?
             .with_context(|| format!("system DNS lookup for {host}"))?
-            .map(|endpoint| endpoint.ip()).collect()
-    };
-    if addresses.is_empty() { bail!("no IP addresses available for {host}"); }
-    let mut failures = Vec::new();
+            .map(|endpoint| endpoint.ip()));
+    }
+
+    let mut unique_addresses = Vec::with_capacity(addresses.len());
     for ip in addresses {
+        if !unique_addresses.contains(&ip) { unique_addresses.push(ip); }
+    }
+    if unique_addresses.is_empty() { bail!("no IP addresses available for {host}"); }
+
+    let mut failures = Vec::new();
+    for ip in unique_addresses {
         let endpoint = SocketAddr::new(ip, port);
         match timeout(CONNECT_TIMEOUT, TcpStream::connect(endpoint)).await {
-            Ok(Ok(stream)) => { stream.set_nodelay(true)?; return Ok(stream); }
+            Ok(Ok(stream)) => { stream.set_nodelay(true)?; return Ok((stream, ip)); }
             Ok(Err(error)) => failures.push(format!("{endpoint}: {error}")),
             Err(_) => failures.push(format!("{endpoint}: connection timed out")),
         }
