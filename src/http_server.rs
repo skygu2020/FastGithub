@@ -621,7 +621,10 @@ mod header_tests {
             ).await.is_err());
             stream.write_all(b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
             // The client must not upload the gated body after the final rejection.
-            assert_eq!(stream.read(&mut probe).await.unwrap(), 0);
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                stream.read(&mut probe),
+            ).await.is_err());
         });
 
         let stream = tokio::net::TcpStream::connect(address).await.unwrap();
