@@ -30,11 +30,17 @@ pub async fn try_respond(stream: &mut TcpStream, header: &[u8], config: &AppConf
     }
 
     let body = response.content_value.as_deref().unwrap_or("").as_bytes();
-    let no_body_status = (100..200).contains(&response.status_code) || matches!(response.status_code, 204 | 304);
-    let content_length = if no_body_status { 0 } else { body.len() };
+    let no_body_status = matches!(response.status_code, 204 | 205 | 304);
+    let content_length_header = match response.status_code {
+        // 204 and 304 have special framing rules; do not claim a zero-length
+        // selected representation for either response.
+        204 | 304 => String::new(),
+        205 => "Content-Length: 0\\r\\n".to_owned(),
+        _ => format!("Content-Length: {}\\r\\n", body.len()),
+    };
     let headers = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nServer: FastGithub\r\n\r\n",
-        response.status_code, reason_phrase(response.status_code), response.content_type, content_length
+        "HTTP/1.1 {} {}\\r\\nContent-Type: {}\\r\\n{}Connection: close\\r\\nServer: FastGithub\\r\\n\\r\\n",
+        response.status_code, reason_phrase(response.status_code), response.content_type, content_length_header
     );
     stream.write_all(headers.as_bytes()).await?;
     if !method.eq_ignore_ascii_case("HEAD") && !no_body_status && !body.is_empty() { stream.write_all(body).await?; }
