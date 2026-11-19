@@ -28,7 +28,7 @@ downstream HTTP/1 connection supports multiple requests. The local CA lifecycle 
 selected configuration file. Normal proxy startup also creates or loads this CA and logs both
 paths. The CA is not automatically installed into the operating-system trust store.
 
-The remaining proxy protocol work is HTTP/1 Upgrade/WebSocket tunneling and HTTP/2 negotiation.
+The proxy also supports persistent downstream HTTP/1 connections and HTTP/1 Upgrade tunneling (including WebSocket). HTTP/2 negotiation remains the outstanding mainline proxy protocol feature.
 The existing HTTP/1 Expect: 100-continue gate and body/trailer handling have source-level tests,
 but the latest changes still require user-side Cargo build and integration verification.
 A bounded TLS ClientHello parser is retained for protocol analysis; the active TLS interception path uses OpenSSL's ClientHello/SNI callback to select per-host certificates.
