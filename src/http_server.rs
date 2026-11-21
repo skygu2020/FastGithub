@@ -495,7 +495,13 @@ async fn handle_request_inner(request: Request<Incoming>, scheme: &str, config: 
                 Some(duration) => match tokio::time::timeout(duration, forwarding).await {
                     Ok(Ok(response)) => response,
                     Ok(Err(error)) => {
-                        tracing::debug!(%error, "upstream HTTP forwarding failed");
+                        tracing::warn!(
+                            %method,
+                            %target,
+                            %error,
+                            elapsed_ms = request_started.elapsed().as_millis(),
+                            "upstream HTTP forwarding failed"
+                        );
                         empty_response(StatusCode::BAD_GATEWAY)
                     }
                     Err(_) => empty_response(StatusCode::GATEWAY_TIMEOUT),
