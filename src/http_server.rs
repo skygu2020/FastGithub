@@ -1455,7 +1455,7 @@ mod header_tests {
     #[tokio::test]
     async fn http1_server_terminates_incomplete_request_body_after_client_disconnect() {
         use bytes::Bytes;
-        use http::{Response, StatusCode};
+        use http::Response;
         use http_body_util::Full;
         use hyper::{service::service_fn, server::conn::http1 as server_http1};
         use hyper_util::rt::TokioIo;
@@ -1467,8 +1467,9 @@ mod header_tests {
         let (body_done_tx, body_done_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
+            let body_done_tx = std::sync::Mutex::new(Some(body_done_tx));
             let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
-                let body_done_tx = std::sync::Mutex::new(Some(body_done_tx));
+                let body_done_tx = body_done_tx.lock().unwrap().take();
                 async move {
                     let mut body = request.into_body();
                     let mut saw_body_error = false;
@@ -1478,7 +1479,7 @@ mod header_tests {
                             break;
                         }
                     }
-                    if let Some(sender) = body_done_tx.into_inner().unwrap() {
+                    if let Some(sender) = body_done_tx {
                         let _ = sender.send(saw_body_error);
                     }
                     Ok::<_, Infallible>(Response::new(Full::new(Bytes::new())))
