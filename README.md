@@ -38,10 +38,24 @@ case-insensitive `@domain`, `@ipaddress`, and `@random` tokens. The random token
 uses Linux system uptime milliseconds from `/proc/uptime`, corresponding to the original changing tick
 count. The upstream TLS connection applies the configured SNI override while continuing to verify the certificate against the original CONNECT/SNI hostname.
 
-The DNS client queries A and AAAA records, merges upstream answers, caches bounded DNS TTLs, and
-can promote the fastest TCP-reachable address. The resolver persists discovered `host:port`
-entries in `dnsendpoints.json`. Port 53 uses TCP; custom ports use UDP and retry over TCP when a
-response is truncated. UDP transaction IDs are validated before parsing.
+The DNS/IP selection path queries A and AAAA records, merges multiple upstreams, and probes
+candidate endpoints with both TCP connect and a TLS handshake using the original hostname as SNI.
+Certificate-chain validation remains enabled while hostname matching is skipped for candidate-IP
+measurement. Online hosts sources are fetched concurrently and take priority over DNS; GitHub
+service-specific seed IPs are added as fallback candidates. Request-stage TCP or TLS failures open
+a 90-second per-IP circuit breaker, while successful addresses are promoted for subsequent requests.
+New candidates are merged ahead of retained old candidates so transient DNS or network failures do
+not empty the pool. DNS endpoint names remain in `dnsendpoints.json`; verified IP candidates are
+persisted in `dnsaddresses.json`. The running proxy refreshes hosts and endpoint candidates at
+startup and every 30 minutes. Loopback management paths `/ping` and `/refresh-ip` are available
+through the proxy authority; manual refresh invalidates DNS/probe caches before rebuilding candidates.
+Public DNS servers on port 53 are temporarily circuit-broken after repeated query failures. Port 53
+uses TCP; custom DNS ports use UDP and retry over TCP when a response is truncated. UDP transaction
+IDs are validated before parsing.
+
+The core parity and remaining-work checklist is maintained in [docs/CORE_PARITY.md](docs/CORE_PARITY.md).
+The current source updates have not yet been built or tested with Cargo; see that checklist for the
+required Linux validation commands.
 
 The bundled Linux `dnscrypt-proxy` remains in place until a native replacement preserves shipped
 behavior. The current TOML enables DNSCrypt and DNS-over-HTTPS and requires no-log/no-filter
