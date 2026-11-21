@@ -553,7 +553,9 @@ async fn forward_request(
             }
         });
     }
-    let upstream_response = tls_proxy.send_pooled_request(upstream_request).await?;
+    let upstream_response = tls_proxy
+        .send_pooled_request(&original_host, upstream_request)
+        .await?;
     let (mut response_parts, response_body) = upstream_response.into_parts();
     response_parts.version = downstream_version;
     strip_hop_by_hop_headers(&mut response_parts.headers);
