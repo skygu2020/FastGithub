@@ -102,10 +102,22 @@ impl Drop for UpstreamConnectionGuard {
 
 impl<B> TimeoutBody<B> {
     fn new(inner: B, duration: Option<Duration>, connection: UpstreamConnectionGuard) -> Self {
+        Self::with_connection(inner, duration, Some(connection))
+    }
+
+    fn new_pooled(inner: B, duration: Option<Duration>) -> Self {
+        Self::with_connection(inner, duration, None)
+    }
+
+    fn with_connection(
+        inner: B,
+        duration: Option<Duration>,
+        connection: Option<UpstreamConnectionGuard>,
+    ) -> Self {
         Self {
             inner: Box::pin(inner),
             sleep: duration.map(|duration| Box::pin(tokio::time::sleep(duration))),
-            connection: Some(connection),
+            connection,
             terminated: false,
         }
     }
@@ -510,38 +522,6 @@ async fn forward_request(
     }
     let downstream_version = request.version();
     let host = uri.host_str().context("upstream URI has no host")?;
-    let port = uri.port().unwrap_or(if uri.scheme() == "https" { 443 } else { 80 });
-    let (stream, upstream_ip) = crate::http_proxy::connect_target(host, port, resolver, domains, config, domain.as_ref()).await?;
-    let (io, upstream_http2): (Box<dyn AsyncIo>, bool) = if uri.scheme() == "https" {
-        let tls = match tls_proxy.connect_upstream(stream, host, upstream_ip, domain.as_ref(), true).await {
-            Ok(tls) => tls,
-            Err(error) => {
-                resolver.report_failure(upstream_ip).await;
-                return Err(error);
-            }
-        };
-        let use_http2 = crate::http_proxy::negotiated_http2(tls.ssl().selected_alpn_protocol());
-        (Box::new(tls), use_http2)
-    } else if uri.scheme() == "http" {
-        (Box::new(stream), false)
-    } else {
-        anyhow::bail!("unsupported upstream URI scheme '{}'", uri.scheme());
-    };
-    if upstream_http2 {
-        return forward_request_http2(
-            request, uri, request_target, original_host, downstream_version, body_timeout, request_started, io,
-        ).await;
-    }
-    let (mut sender, connection) = client_http1::handshake(TokioIo::new(io)).await?;
-    let connection_task = tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            tracing::debug!(%error, "upstream HTTP connection ended");
-        }
-    });
-    // Keep the driver alive through response-body streaming, but make every
-    // early-return/cancellation path abort it through this guard's Drop.
-    let connection_guard = UpstreamConnectionGuard(connection_task.abort_handle());
-
     let (mut parts, body) = request.into_parts();
     parts.uri = build_upstream_request_uri(&uri, &request_target)
         .context("building upstream request URI")?;
@@ -553,7 +533,10 @@ async fn forward_request(
     let expect_continue = should_gate_expect_continue(&parts.headers, &body);
     let (continue_tx, continue_rx) = oneshot::channel();
     let gated_body = ExpectContinueBody::new(body, expect_continue.then_some(continue_rx));
-    let mut upstream_request = Request::from_parts(parts, gated_body);
+    let boxed_request_body = gated_body
+        .map_err(|error| Box::new(error) as BoxError)
+        .boxed_unsync();
+    let mut upstream_request = Request::from_parts(parts, boxed_request_body);
     if expect_continue {
         // Hyper's client polls the body after writing request headers. Gate it
         // until the upstream's actual 100 arrives. Polling Incoming only after
@@ -567,14 +550,14 @@ async fn forward_request(
             }
         });
     }
-    let upstream_response = sender.send_request(upstream_request).await?;
+    let upstream_response = tls_proxy.send_pooled_request(upstream_request).await?;
     let (mut response_parts, response_body) = upstream_response.into_parts();
     response_parts.version = downstream_version;
     strip_hop_by_hop_headers(&mut response_parts.headers);
     response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
     let boxed_body = response_body.map_err(|error| Box::new(error) as BoxError).boxed_unsync();
     let remaining = body_timeout.map(|duration| duration.saturating_sub(request_started.elapsed()));
-    let response_body = TimeoutBody::new(boxed_body, remaining, connection_guard).boxed_unsync();
+    let response_body = TimeoutBody::new_pooled(boxed_body, remaining).boxed_unsync();
     Ok(Response::from_parts(response_parts, response_body))
 }
 
