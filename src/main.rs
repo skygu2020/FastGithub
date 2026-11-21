@@ -18,7 +18,12 @@ mod tls;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    fs::{File, OpenOptions},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use fs2::FileExt;
 use tracing_subscriber::{fmt::writer::MakeWriterExt, EnvFilter};
 
 #[derive(Debug, Parser)]
@@ -47,6 +52,21 @@ enum Command {
     TestDns,
     /// Run the original one-second DNS endpoint health refresh loop.
     WatchDns,
+}
+
+fn acquire_instance_lock(config_path: &Path) -> Result<File> {
+    let directory = config_path.parent().filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let lock_path = directory.join(".fastgithub.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening instance lock {}", lock_path.display()))?;
+    FileExt::try_lock_exclusive(&file)
+        .with_context(|| format!("another FastGithub instance already holds {}", lock_path.display()))?;
+    Ok(file)
 }
 
 #[tokio::main]
@@ -150,6 +170,7 @@ async fn main() -> Result<()> {
             println!("CA subject: {:?}", certificates.ca_certificate().subject_name());
         }
         None => {
+            let _instance_lock = acquire_instance_lock(&config_path)?;
             let config = config::AppConfig::load(&config_path)?;
             let certificate_directory = certificate_directory(&config_path);
             let certificates = Arc::new(cert::CertificateService::load_or_create(&certificate_directory)
