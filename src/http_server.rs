@@ -1508,7 +1508,9 @@ mod header_tests {
             let service = service_fn(|request: Request<Incoming>| async move {
                 assert_eq!(request.version(), Version::HTTP_2);
                 assert_eq!(request.uri().path(), "/h2");
-                let response = Response::new(Full::new(Bytes::from_static(b"h2-ok")));
+                // Exceed the default HTTP/2 stream flow-control window so
+                // the client must keep consuming DATA frames to make progress.
+                let response = Response::new(Full::new(Bytes::from(vec![b'x'; 2 * 1024 * 1024])));
                 Ok::<_, Infallible>(response)
             });
             server_http2::Builder::new(TokioExecutor::new())
@@ -1530,7 +1532,9 @@ mod header_tests {
             .unwrap();
         let response = sender.send_request(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), Bytes::from_static(b"h2-ok"));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.len(), 2 * 1024 * 1024);
+        assert!(body.iter().all(|byte| *byte == b'x'));
 
         drop(sender);
         driver.await.unwrap();
