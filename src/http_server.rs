@@ -504,7 +504,16 @@ async fn handle_request_inner(request: Request<Incoming>, scheme: &str, config: 
                         );
                         empty_response(StatusCode::BAD_GATEWAY)
                     }
-                    Err(_) => empty_response(StatusCode::GATEWAY_TIMEOUT),
+                    Err(_) => {
+                        tracing::warn!(
+                            %method,
+                            %target,
+                            elapsed_ms = request_started.elapsed().as_millis(),
+                            timeout_ms = duration.as_millis(),
+                            "upstream HTTP request timed out"
+                        );
+                        empty_response(StatusCode::GATEWAY_TIMEOUT)
+                    },
                 },
                 None => match forwarding.await {
                     Ok(response) => response,
