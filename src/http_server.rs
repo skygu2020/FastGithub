@@ -84,7 +84,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingIo<S> {
 /// Enforce the configured timeout while the upstream response body is streamed.
 /// The forwarding future has its own timeout for DNS, connect, TLS and response headers.
 struct TimeoutBody<B> {
-    inner: Pin<Box<B>>,
+    inner: Option<Pin<Box<B>>>,
     sleep: Option<Pin<Box<Sleep>>>,
     connection: Option<UpstreamConnectionGuard>,
     terminated: bool,
@@ -115,7 +115,7 @@ impl<B> TimeoutBody<B> {
         connection: Option<UpstreamConnectionGuard>,
     ) -> Self {
         Self {
-            inner: Box::pin(inner),
+            inner: Some(Box::pin(inner)),
             sleep: duration.map(|duration| Box::pin(tokio::time::sleep(duration))),
             connection,
             terminated: false,
@@ -140,24 +140,29 @@ where
         }
         if this.sleep.as_mut().is_some_and(|sleep| sleep.as_mut().poll(cx).is_ready()) {
             this.terminated = true;
-            // Stop the Hyper connection driver immediately; otherwise it may
-            // remain parked on a body that nobody will consume after timeout.
+            // Dropping Incoming cancels the upstream HTTP/2 stream or makes an
+            // incomplete HTTP/1 connection ineligible for keep-alive reuse.
+            drop(this.inner.take());
             drop(this.connection.take());
             return Poll::Ready(Some(Err(Box::new(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "configured HTTP request timeout elapsed while streaming the response body",
             )))));
         }
-        match this.inner.as_mut().poll_frame(cx) {
+        let frame = match this.inner.as_mut() {
+            Some(inner) => inner.as_mut().poll_frame(cx),
+            None => return Poll::Ready(None),
+        };
+        match frame {
             Poll::Ready(None) => {
                 this.terminated = true;
-                // The response is fully consumed. Do not leave an idle upstream
-                // keep-alive driver running after the last response frame.
+                drop(this.inner.take());
                 drop(this.connection.take());
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(error))) => {
                 this.terminated = true;
+                drop(this.inner.take());
                 drop(this.connection.take());
                 Poll::Ready(Some(Err(error)))
             }
@@ -166,11 +171,18 @@ where
     }
 
     fn is_end_stream(&self) -> bool {
-        self.terminated || self.inner.as_ref().get_ref().is_end_stream()
+        self.terminated || self.inner.as_ref()
+            .map_or(true, |inner| inner.as_ref().get_ref().is_end_stream())
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
-        if self.terminated { http_body::SizeHint::with_exact(0) } else { self.inner.as_ref().get_ref().size_hint() }
+        if self.terminated {
+            http_body::SizeHint::with_exact(0)
+        } else {
+            self.inner.as_ref()
+                .map(|inner| inner.as_ref().get_ref().size_hint())
+                .unwrap_or_else(|| http_body::SizeHint::with_exact(0))
+        }
     }
 }
 
