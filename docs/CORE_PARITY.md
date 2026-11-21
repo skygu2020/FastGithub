@@ -44,7 +44,6 @@
 
 - [x] 流量分析：累计客户端上行/下行字节、5 秒速率窗口（HTTP/1、HTTP/2、普通 HTTP 和原始 CONNECT；TLS 握手本身未计入）。
 - [x] 非阻塞每日滚动文件日志：与 stdout 同时输出，UTC 日期轮转，最多保留 14 个日志文件。
-- [ ] UDP 日志输出。
 - [x] 单实例运行保护：在主配置文件同目录使用 advisory lock 文件 `.fastgithub.lock`，进程退出自动释放锁。
 - [x] 父进程退出时自动停止代理进程（通过 Linux /proc 监测；由 PID 1 启动时不监测）。
 
@@ -53,6 +52,8 @@
 - [ ] PAC 脚本及 Linux 代理辅助功能。
 
 ## 不移植的 Windows 专属功能
+
+- WPF UI 的 UDP 日志推送接收链路：Linux 版本没有对应的桌面日志 UI，统一使用 stdout 和每日滚动文件日志。
 
 - WinDivert DNS 劫持、TCP 端口重写和透明代理。
 - WPF 托盘 UI。
