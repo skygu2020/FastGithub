@@ -112,3 +112,12 @@
 - 新增 identity 匹配单元测试。该测试尚未执行；当前环境没有本地 Cargo 工具链。
 - 该修正解决的是连接池并发替换竞态，不代表已经解决 GitHub 某些 IP 在 TLS 成功后不返回 HTTP 响应的问题，也不增加请求重放或换 IP 重试。
 
+
+
+## 上游连接 peer IP 可观测性（2026-11-21）
+
+- `UpstreamConnector::connect` 在建立 TCP/TLS 连接时已经获得实际连接 IP，但此前成功日志只记录 host、port 和 ALPN，未输出选中的 peer IP。
+- 现为每条新建上游传输连接分配单调递增的 `connection_id`，并在“连接就绪”和 Hyper 获取连接元数据时记录 `peer_ip`、`connection_id` 与 HTTP/2 协商结果；HTTP 明文与 HTTPS TLS 路径均携带实际选中的 IP。
+- 这属于连接级观测，不等同于请求级关联。Hyper legacy client 的 HTTP/2 连接可复用并承载多个并发 stream；当前请求日志仍只有 host/method/URI，不能据此断言某条响应对应哪个 `connection_id`。后续若要建立请求到连接/IP 的准确关联，需要利用 Hyper 提供的连接扩展元数据或调整 connector/connection 驱动架构，并确认其对 HTTP/1 与 HTTP/2 均成立。
+- 不因单个 HTTP/2 stream 超时而关闭共享连接；也不在请求已经发送后盲目换 IP 重放。先用新增连接日志与用户侧代理请求日志对照，确定是否存在特定 peer IP 反复出现“TLS 成功、HTTP 无响应”。
+- 本次代码尚未由本地 Cargo 工具链格式化、编译或测试；没有触发 GitHub Actions/CI。
