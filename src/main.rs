@@ -24,7 +24,7 @@ use std::{
     sync::Arc,
 };
 use fs2::FileExt;
-use tracing_subscriber::{fmt::writer::MakeWriterExt, EnvFilter};
+use tracing_subscriber::{fmt::writer::{BoxMakeWriter, MakeWriterExt}, EnvFilter};
 
 #[derive(Debug, Parser)]
 #[command(name = "fastgithub", version, about = "Native Rust Linux FastGithub")]
@@ -72,15 +72,22 @@ fn acquire_instance_lock(config_path: &Path) -> Result<File> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let log_directory = std::env::current_dir()?.join("logs");
-    let file_appender = tracing_appender::rolling::Builder::default()
+    let appender = tracing_appender::rolling::Builder::default()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("fastgithub")
         .filename_suffix("log")
         .max_log_files(14)
-        .build(&log_directory)
-        .with_context(|| format!("initializing daily log directory {}", log_directory.display()))?;
-    let (file_writer, _log_guard) = tracing_appender::non_blocking(file_appender);
-    let writer = std::io::stdout.and(file_writer);
+        .build(&log_directory);
+    let (writer, _log_guard) = match appender {
+        Ok(appender) => {
+            let (file_writer, guard) = tracing_appender::non_blocking(appender);
+            (BoxMakeWriter::new(std::io::stdout.and(file_writer)), Some(guard))
+        }
+        Err(error) => {
+            eprintln!("daily log file unavailable ({}): {error}; using stdout only", log_directory.display());
+            (BoxMakeWriter::new(std::io::stdout), None)
+        }
+    };
     tracing_subscriber::fmt()
         .with_writer(writer)
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
