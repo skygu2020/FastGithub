@@ -581,6 +581,74 @@ pub(crate) async fn connect_target(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn pooled_client_reuses_http1_connection_for_same_origin() {
+        use bytes::Bytes;
+        use http::{Request, Response};
+        use http_body_util::{BodyExt, Full};
+        use hyper::{server::conn::http1, service::service_fn};
+        use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+        use std::{convert::Infallible, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_server = Arc::clone(&accepted);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            accepted_server.fetch_add(1, Ordering::Relaxed);
+            let service = service_fn(|_request: Request<hyper::body::Incoming>| async move {
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+            });
+            http1::Builder::new()
+                .keep_alive(true)
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        });
+
+        let config: AppConfig = serde_json::from_str(
+            r#"{"FastGithub":{"HttpProxyPort":0,"FallbackDns":[],"DomainConfigs":{}}}"#,
+        ).unwrap();
+        let resolver = DomainResolver::new(
+            DnsClient::new(Vec::new()),
+            Persistence::new(std::env::temp_dir().join(format!(
+                "fastgithub-pool-test-{}.json",
+                std::process::id()
+            ))),
+        ).await.unwrap();
+        let connector = UpstreamConnector {
+            resolver,
+            domains: Arc::new(Vec::new()),
+            config: Arc::new(config),
+            tls_connector: Arc::new(SslConnector::builder(SslMethod::tls()).unwrap().build()),
+            inherited_rule: None,
+        };
+        let mut builder = Client::builder(TokioExecutor::new());
+        builder
+            .pool_idle_timeout(Duration::from_secs(30))
+            .pool_timer(TokioTimer::new())
+            .pool_max_idle_per_host(4);
+        let client: UpstreamClient = builder.build(connector);
+
+        for _ in 0..2 {
+            let body = Full::new(Bytes::new())
+                .map_err(|never| match never {})
+                .boxed_unsync();
+            let request = Request::builder()
+                .uri(format!("http://127.0.0.1:{}/", address.port()))
+                .body(body)
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), Bytes::from_static(b"ok"));
+        }
+
+        assert_eq!(accepted.load(Ordering::Relaxed), 1);
+        drop(client);
+        server.await.unwrap();
+    }
+
     use super::*;
 
     #[test]
