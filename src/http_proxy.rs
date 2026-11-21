@@ -8,6 +8,13 @@ use tokio_openssl::SslStream;
 const HEADER_LIMIT: usize = 16 * 1024;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Only an explicit h2 ALPN selection enables HTTP/2. No ALPN extension,
+/// no overlap, and an explicit http/1.1 selection all use the HTTP/1 path.
+fn negotiated_http2(selected_alpn: Option<&[u8]>) -> bool {
+    selected_alpn == Some(&b"h2"[..])
+}
+
 const SYSTEM_DNS_TIMEOUT: Duration = Duration::from_secs(10);
 const BAD_REQUEST_RESPONSE: &[u8] = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
 
@@ -193,7 +200,7 @@ impl TlsProxy {
         let requested_host = client_tls.ssl().servername(NameType::HOST_NAME).unwrap_or(connect_host).to_owned();
 
         tracing::debug!(host = %requested_host, alpn = ?client_tls.ssl().selected_alpn_protocol(), "TLS interception established; handing decrypted HTTP to Hyper");
-        if client_tls.ssl().selected_alpn_protocol() == Some(&b"h2"[..]) {
+        if negotiated_http2(client_tls.ssl().selected_alpn_protocol()) {
             crate::http_server::serve_http2(client_tls, "https", config, resolver, domains, tls_proxy).await
         } else {
             crate::http_server::serve(client_tls, "https", config, resolver, domains, tls_proxy).await
@@ -377,6 +384,14 @@ mod tests {
         assert!(parse_request_line(b"CONNECT github.com:443\r\n\r\n").is_err());
         assert!(parse_request_line(b"CONNECT github.com:443 HTTP/1.x\r\n\r\n").is_err());
     }
+    #[test]
+    fn missing_or_non_h2_alpn_falls_back_to_http1() {
+        assert!(!negotiated_http2(None));
+        assert!(!negotiated_http2(Some(b"http/1.1")));
+        assert!(!negotiated_http2(Some(b"unknown/1.0")));
+        assert!(negotiated_http2(Some(b"h2")));
+    }
+
     #[test]
     fn alpn_selection_prefers_h2_and_can_force_http1_for_upgrades() {
         let both = b"\x02h2\x08http/1.1";
