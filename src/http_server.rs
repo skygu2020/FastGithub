@@ -280,7 +280,42 @@ where
     Ok(())
 }
 
-async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppConfig, resolver: &DomainResolver, domains: &[String], tls_proxy: &crate::http_proxy::TlsProxy) -> Response<ResponseBody> {
+async fn handle_request(
+    request: Request<Incoming>,
+    scheme: &str,
+    config: &AppConfig,
+    resolver: &DomainResolver,
+    domains: &[String],
+    tls_proxy: &crate::http_proxy::TlsProxy,
+) -> Response<ResponseBody> {
+    let method = request.method().clone();
+    let authority = request.uri().authority().map(|value| value.as_str()).unwrap_or("");
+    let path = request.uri().path();
+    let target = format!("{authority}{path}");
+    let started = tokio::time::Instant::now();
+    let response = handle_request_inner(request, scheme, config, resolver, domains, tls_proxy).await;
+    let status = response.status();
+    if status.is_server_error() {
+        tracing::warn!(
+            %method,
+            %target,
+            status = status.as_u16(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "HTTP request completed with server error"
+        );
+    } else {
+        tracing::info!(
+            %method,
+            %target,
+            status = status.as_u16(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "HTTP request completed"
+        );
+    }
+    response
+}
+
+async fn handle_request_inner(request: Request<Incoming>, scheme: &str, config: &AppConfig, resolver: &DomainResolver, domains: &[String], tls_proxy: &crate::http_proxy::TlsProxy) -> Response<ResponseBody> {
     let method = request.method().clone();
     // CONNECT has different HTTP/2 pseudo-header and tunnel semantics. This
     // proxy currently implements raw CONNECT only on the HTTP/1 entry path;
