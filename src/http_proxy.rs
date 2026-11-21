@@ -95,26 +95,50 @@ impl UpstreamConnector {
         let port = uri.port_u16().unwrap_or(if scheme == "https" { 443 } else { 80 });
         let config = Arc::clone(&self.config);
         let domains = config.fast_github.domain_configs.keys().cloned().collect::<Vec<_>>();
-        let (stream, ip) = connect_target(
-            host,
-            port,
-            &self.resolver,
-            &domains,
-            &config,
-            self.inherited_rule.as_ref(),
-        ).await?;
 
         let (io, http2): (Box<dyn ProxyIo>, bool) = match scheme {
-            "http" => (Box::new(stream), false),
+            "http" => {
+                let (stream, _) = connect_target(
+                    host, port, &self.resolver, &domains, &config, self.inherited_rule.as_ref(),
+                ).await?;
+                (Box::new(stream), false)
+            }
             "https" => {
                 let rule = self.inherited_rule.as_ref().or_else(|| config.domain_config(host));
-                match connect_upstream_tls(&self.tls_connector, stream, host, ip, rule, true).await {
-                    Ok((tls, http2)) => (Box::new(tls), http2),
-                    Err(error) => {
-                        self.resolver.report_failure(host, port, ip).await;
-                        return Err(error);
+                let mut attempted = Vec::new();
+                let mut failures = Vec::new();
+                let mut connected = None;
+
+                // A TCP connection is not proof that the endpoint can complete TLS.
+                // Try the next candidate when the TLS handshake or certificate check fails.
+                for _ in 0..8 {
+                    let (stream, ip) = match connect_target_excluding(
+                        host, port, &self.resolver, &domains, &config,
+                        self.inherited_rule.as_ref(), &attempted,
+                    ).await {
+                        Ok(value) => value,
+                        Err(error) => {
+                            failures.push(error.to_string());
+                            break;
+                        }
+                    };
+                    attempted.push(ip);
+                    match connect_upstream_tls(&self.tls_connector, stream, host, ip, rule, true).await {
+                        Ok((tls, http2)) => {
+                            connected = Some((Box::new(tls) as Box<dyn ProxyIo>, http2));
+                            break;
+                        }
+                        Err(error) => {
+                            self.resolver.report_failure(host, port, ip).await;
+                            failures.push(format!("{ip}: TLS handshake failed: {error}"));
+                        }
                     }
                 }
+
+                connected.ok_or_else(|| anyhow::anyhow!(
+                    "no upstream candidate completed TLS for {host}:{port}: {}",
+                    failures.join("; ")
+                ))?
             }
             other => bail!("unsupported upstream URI scheme '{other}'"),
         };
@@ -623,6 +647,18 @@ pub(crate) async fn connect_target(
     config: &AppConfig,
     inherited_rule: Option<&crate::config::DomainConfig>,
 ) -> Result<(TcpStream, IpAddr)> {
+    connect_target_excluding(host, port, resolver, domains, config, inherited_rule, &[]).await
+}
+
+async fn connect_target_excluding(
+    host: &str,
+    port: u16,
+    resolver: &DomainResolver,
+    domains: &[String],
+    config: &AppConfig,
+    inherited_rule: Option<&crate::config::DomainConfig>,
+    excluded: &[IpAddr],
+) -> Result<(TcpStream, IpAddr)> {
     // Destination changes the upstream host, but the original request's DomainConfig
     // remains authoritative for IPAddress and TLS policy (matching .NET HttpClientHandler).
     let domain_config = inherited_rule.or_else(|| config.domain_config(host));
@@ -658,7 +694,9 @@ pub(crate) async fn connect_target(
 
     let mut unique_addresses = Vec::with_capacity(addresses.len());
     for ip in addresses {
-        if !unique_addresses.contains(&ip) { unique_addresses.push(ip); }
+        if !excluded.contains(&ip) && !unique_addresses.contains(&ip) {
+            unique_addresses.push(ip);
+        }
     }
     if unique_addresses.is_empty() { bail!("no IP addresses available for {host}"); }
 
@@ -676,7 +714,7 @@ pub(crate) async fn connect_target(
                 failures.push(format!("{endpoint}: {error}"));
             }
             Err(_) => {
-                resolver.report_failure(ip).await;
+                resolver.report_failure(host, port, ip).await;
                 failures.push(format!("{endpoint}: connection timed out"));
             }
         }
