@@ -230,7 +230,14 @@ async fn wait_for_parent_exit(parent_pid: u32) {
         std::future::pending::<()>().await;
     }
     loop {
-        if tokio::fs::metadata(format!("/proc/{parent_pid}")).await.is_err() {
+        let stat = match tokio::fs::read_to_string(format!("/proc/{parent_pid}/stat")).await {
+            Ok(stat) => stat,
+            Err(_) => return,
+        };
+        let state = stat.rsplit_once(')')
+            .and_then(|(_, fields)| fields.split_whitespace().next())
+            .unwrap_or("Z");
+        if state == "Z" || state == "X" {
             return;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
