@@ -180,9 +180,14 @@ impl DomainResolver {
         self.save_addresses().await;
     }
 
-    /// Refresh online hosts sources and then re-probe every known endpoint.
-    pub async fn refresh_hosts(&self) -> HostsRefreshResult {
-        self.hosts.refresh().await
+    /// Force a full refresh: invalidate DNS/probe caches, update online hosts,
+    /// then re-resolve and benchmark every known endpoint.
+    pub async fn refresh_all(&self) -> Result<HostsRefreshResult> {
+        self.dns.clear_cache().await;
+        self.addresses.clear_cache().await;
+        let hosts = self.hosts.refresh().await;
+        self.test_speed().await?;
+        Ok(hosts)
     }
 
     /// Refresh every known endpoint. A per-endpoint DNS failure never erases
