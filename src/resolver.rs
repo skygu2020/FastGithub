@@ -36,7 +36,7 @@ pub struct DomainResolver {
     hosts: HostsService,
     flow: FlowAnalyzer,
     endpoints: Arc<RwLock<HashMap<EndpointRecord, EndpointState>>>,
-    failed_ips: Arc<RwLock<HashMap<IpAddr, Instant>>>,
+    failed_ips: Arc<RwLock<HashMap<(String, u16, IpAddr), Instant>>>,
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -100,7 +100,7 @@ impl DomainResolver {
                 if !state.addresses.is_empty()
                     && state.refreshed_at.elapsed() < ENDPOINT_REFRESH_TTL
                 {
-                    let usable = self.exclude_failed(&state.addresses).await;
+                    let usable = self.exclude_failed(&endpoint.host, endpoint.port, &state.addresses).await;
                     if !usable.is_empty() {
                         return Ok(usable);
                     }
@@ -120,7 +120,7 @@ impl DomainResolver {
                 .addresses
                 .order_addresses(&endpoint.host, port, hosts_candidates, &previous)
                 .await;
-            let ordered = self.exclude_failed(&merge_candidates(probed, &previous)).await;
+            let ordered = self.exclude_failed(&endpoint.host, endpoint.port, &merge_candidates(probed, &previous)).await;
             if !ordered.is_empty() {
                 self.store_endpoint(endpoint, ordered.clone()).await;
                 return Ok(ordered);
@@ -137,7 +137,7 @@ impl DomainResolver {
                     %error,
                     "DNS refresh failed; retaining previous candidates"
                 );
-                let retained = self.exclude_failed(&previous).await;
+                let retained = self.exclude_failed(&endpoint.host, endpoint.port, &previous).await;
                 self.store_endpoint(endpoint.clone(), retained.clone()).await;
                 return Ok(retained);
             }
@@ -270,7 +270,7 @@ impl DomainResolver {
             .order_addresses(&endpoint.host, endpoint.port, candidates, &old)
             .await;
         let merged = merge_candidates(probed, &old);
-        let ordered = self.exclude_failed(&merged).await;
+        let ordered = self.exclude_failed(&endpoint.host, endpoint.port, &merged).await;
 
         if old.iter().take(3).ne(ordered.iter().take(3)) {
             tracing::info!(
@@ -292,20 +292,24 @@ impl DomainResolver {
     }
 
     /// Mark an IP as failed for 90 seconds and remove it from current candidate lists.
-    pub async fn report_failure(&self, address: IpAddr) {
-        self.failed_ips
-            .write()
-            .await
-            .insert(address, Instant::now() + FAILED_ADDRESS_TTL);
-        for state in self.endpoints.write().await.values_mut() {
+    pub async fn report_failure(&self, host: &str, port: u16, address: IpAddr) {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        self.failed_ips.write().await.insert(
+            (host.clone(), port, address),
+            Instant::now() + FAILED_ADDRESS_TTL,
+        );
+        let endpoint = EndpointRecord { host, port };
+        if let Some(state) = self.endpoints.write().await.get_mut(&endpoint) {
             state.addresses.retain(|candidate| *candidate != address);
         }
     }
 
     /// Remember a successful endpoint IP so subsequent requests try it first.
     pub async fn report_success(&self, host: &str, port: u16, address: IpAddr) {
+        let normalized_host = host.trim_end_matches('.').to_ascii_lowercase();
+        self.failed_ips.write().await.remove(&(normalized_host.clone(), port, address));
         let endpoint = EndpointRecord {
-            host: host.trim_end_matches('.').to_ascii_lowercase(),
+            host: normalized_host,
             port,
         };
         if let Some(state) = self.endpoints.write().await.get_mut(&endpoint) {
@@ -333,14 +337,15 @@ impl DomainResolver {
         }
     }
 
-    async fn exclude_failed(&self, addresses: &[IpAddr]) -> Vec<IpAddr> {
+    async fn exclude_failed(&self, host: &str, port: u16, addresses: &[IpAddr]) -> Vec<IpAddr> {
         let now = Instant::now();
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
         let mut failed = self.failed_ips.write().await;
         failed.retain(|_, expires| *expires > now);
         addresses
             .iter()
             .copied()
-            .filter(|address| !failed.contains_key(address))
+            .filter(|address| !failed.contains_key(&(host.clone(), port, *address)))
             .collect()
     }
 
