@@ -11,6 +11,7 @@ name = "fastgithub"
 path = "src/main.rs"
 
 [dependencies]
+arc-swap = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 json5 = "0.4"
