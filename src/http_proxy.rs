@@ -152,6 +152,7 @@ const SYSTEM_DNS_TIMEOUT: Duration = Duration::from_secs(10);
 const BAD_REQUEST_RESPONSE: &[u8] = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
 
 pub async fn run(config: AppConfig, config_path: PathBuf, upstreams: Vec<SocketAddr>, certificates: Arc<CertificateService>) -> Result<()> {
+    let parent_pid = unsafe { libc::getppid() as u32 };
     let port = config.fast_github.http_proxy_port;
     let resolver = DomainResolver::new(DnsClient::new(upstreams), Persistence::new("dnsendpoints.json")).await?;
     let refresh_resolver = resolver.clone();
@@ -214,11 +215,27 @@ pub async fn run(config: AppConfig, config_path: PathBuf, upstreams: Vec<SocketA
                 tracing::info!("HTTP proxy shutting down");
                 break;
             }
+            _ = wait_for_parent_exit(parent_pid) => {
+                tracing::info!(parent_pid, "parent process exited; stopping HTTP proxy");
+                break;
+            }
         }
     }
     refresh_task.abort();
     config_task.abort();
     Ok(())
+}
+
+async fn wait_for_parent_exit(parent_pid: u32) {
+    if parent_pid <= 1 {
+        std::future::pending::<()>().await;
+    }
+    loop {
+        if tokio::fs::metadata(format!("/proc/{parent_pid}")).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 fn config_fingerprint(path: &Path) -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
