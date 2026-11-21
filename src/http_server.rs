@@ -290,11 +290,20 @@ async fn handle_request(
 ) -> Response<ResponseBody> {
     let method = request.method().clone();
     let authority = request.uri().authority().map(|value| value.as_str()).unwrap_or("");
+    let host = request.uri().host()
+        .or_else(|| request.headers().get(header::HOST).and_then(|value| value.to_str().ok()))
+        .unwrap_or("")
+        .split(':').next().unwrap_or("")
+        .trim_matches(['[', ']'])
+        .to_owned();
     let path = request.uri().path();
     let target = format!("{authority}{path}");
     let started = tokio::time::Instant::now();
     let response = handle_request_inner(request, scheme, config, resolver, domains, tls_proxy).await;
     let status = response.status();
+    if status.is_client_error() || status.is_server_error() {
+        resolver.flow_analyzer().record_error(&host, status.as_u16());
+    }
     if status.is_server_error() {
         tracing::warn!(
             %method,
@@ -347,10 +356,19 @@ async fn handle_request_inner(request: Request<Incoming>, scheme: &str, config: 
                 .unwrap_or(if management_uri.scheme() == "https" { 443 } else { 80 });
             if local_host
                 && local_port == config.fast_github.http_proxy_port
-                && matches!(management_uri.path(), "/ping" | "/refresh-ip" | "/flowStatistics")
+                && matches!(management_uri.path(), "/ping" | "/refresh-ip" | "/flowStatistics" | "/errorStatistics")
             {
                 if management_uri.path() == "/ping" && method == Method::GET {
                     return management_response(StatusCode::OK, "text/plain; charset=utf-8", "pong".to_owned());
+                }
+                if management_uri.path() == "/errorStatistics" && method == Method::GET {
+                    let body = serde_json::to_string(&resolver.flow_analyzer().error_statistics())
+                        .unwrap_or_else(|_| "[]".to_owned());
+                    return management_response(
+                        StatusCode::OK,
+                        "application/json; charset=utf-8",
+                        body,
+                    );
                 }
                 if management_uri.path() == "/flowStatistics" && method == Method::GET {
                     let body = serde_json::to_string(&resolver.flow_analyzer().statistics())
