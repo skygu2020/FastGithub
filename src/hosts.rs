@@ -71,7 +71,23 @@ impl HostsService {
                         }
                     }
                 }
-                Ok((url, Err(error))) => errors.push(format!("{url}: {error}")),
+                Ok((url, Err(error))) => {
+                    let detail = format!(
+                        "{url}: {error:#} (timeout={}, connect={}, status={:?})",
+                        error.is_timeout(),
+                        error.is_connect(),
+                        error.status()
+                    );
+                    tracing::warn!(
+                        url = %url,
+                        %error,
+                        timeout = error.is_timeout(),
+                        connect = error.is_connect(),
+                        status = ?error.status(),
+                        "online hosts source download failed"
+                    );
+                    errors.push(detail);
+                },
                 Err(error) => errors.push(format!("hosts fetch task failed: {error}")),
             }
         }
