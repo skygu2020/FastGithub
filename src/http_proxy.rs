@@ -84,7 +84,7 @@ impl Connection for ConnectedUpstreamIo {
 struct UpstreamConnector {
     resolver: DomainResolver,
     domains: Arc<Vec<String>>,
-    config: Arc<ArcSwap<AppConfig>>,
+    config: Arc<AppConfig>,
     tls_connector: Arc<SslConnector>,
     inherited_rule: Option<crate::config::DomainConfig>,
 }
@@ -94,7 +94,7 @@ impl UpstreamConnector {
         let host = uri.host().context("upstream URI has no hostname")?;
         let scheme = uri.scheme_str().unwrap_or("http");
         let port = uri.port_u16().unwrap_or(if scheme == "https" { 443 } else { 80 });
-        let config = self.config.load_full();
+        let config = Arc::clone(&self.config);
         let domains = config.fast_github.domain_configs.keys().cloned().collect::<Vec<_>>();
         let (stream, ip) = connect_target(
             host,
@@ -322,7 +322,8 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, doma
 
     // A raw CONNECT tunnel has no HTTP request to route, so connect to its
     // authority only after determining that the client is not starting TLS.
-    let (mut upstream, _upstream_ip) = connect_target(&host, port, &resolver, domains, &config, None)
+    let config_snapshot = config.load_full();
+    let (mut upstream, _upstream_ip) = connect_target(&host, port, &resolver, domains, &config_snapshot, None)
         .await.with_context(|| format!("connecting to raw CONNECT target {host}:{port}"))?;
     let mut client = crate::http_server::CountingIo::new(client, resolver.flow_analyzer());
     let (up, down) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
@@ -415,7 +416,7 @@ impl TlsProxy {
         let connector = UpstreamConnector {
             resolver: self.resolver.clone(),
             domains,
-            config: Arc::clone(&self.config),
+            config: Arc::clone(&config),
             tls_connector: Arc::new(self.connector.clone()),
             inherited_rule: config.domain_config(original_host).cloned(),
         };
