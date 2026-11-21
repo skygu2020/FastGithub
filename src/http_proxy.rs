@@ -15,6 +15,7 @@ use std::{
     future::Future,
     io,
     net::{IpAddr, SocketAddr},
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context as TaskContext, Poll},
@@ -150,7 +151,7 @@ pub(crate) fn negotiated_http2(selected_alpn: Option<&[u8]>) -> bool {
 const SYSTEM_DNS_TIMEOUT: Duration = Duration::from_secs(10);
 const BAD_REQUEST_RESPONSE: &[u8] = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
 
-pub async fn run(config: AppConfig, upstreams: Vec<SocketAddr>, certificates: Arc<CertificateService>) -> Result<()> {
+pub async fn run(config: AppConfig, config_path: PathBuf, upstreams: Vec<SocketAddr>, certificates: Arc<CertificateService>) -> Result<()> {
     let port = config.fast_github.http_proxy_port;
     let configured_domains = config.fast_github.domain_configs.keys().cloned().collect::<Vec<_>>();
     let resolver = DomainResolver::new(DnsClient::new(upstreams), Persistence::new("dnsendpoints.json")).await?;
@@ -182,13 +183,17 @@ pub async fn run(config: AppConfig, upstreams: Vec<SocketAddr>, certificates: Ar
             }
         }
     });
-    let config = Arc::new(config);
+    let config = Arc::new(ArcSwap::from_pointee(config));
     let tls_proxy = Arc::new(TlsProxy::new(
         certificates,
         resolver.clone(),
         Arc::clone(&config),
-        configured_domains.clone(),
     )?);
+    let watch_config = Arc::clone(&config);
+    let watch_tls_proxy = Arc::clone(&tls_proxy);
+    let config_task = tokio::spawn(async move {
+        watch_config_file(config_path, watch_config, watch_tls_proxy).await;
+    });
     let listener = TcpListener::bind(("127.0.0.1", port)).await
         .with_context(|| format!("binding HTTP proxy 127.0.0.1:{port}"))?;
     tracing::info!(address = %listener.local_addr()?, "HTTP CONNECT proxy listening");
@@ -214,10 +219,62 @@ pub async fn run(config: AppConfig, upstreams: Vec<SocketAddr>, certificates: Ar
         }
     }
     refresh_task.abort();
+    config_task.abort();
     Ok(())
 }
 
-async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, domains: &[String], config: Arc<AppConfig>, tls_proxy: Arc<TlsProxy>, peer: SocketAddr) -> Result<()> {
+fn config_fingerprint(path: &Path) -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
+    let mut paths = vec![path.to_path_buf()];
+    if let Some(parent) = path.parent() {
+        let overlay_dir = parent.join("appsettings");
+        if let Ok(entries) = std::fs::read_dir(overlay_dir) {
+            paths.extend(entries.filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|candidate| candidate.file_name().and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("appsettings.") && name.ends_with(".json"))));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths.into_iter().map(|candidate| {
+        let modified = std::fs::metadata(&candidate).and_then(|metadata| metadata.modified()).ok();
+        (candidate, modified)
+    }).collect()
+}
+
+async fn watch_config_file(
+    path: PathBuf,
+    config: Arc<ArcSwap<AppConfig>>,
+    tls_proxy: Arc<TlsProxy>,
+) {
+    let mut fingerprint = config_fingerprint(&path);
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let next = config_fingerprint(&path);
+        if next == fingerprint {
+            continue;
+        }
+        fingerprint = next;
+        let load_path = path.clone();
+        match tokio::task::spawn_blocking(move || AppConfig::load(&load_path)).await {
+            Ok(Ok(updated)) => {
+                let domains = updated.fast_github.domain_configs.len();
+                config.store(Arc::new(updated));
+                tls_proxy.clear_upstream_clients();
+                tracing::info!(domains, "configuration reloaded; upstream connection pools invalidated");
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "configuration reload failed; keeping previous configuration");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "configuration reload task failed; keeping previous configuration");
+            }
+        }
+    }
+}
+
+async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, domains: &[String], config: Arc<ArcSwap<AppConfig>>, tls_proxy: Arc<TlsProxy>, peer: SocketAddr) -> Result<()> {
     let header = match timeout(HEADER_TIMEOUT, read_header(&mut client)).await {
         Ok(Ok(header)) => header,
         Ok(Err(error)) => return Err(error),
