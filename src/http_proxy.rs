@@ -11,7 +11,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Only an explicit h2 ALPN selection enables HTTP/2. No ALPN extension,
 /// no overlap, and an explicit http/1.1 selection all use the HTTP/1 path.
-fn negotiated_http2(selected_alpn: Option<&[u8]>) -> bool {
+pub(crate) fn negotiated_http2(selected_alpn: Option<&[u8]>) -> bool {
     selected_alpn == Some(&b"h2"[..])
 }
 
