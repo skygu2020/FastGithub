@@ -638,8 +638,8 @@ mod tests {
         let client: UpstreamClient = builder.build(connector);
 
         for _ in 0..2 {
-            let body = Full::new(Bytes::new())
-                .map_err(|never| match never {})
+            let body: UpstreamBody = Full::new(Bytes::new())
+                .map_err(|never| -> UpstreamError { match never {} })
                 .boxed_unsync();
             let request = Request::builder()
                 .uri(format!("http://127.0.0.1:{}/", address.port()))
