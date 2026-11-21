@@ -236,6 +236,60 @@ async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppCo
     } else {
         request.uri().to_string()
     };
+    // Keep management endpoints scoped to the proxy's own loopback authority.
+    // A remote site's /ping or /refresh-ip path must continue through normal routing.
+    if scheme == "http" {
+        if let Ok(management_uri) = url::Url::parse(&target) {
+            let local_host = matches!(
+                management_uri.host_str(),
+                Some("127.0.0.1" | "localhost" | "::1")
+            );
+            let local_port = management_uri
+                .port()
+                .unwrap_or(if management_uri.scheme() == "https" { 443 } else { 80 });
+            if local_host
+                && local_port == config.fast_github.http_proxy_port
+                && matches!(management_uri.path(), "/ping" | "/refresh-ip")
+            {
+                if management_uri.path() == "/ping" && method == Method::GET {
+                    return management_response(StatusCode::OK, "text/plain; charset=utf-8", "pong".to_owned());
+                }
+                if management_uri.path() == "/refresh-ip"
+                    && (method == Method::GET || method == Method::POST)
+                {
+                    let hosts = resolver.refresh_hosts().await;
+                    match resolver.test_speed().await {
+                        Ok(()) => {
+                            let body = serde_json::json!({
+                                "success": hosts.success,
+                                "domainCount": hosts.domain_count,
+                                "errors": hosts.errors,
+                            }).to_string();
+                            return management_response(
+                                StatusCode::OK,
+                                "application/json; charset=utf-8",
+                                body,
+                            );
+                        }
+                        Err(error) => {
+                            let body = serde_json::json!({
+                                "success": false,
+                                "domainCount": hosts.domain_count,
+                                "error": error.to_string(),
+                            }).to_string();
+                            return management_response(
+                                StatusCode::BAD_GATEWAY,
+                                "application/json; charset=utf-8",
+                                body,
+                            );
+                        }
+                    }
+                }
+                return empty_response(StatusCode::METHOD_NOT_ALLOWED);
+            }
+        }
+    }
+
     let host_header = request.headers().get(header::HOST);
     if request.version() == http::Version::HTTP_2 {
         let authority = request.uri().authority();
@@ -712,6 +766,32 @@ fn configured_response(method: &Method, rule: crate::config::ResponseConfig) -> 
     }
     if !suppress_body { *response.body_mut() = Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed_unsync(); }
     response.headers_mut().insert(header::SERVER, HeaderValue::from_static("FastGithub"));
+    response
+}
+
+fn management_response(
+    status: StatusCode,
+    content_type: &'static str,
+    body: String,
+) -> Response<ResponseBody> {
+    let bytes = Bytes::from(body);
+    let mut response = Response::new(
+        Full::new(bytes.clone())
+            .map_err(|never| match never {})
+            .boxed_unsync(),
+    );
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type),
+    );
+    if let Ok(value) = HeaderValue::from_str(&bytes.len().to_string()) {
+        response.headers_mut().insert(header::CONTENT_LENGTH, value);
+    }
+    response.headers_mut().insert(
+        header::SERVER,
+        HeaderValue::from_static("FastGithub"),
+    );
     response
 }
 
