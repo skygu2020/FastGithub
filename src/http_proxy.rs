@@ -31,7 +31,7 @@ const HEADER_LIMIT: usize = 16 * 1024;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-type UpstreamError = Box<dyn Error + Send + Sync>;
+pub(crate) type UpstreamError = Box<dyn Error + Send + Sync>;
 pub(crate) type UpstreamBody = UnsyncBoxBody<Bytes, UpstreamError>;
 type UpstreamClient = Client<UpstreamConnector, UpstreamBody>;
 
