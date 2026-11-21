@@ -705,6 +705,93 @@ mod tests {
     use http_body_util::Full;
 
 
+    struct NeverRequestBody;
+
+    impl http_body::Body for NeverRequestBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            Poll::Pending
+        }
+
+        fn is_end_stream(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn pooled_http1_client_delivers_early_final_response_during_upload() {
+        use bytes::Bytes;
+        use http::{header, Method, Request, Response, StatusCode};
+        use http_body_util::{BodyExt, Full};
+        use hyper::{server::conn::http1, service::service_fn};
+        use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+        use std::{convert::Infallible, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = service_fn(|_request: Request<hyper::body::Incoming>| async move {
+                let mut response = Response::new(Full::new(Bytes::from_static(b"rejected")));
+                *response.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+                Ok::<_, Infallible>(response)
+            });
+            http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        });
+
+        let config: AppConfig = serde_json::from_str(
+            r#"{"FastGithub":{"HttpProxyPort":0,"FallbackDns":[],"DomainConfigs":{}}}"#,
+        ).unwrap();
+        let resolver = DomainResolver::new(
+            DnsClient::new(Vec::new()),
+            Persistence::new(std::env::temp_dir().join(format!(
+                "fastgithub-early-response-{}-{}.json",
+                std::process::id(),
+                address.port()
+            ))),
+        ).await.unwrap();
+        let connector = UpstreamConnector {
+            resolver,
+            config: Arc::new(config),
+            tls_connector: Arc::new(SslConnector::builder(SslMethod::tls()).unwrap().build()),
+            inherited_rule: None,
+        };
+        let mut builder = Client::builder(TokioExecutor::new());
+        builder
+            .pool_idle_timeout(Duration::from_secs(30))
+            .pool_timer(TokioTimer::new());
+        let client: UpstreamClient = builder.build(connector);
+
+        let body: UpstreamBody = NeverRequestBody
+            .map_err(|never| -> UpstreamError { match never {} })
+            .boxed_unsync();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("http://127.0.0.1:{}/upload", address.port()))
+            .header(header::CONTENT_LENGTH, "10")
+            .body(body)
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), client.request(request))
+            .await
+            .expect("early upstream response must not wait for the unfinished upload")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), Bytes::from_static(b"rejected"));
+
+        drop(client);
+        server.abort();
+        let _ = server.await;
+    }
+
     #[derive(Clone)]
     struct MockH2Connector {
         connections: Arc<std::sync::atomic::AtomicUsize>,
