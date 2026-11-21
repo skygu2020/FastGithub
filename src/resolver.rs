@@ -65,7 +65,9 @@ impl DomainResolver {
                 endpoint,
                 EndpointState {
                     addresses: record.addresses,
-                    refreshed_at: Instant::now() - ENDPOINT_REFRESH_TTL,
+                    // Reuse the last verified candidates immediately after restart;
+                    // the background refresh revalidates them without delaying requests.
+                    refreshed_at: Instant::now(),
                 },
             );
         }
