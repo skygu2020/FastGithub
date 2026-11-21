@@ -32,7 +32,7 @@ const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 type UpstreamError = Box<dyn Error + Send + Sync>;
-type UpstreamBody = UnsyncBoxBody<Bytes, UpstreamError>;
+pub(crate) type UpstreamBody = UnsyncBoxBody<Bytes, UpstreamError>;
 type UpstreamClient = Client<UpstreamConnector, UpstreamBody>;
 
 trait ProxyIo: AsyncRead + AsyncWrite + Unpin + Send {}
