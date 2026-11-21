@@ -1553,9 +1553,10 @@ mod header_tests {
         let (release_slow_tx, release_slow_rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
+            let release_slow_rx = std::sync::Mutex::new(Some(release_slow_rx));
             let service = service_fn(move |request: Request<Incoming>| {
                 let release_slow_rx = if request.uri().path() == "/slow" {
-                    Some(release_slow_rx)
+                    release_slow_rx.lock().unwrap().take()
                 } else {
                     None
                 };
