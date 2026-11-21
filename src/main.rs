@@ -168,7 +168,7 @@ async fn main() -> Result<()> {
                 }
             }
             upstreams.extend(config.fast_github.fallback_dns.iter().copied());
-            let result = http_proxy::run(config, upstreams, certificates).await;
+            let result = http_proxy::run(config, config_path.clone(), upstreams, certificates).await;
             if let Some(proxy) = proxy {
                 proxy.stop().await;
             }
