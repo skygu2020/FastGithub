@@ -155,7 +155,7 @@ impl DomainResolver {
             .addresses
             .order_addresses(&endpoint.host, port, dns_candidates, &previous)
             .await;
-        let ordered = self.exclude_failed(&merge_candidates(probed, &previous)).await;
+        let ordered = self.exclude_failed(&endpoint.host, endpoint.port, &merge_candidates(probed, &previous)).await;
         self.store_endpoint(endpoint, ordered.clone()).await;
         Ok(ordered)
     }
