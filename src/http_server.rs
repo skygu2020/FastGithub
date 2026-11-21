@@ -1895,9 +1895,7 @@ mod header_tests {
                     let _ = sender.send(());
                 }
                 async move {
-                    std::future::pending::<()>().await;
-                    #[allow(unreachable_code)]
-                    Ok::<_, Infallible>(Response::new(http_body_util::Full::new(Bytes::new())))
+                    std::future::pending::<Result<Response<http_body_util::Full<Bytes>>, Infallible>>().await
                 }
             });
             let _ = server_http2::Builder::new(TokioExecutor::new())
@@ -1994,13 +1992,17 @@ mod header_tests {
             .body(PendingUpload)
             .unwrap();
 
-        let send = tokio::spawn(async move {\n            tokio::time::timeout(\n                std::time::Duration::from_millis(100),\n                sender.send_request(request),\n            ).await\n        });
+        let send = tokio::spawn(async move {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                sender.send_request(request),
+            ).await
+        });
         tokio::time::timeout(std::time::Duration::from_secs(2), request_seen_rx)
             .await.expect("upstream must receive request headers").unwrap();
         // Model the request-scoped timeout firing while the upload body remains
-        // pending. Dropping the forwarding future and its guard must stop h2.
-        send.abort();
-        assert!(send.await.unwrap_err().is_cancelled());
+        // pending. The timeout drops send_request; the guard then stops h2.
+        assert!(send.await.unwrap().is_err(), "pending HTTP/2 upload must hit its timeout");
         drop(guard);
         match tokio::time::timeout(std::time::Duration::from_secs(2), driver).await.unwrap() {
             Err(error) if error.is_cancelled() => {}
