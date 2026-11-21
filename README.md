@@ -46,8 +46,11 @@ a 90-second per-IP circuit breaker, while successful addresses are promoted for 
 New candidates are merged ahead of retained old candidates so transient DNS or network failures do
 not empty the pool. DNS endpoint names remain in `dnsendpoints.json`; verified IP candidates are
 persisted in `dnsaddresses.json`. The running proxy refreshes hosts and endpoint candidates at
-startup and every 30 minutes. Loopback management paths `/ping` and `/refresh-ip` are available
-through the proxy authority; manual refresh invalidates DNS/probe caches before rebuilding candidates.
+startup and every 30 minutes. Loopback management paths `/ping`, `/refresh-ip`, `/flowStatistics`, and `/errorStatistics`
+are available through the proxy authority; manual refresh invalidates DNS/probe caches before rebuilding
+candidates. `/flowStatistics` reports cumulative client-facing read/write bytes and five-second rates;
+`/errorStatistics` aggregates HTTP 4xx/5xx responses by normalized host and status. TLS handshake
+bytes are not included in the flow counters.
 Public DNS servers on port 53 are temporarily circuit-broken after repeated query failures. Port 53
 uses TCP; custom DNS ports use UDP and retry over TCP when a response is truncated. UDP transaction
 IDs are validated before parsing.
