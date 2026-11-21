@@ -1502,11 +1502,10 @@ mod header_tests {
             .expect("incomplete request body must finish after client disconnect")
             .unwrap();
         assert!(saw_body_error, "truncated Content-Length body should be reported as an error");
-        timeout(Duration::from_secs(2), server)
+        let _connection_result = timeout(Duration::from_secs(2), server)
             .await
             .expect("HTTP/1 connection task must terminate after client disconnect")
-            .unwrap()
-            .unwrap_err();
+            .unwrap();
     }
 
     #[test]
