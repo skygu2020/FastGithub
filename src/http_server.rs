@@ -9,7 +9,7 @@ use http::{header, HeaderMap, HeaderName, HeaderValue, Method, Response, StatusC
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::{
     body::Incoming,
-    client::conn::{http1 as client_http1, http2 as client_http2},
+    client::conn::http1 as client_http1,
     server::conn::{http1, http2 as server_http2},
     service::service_fn,
     Request,
@@ -488,7 +488,7 @@ async fn handle_request_inner(request: Request<Incoming>, scheme: &str, config: 
                 if is_upgrade_request(&request) {
                     forward_upgrade_request(request, uri, request_target, original_host, domain, timeout_duration, request_started, resolver, domains, config, tls_proxy).await
                 } else {
-                    forward_request(request, uri, request_target, original_host, domain, timeout_duration, request_started, resolver, domains, config, tls_proxy).await
+                    forward_request(request, uri, request_target, original_host, timeout_duration, request_started, tls_proxy).await
                 }
             };
             match timeout_duration {
@@ -521,12 +521,8 @@ async fn forward_request(
     uri: url::Url,
     request_target: String,
     original_host: String,
-    domain: Option<crate::config::DomainConfig>,
     body_timeout: Option<Duration>,
     request_started: tokio::time::Instant,
-    resolver: &DomainResolver,
-    domains: &[String],
-    config: &AppConfig,
     tls_proxy: &crate::http_proxy::TlsProxy,
 ) -> anyhow::Result<Response<ResponseBody>> {
     if has_fastgithub_user_agent(request.headers()) {
@@ -575,51 +571,6 @@ async fn forward_request(
     let boxed_body = response_body.map_err(|error| Box::new(error) as BoxError).boxed_unsync();
     let remaining = body_timeout.map(|duration| duration.saturating_sub(request_started.elapsed()));
     let response_body = TimeoutBody::new_pooled(boxed_body, remaining).boxed_unsync();
-    Ok(Response::from_parts(response_parts, response_body))
-}
-
-async fn forward_request_http2(
-    request: Request<Incoming>,
-    uri: url::Url,
-    request_target: String,
-    original_host: String,
-    downstream_version: http::Version,
-    body_timeout: Option<Duration>,
-    request_started: tokio::time::Instant,
-    io: Box<dyn AsyncIo>,
-) -> anyhow::Result<Response<ResponseBody>> {
-    let (mut sender, connection) =
-        client_http2::handshake(TokioExecutor::new(), TokioIo::new(io)).await?;
-    let connection_task = tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            tracing::debug!(%error, "upstream HTTP/2 connection ended");
-        }
-    });
-    let connection_guard = UpstreamConnectionGuard(connection_task.abort_handle());
-
-    let (mut parts, body) = request.into_parts();
-    let host = uri.host_str().context("upstream HTTP/2 URI has no host")?;
-    parts.uri = build_upstream_request_uri(&uri, &request_target)
-        .context("building upstream HTTP/2 request URI")?;
-    parts.version = http::Version::HTTP_2;
-    strip_hop_by_hop_headers(&mut parts.headers);
-    parts.headers.remove(header::HOST);
-    parts.headers.remove(header::TRANSFER_ENCODING);
-    append_fastgithub_user_agent(&mut parts.headers)?;
-    tracing::debug!(%original_host, upstream = %uri, "forwarding HTTP/2 request");
-
-    // Hyper's informational callback is currently HTTP/1-only. Keep HTTP/2
-    // request bodies flowing rather than gating them on a 100 that we cannot
-    // observe through this API.
-    let upstream_request = Request::from_parts(parts, body);
-    let upstream_response = sender.send_request(upstream_request).await?;
-    let (mut response_parts, response_body) = upstream_response.into_parts();
-    response_parts.version = downstream_version;
-    strip_hop_by_hop_headers(&mut response_parts.headers);
-    response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
-    let boxed_body = response_body.map_err(|error| Box::new(error) as BoxError).boxed_unsync();
-    let remaining = body_timeout.map(|duration| duration.saturating_sub(request_started.elapsed()));
-    let response_body = TimeoutBody::new(boxed_body, remaining, connection_guard).boxed_unsync();
     Ok(Response::from_parts(response_parts, response_body))
 }
 
