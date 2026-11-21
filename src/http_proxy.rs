@@ -37,6 +37,11 @@ pub(crate) type UpstreamError = Box<dyn Error + Send + Sync>;
 pub(crate) type UpstreamBody = UnsyncBoxBody<Bytes, UpstreamError>;
 type UpstreamClient = Client<UpstreamConnector, UpstreamBody>;
 
+struct UpstreamClientEntry {
+    client: UpstreamClient,
+    expires_at: tokio::time::Instant,
+}
+
 trait ProxyIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> ProxyIo for T {}
 
@@ -412,7 +417,7 @@ pub(crate) struct TlsProxy {
     certificates: Arc<CertificateService>,
     resolver: DomainResolver,
     config: Arc<ArcSwap<AppConfig>>,
-    upstream_clients: Mutex<std::collections::HashMap<String, UpstreamClient>>,
+    upstream_clients: Mutex<std::collections::HashMap<String, UpstreamClientEntry>>,
 }
 
 impl TlsProxy {
@@ -453,13 +458,21 @@ impl TlsProxy {
 
     fn upstream_client(&self, original_host: &str) -> Result<UpstreamClient> {
         let key = original_host.trim_end_matches('.').to_ascii_lowercase();
+        let mut lifetime = Duration::from_secs(10);
+
         loop {
-            if let Some(client) = self.upstream_clients.lock()
-                .map_err(|_| anyhow::anyhow!("upstream client pool lock poisoned"))?
-                .get(&key)
-                .cloned()
             {
-                return Ok(client);
+                let mut clients = self.upstream_clients.lock()
+                    .map_err(|_| anyhow::anyhow!("upstream client pool lock poisoned"))?;
+                if let Some(entry) = clients.get(&key) {
+                    if entry.expires_at > tokio::time::Instant::now() {
+                        return Ok(entry.client.clone());
+                    }
+                    // The first handler is deliberately short-lived; replacements
+                    // follow the reference implementation's 100-second lifetime.
+                    clients.remove(&key);
+                    lifetime = Duration::from_secs(100);
+                }
             }
 
             let config = self.config.load_full();
@@ -478,17 +491,26 @@ impl TlsProxy {
 
             let mut clients = self.upstream_clients.lock()
                 .map_err(|_| anyhow::anyhow!("upstream client pool lock poisoned"))?;
-            // A reload takes the same lock while swapping the snapshot and
-            // clearing pools, so an old-snapshot client cannot be inserted later.
             if !Arc::ptr_eq(&config, &self.config.load_full()) {
                 continue;
             }
-            if !clients.contains_key(&key) && clients.len() >= 256 {
+            if let Some(entry) = clients.get(&key) {
+                if entry.expires_at > tokio::time::Instant::now() {
+                    return Ok(entry.client.clone());
+                }
+                clients.remove(&key);
+                lifetime = Duration::from_secs(100);
+            }
+            if clients.len() >= 256 && !clients.contains_key(&key) {
                 if let Some(evicted) = clients.keys().next().cloned() {
                     clients.remove(&evicted);
                 }
             }
-            return Ok(clients.entry(key).or_insert_with(|| client.clone()).clone());
+            clients.insert(key.clone(), UpstreamClientEntry {
+                client: client.clone(),
+                expires_at: tokio::time::Instant::now() + lifetime,
+            });
+            return Ok(client);
         }
     }
 
