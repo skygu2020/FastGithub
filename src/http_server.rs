@@ -1431,10 +1431,20 @@ mod header_tests {
     }
 
     #[tokio::test]
-    async fn dropping_response_guard_aborts_upstream_driver() {
+    async fn dropping_response_body_aborts_upstream_driver() {
+        use super::TimeoutBody;
+        use bytes::Bytes;
+        use http_body_util::{BodyExt, Full};
+
+        let inner = Full::new(Bytes::from_static(b"not consumed"))
+            .map_err(|never| match never {})
+            .boxed_unsync();
         let task = tokio::spawn(std::future::pending::<()>());
         let guard = super::UpstreamConnectionGuard(task.abort_handle());
-        drop(guard);
+        let body = TimeoutBody::new(inner, None, guard);
+
+        // Downstream cancellation drops the response body without polling it.
+        drop(body);
         assert!(task.await.unwrap_err().is_cancelled());
     }
 
