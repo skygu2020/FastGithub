@@ -586,6 +586,94 @@ pub(crate) async fn connect_target(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::{convert::Infallible, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
+    use hyper::service::service_fn;
+
+
+    #[derive(Clone)]
+    struct MockH2Connector {
+        connections: Arc<std::sync::atomic::AtomicUsize>,
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Service<Uri> for MockH2Connector {
+        type Response = TokioIo<ConnectedUpstreamIo>;
+        type Error = io::Error;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _uri: Uri) -> Self::Future {
+            let connections = Arc::clone(&self.connections);
+            let requests = Arc::clone(&self.requests);
+            Box::pin(async move {
+                let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+                connections.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let service = service_fn(move |_request: Request<hyper::body::Incoming>| {
+                        let requests = Arc::clone(&requests);
+                        async move {
+                            requests.fetch_add(1, Ordering::Relaxed);
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"h2"))))
+                        }
+                    });
+                    hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(server_io), service)
+                        .await
+                        .unwrap();
+                });
+                Ok(TokioIo::new(ConnectedUpstreamIo {
+                    inner: Box::new(client_io),
+                    http2: true,
+                }))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn pooled_client_multiplexes_http2_requests_on_one_connection() {
+        use bytes::Bytes;
+        use http::Version;
+        use http_body_util::{BodyExt, Full};
+        use hyper_util::rt::TokioExecutor;
+
+        let connections = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let connector = MockH2Connector {
+            connections: Arc::clone(&connections),
+            requests: Arc::clone(&requests),
+        };
+        let mut builder = Client::builder(TokioExecutor::new());
+        builder
+            .pool_idle_timeout(Duration::from_secs(30))
+            .pool_timer(TokioTimer::new())
+            .pool_max_idle_per_host(4);
+        let client: Client<_, UpstreamBody> = builder.build(connector);
+
+        let make_request = |path: &'static str| {
+            let body: UpstreamBody = Full::new(Bytes::new())
+                .map_err(|never| -> UpstreamError { match never {} })
+                .boxed_unsync();
+            Request::builder()
+                .version(Version::HTTP_11)
+                .uri(format!("https://pool.example{path}"))
+                .body(body)
+                .unwrap()
+        };
+        let (first, second) = tokio::join!(
+            client.request(make_request("/one")),
+            client.request(make_request("/two")),
+        );
+        let first = first.unwrap().into_body().collect().await.unwrap().to_bytes();
+        let second = second.unwrap().into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(first, Bytes::from_static(b"h2"));
+        assert_eq!(second, Bytes::from_static(b"h2"));
+        assert_eq!(connections.load(Ordering::Relaxed), 1);
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+    }
     #[tokio::test]
     async fn pooled_client_reuses_http1_connection_for_same_origin() {
         use bytes::Bytes;
@@ -653,8 +741,6 @@ mod tests {
         drop(client);
         server.await.unwrap();
     }
-
-    use super::*;
 
     #[test]
     fn classifies_fragmented_tls_record_prefixes() {
