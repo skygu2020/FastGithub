@@ -43,6 +43,12 @@ impl Default for AddressService {
 }
 
 impl AddressService {
+    /// Clear only probe and domain-association caches; request-stage circuit breakers remain.
+    pub async fn clear_cache(&self) {
+        self.domain_ips.lock().await.clear();
+        self.latency.lock().await.clear();
+    }
+
     /// Keep previously selected addresses only while their domain/IP association is fresh.
     pub async fn order_addresses(
         &self,
