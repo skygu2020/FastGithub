@@ -1742,7 +1742,7 @@ mod header_tests {
     }
 
     #[tokio::test]
-    async fn hyper_http1_upgrade_handoff_carries_bidirectional_bytes() {
+    async fn hyper_http1_upgrade_handoff_preserves_half_close_and_bidirectional_bytes() {
         use super::client_http1;
         use bytes::Bytes;
         use http::{Request, Response, StatusCode};
