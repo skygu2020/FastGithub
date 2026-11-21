@@ -692,16 +692,40 @@ async fn forward_upgrade_request(
     let downstream_upgrade = hyper::upgrade::on(&mut request);
     let host = uri.host_str().context("upstream URI has no host")?;
     let port = uri.port().unwrap_or(if uri.scheme() == "https" { 443 } else { 80 });
-    let (stream, upstream_ip) = crate::http_proxy::connect_target(host, port, resolver, domains, config, domain.as_ref()).await?;
     let io: Box<dyn AsyncIo> = if uri.scheme() == "https" {
-        match tls_proxy.connect_upstream(stream, host, upstream_ip, domain.as_ref(), false).await {
-            Ok(tls) => Box::new(tls),
-            Err(error) => {
-                resolver.report_failure(host, port, upstream_ip).await;
-                return Err(error);
+        let mut attempted = Vec::new();
+        let mut failures = Vec::new();
+        let mut connected: Option<Box<dyn AsyncIo>> = None;
+        for _ in 0..8 {
+            let (stream, upstream_ip) = match crate::http_proxy::connect_target_excluding(
+                host, port, resolver, domains, config, domain.as_ref(), &attempted,
+            ).await {
+                Ok(value) => value,
+                Err(error) => {
+                    failures.push(error.to_string());
+                    break;
+                }
+            };
+            attempted.push(upstream_ip);
+            match tls_proxy.connect_upstream(stream, host, upstream_ip, domain.as_ref(), false).await {
+                Ok(tls) => {
+                    connected = Some(Box::new(tls));
+                    break;
+                }
+                Err(error) => {
+                    resolver.report_failure(host, port, upstream_ip).await;
+                    failures.push(format!("{upstream_ip}: TLS handshake failed: {error}"));
+                }
             }
         }
+        connected.ok_or_else(|| anyhow::anyhow!(
+            "no upstream candidate completed TLS for {host}:{port}: {}",
+            failures.join("; ")
+        ))?
     } else if uri.scheme() == "http" {
+        let (stream, _) = crate::http_proxy::connect_target(
+            host, port, resolver, domains, config, domain.as_ref(),
+        ).await?;
         Box::new(stream)
     } else {
         anyhow::bail!("unsupported upstream URI scheme '{}'", uri.scheme());
