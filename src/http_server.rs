@@ -2392,3 +2392,32 @@ mod header_tests {
     }
 
 }
+
+
+#[cfg(test)]
+mod flow_io_tests {
+    use super::CountingIo;
+    use crate::flow::FlowAnalyzer;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn counts_bytes_read_from_and_written_to_client() {
+        let (server, mut client) = tokio::io::duplex(64);
+        let analyzer = FlowAnalyzer::default();
+        let mut counted = CountingIo::new(server, analyzer.clone());
+
+        client.write_all(b"request").await.unwrap();
+        let mut request = [0u8; 7];
+        counted.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"request");
+
+        counted.write_all(b"response").await.unwrap();
+        let mut response = [0u8; 8];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"response");
+
+        let stats = analyzer.statistics();
+        assert_eq!(stats.total_read, 7);
+        assert_eq!(stats.total_write, 8);
+    }
+}
