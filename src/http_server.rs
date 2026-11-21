@@ -529,7 +529,6 @@ async fn forward_request(
         anyhow::bail!("request already contains FastGithub/1.0 User-Agent marker; refusing proxy loop");
     }
     let downstream_version = request.version();
-    let host = uri.host_str().context("upstream URI has no host")?;
     let (mut parts, body) = request.into_parts();
     // Let the pooled client negotiate HTTP/1.1 or HTTP/2 independently of
     // the downstream protocol version.
