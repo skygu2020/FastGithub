@@ -257,9 +257,8 @@ async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppCo
                 if management_uri.path() == "/refresh-ip"
                     && (method == Method::GET || method == Method::POST)
                 {
-                    let hosts = resolver.refresh_hosts().await;
-                    match resolver.test_speed().await {
-                        Ok(()) => {
+                    match resolver.refresh_all().await {
+                        Ok(hosts) => {
                             let body = serde_json::json!({
                                 "success": hosts.success,
                                 "domainCount": hosts.domain_count,
@@ -274,7 +273,6 @@ async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppCo
                         Err(error) => {
                             let body = serde_json::json!({
                                 "success": false,
-                                "domainCount": hosts.domain_count,
                                 "error": error.to_string(),
                             }).to_string();
                             return management_response(
