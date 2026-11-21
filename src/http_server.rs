@@ -1416,12 +1416,12 @@ mod header_tests {
     #[tokio::test]
     async fn http1_server_honors_client_connection_close() {
         use bytes::Bytes;
-        use http::{Response, StatusCode};
+        use http::Response;
         use http_body_util::Full;
         use hyper::{service::service_fn, server::conn::http1 as server_http1};
         use hyper_util::rt::TokioIo;
         use std::convert::Infallible;
-        use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener, time::{timeout, Duration}};
+        use tokio::{io::AsyncWriteExt, net::TcpListener, time::{timeout, Duration}};
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
