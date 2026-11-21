@@ -52,7 +52,6 @@ impl DnsClient {
             match self.lookup(upstream, &host).await {
                 Ok(found) => for ip in found { if !ip.is_loopback() && !addresses.contains(&ip) { addresses.push(ip); } },
                 Err(error) => {
-                    self.report_query_failure(upstream).await;
                     tracing::warn!(%host, %upstream, %error, "DNS lookup failed");
                 }
             }
