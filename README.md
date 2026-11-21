@@ -60,6 +60,9 @@ still requires a restart.
 
 Logs are written to stdout and to non-blocking daily files under `./logs`; the file appender
 rotates by UTC date and retains up to 14 files.
+The proxy also holds an advisory `.fastgithub.lock` beside the selected configuration file to
+prevent duplicate instances. If its launching parent exits (except when the parent is PID 1), the
+proxy shuts down automatically.
 
 The core parity and remaining-work checklist is maintained in [docs/CORE_PARITY.md](docs/CORE_PARITY.md).
 The current source updates have not yet been built or tested with Cargo; see that checklist for the
