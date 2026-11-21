@@ -319,7 +319,6 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, conf
             return Err(error);
         }
     };
-    let domains = config.load_full().fast_github.domain_configs.keys().cloned().collect::<Vec<_>>();
     let flow = resolver.flow_analyzer();
     flow.record(crate::flow::FlowDirection::Read, header.len());
     const CONNECT_ESTABLISHED: &[u8] =
@@ -334,13 +333,14 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, conf
     if is_tls {
         // Intercepted TLS requests are routed by the decrypted HTTP Host and
         // configured Destination; the CONNECT authority is not an upstream.
-        tls_proxy.intercept(client, host.as_str(), Arc::clone(&config), resolver.clone(), domains, Arc::clone(&tls_proxy)).await?;
+        tls_proxy.intercept(client, host.as_str(), Arc::clone(&config), resolver.clone(), Vec::new(), Arc::clone(&tls_proxy)).await?;
         return Ok(());
     }
 
     // A raw CONNECT tunnel has no HTTP request to route, so connect to its
     // authority only after determining that the client is not starting TLS.
     let config_snapshot = config.load_full();
+    let domains = config_snapshot.fast_github.domain_configs.keys().cloned().collect::<Vec<_>>();
     let (mut upstream, _upstream_ip) = connect_target(&host, port, &resolver, &domains, &config_snapshot, None)
         .await.with_context(|| format!("connecting to raw CONNECT target {host}:{port}"))?;
     let mut client = crate::http_server::CountingIo::new(client, resolver.flow_analyzer());
