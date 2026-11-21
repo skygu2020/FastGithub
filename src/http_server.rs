@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use crate::{
     config::AppConfig,
     flow::{FlowAnalyzer, FlowDirection},
@@ -265,7 +266,7 @@ fn http2_expect_continue_unsupported(version: http::Version, headers: &HeaderMap
 
 /// Serve one HTTP/1 connection over a plain TCP or decrypted TLS stream.
 /// Already-consumed bytes can be restored by wrapping the stream in PrefixedIo.
-pub async fn serve<S>(io: S, scheme: &'static str, config: Arc<AppConfig>, resolver: DomainResolver, domains: Vec<String>, tls_proxy: Arc<crate::http_proxy::TlsProxy>) -> anyhow::Result<()>
+pub async fn serve<S>(io: S, scheme: &'static str, config: Arc<ArcSwap<AppConfig>>, resolver: DomainResolver, domains: Vec<String>, tls_proxy: Arc<crate::http_proxy::TlsProxy>) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -273,9 +274,8 @@ where
     let service = service_fn(move |request: Request<Incoming>| {
         let config = Arc::clone(&config);
         let resolver = resolver.clone();
-        let domains = domains.clone();
         let tls_proxy = Arc::clone(&tls_proxy);
-        async move { Ok::<_, Infallible>(handle_request(request, scheme, &config, &resolver, &domains, &tls_proxy).await) }
+        async move { Ok::<_, Infallible>(handle_request(request, scheme, &config, &resolver, &tls_proxy).await) }
     });
     http1::Builder::new().keep_alive(true)
         .serve_connection(TokioIo::new(io), service)
@@ -286,7 +286,7 @@ where
 
 /// Serve decrypted TLS traffic negotiated as HTTP/2. The same request router
 /// and response/body pipeline are shared with the HTTP/1 entry point.
-pub async fn serve_http2<S>(io: S, scheme: &'static str, config: Arc<AppConfig>, resolver: DomainResolver, domains: Vec<String>, tls_proxy: Arc<crate::http_proxy::TlsProxy>) -> anyhow::Result<()>
+pub async fn serve_http2<S>(io: S, scheme: &'static str, config: Arc<ArcSwap<AppConfig>>, resolver: DomainResolver, domains: Vec<String>, tls_proxy: Arc<crate::http_proxy::TlsProxy>) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -318,18 +318,19 @@ fn request_host<B>(request: &Request<B>) -> String {
 async fn handle_request(
     request: Request<Incoming>,
     scheme: &str,
-    config: &AppConfig,
+    config: &ArcSwap<AppConfig>,
     resolver: &DomainResolver,
-    domains: &[String],
     tls_proxy: &crate::http_proxy::TlsProxy,
 ) -> Response<ResponseBody> {
+    let config = config.load_full();
+    let domains = config.fast_github.domain_configs.keys().cloned().collect::<Vec<_>>();
     let method = request.method().clone();
     let authority = request.uri().authority().map(|value| value.as_str()).unwrap_or("");
     let host = request_host(&request);
     let path = request.uri().path();
     let target = format!("{authority}{path}");
     let started = tokio::time::Instant::now();
-    let response = handle_request_inner(request, scheme, config, resolver, domains, tls_proxy).await;
+    let response = handle_request_inner(request, scheme, &config, &domains, tls_proxy).await;
     let status = response.status();
     if status.is_client_error() || status.is_server_error() {
         resolver.flow_analyzer().record_error(&host, status.as_u16());
