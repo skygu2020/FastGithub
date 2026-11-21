@@ -82,7 +82,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingIo<S> {
     }
 }
 
-/// Enforce the configured timeout while the upstream response body is streamed.
+/// Enforce the complete request timeout while the upstream response body is streamed.
 /// The forwarding future has its own timeout for DNS, connect, TLS and response headers.
 struct TimeoutBody<B> {
     inner: Option<Pin<Box<B>>>,
@@ -147,7 +147,7 @@ where
             drop(this.connection.take());
             return Poll::Ready(Some(Err(Box::new(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "configured HTTP request timeout elapsed while streaming the response body",
+                "HTTP request timeout elapsed while streaming the response body",
             )))));
         }
         let frame = match this.inner.as_mut() {
