@@ -25,30 +25,28 @@ pub async fn run(config: AppConfig, upstreams: Vec<SocketAddr>, certificates: Ar
     let refresh_resolver = resolver.clone();
     let refresh_task = tokio::spawn(async move {
         // Refresh hosts once at startup, then periodically refresh all known endpoints.
-        let hosts = refresh_resolver.refresh_hosts().await;
-        tracing::info!(
-            success = hosts.success,
-            domains = hosts.domain_count,
-            errors = %hosts.errors.join("; "),
-            "initial online hosts refresh completed"
-        );
-        if let Err(error) = refresh_resolver.test_speed().await {
-            tracing::warn!(%error, "initial DNS/IP speed refresh failed");
+        match refresh_resolver.refresh_all().await {
+            Ok(hosts) => tracing::info!(
+                success = hosts.success,
+                domains = hosts.domain_count,
+                errors = %hosts.errors.join("; "),
+                "initial hosts and DNS/IP refresh completed"
+            ),
+            Err(error) => tracing::warn!(%error, "initial hosts and DNS/IP refresh failed"),
         }
 
         let mut interval = tokio::time::interval(Duration::from_secs(30 * 60));
         interval.tick().await;
         loop {
             interval.tick().await;
-            let hosts = refresh_resolver.refresh_hosts().await;
-            tracing::info!(
-                success = hosts.success,
-                domains = hosts.domain_count,
-                errors = %hosts.errors.join("; "),
-                "periodic online hosts refresh completed"
-            );
-            if let Err(error) = refresh_resolver.test_speed().await {
-                tracing::warn!(%error, "periodic DNS/IP speed refresh failed");
+            match refresh_resolver.refresh_all().await {
+                Ok(hosts) => tracing::info!(
+                    success = hosts.success,
+                    domains = hosts.domain_count,
+                    errors = %hosts.errors.join("; "),
+                    "periodic hosts and DNS/IP refresh completed"
+                ),
+                Err(error) => tracing::warn!(%error, "periodic hosts and DNS/IP refresh failed"),
             }
         }
     });
