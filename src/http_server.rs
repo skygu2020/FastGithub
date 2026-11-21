@@ -266,7 +266,7 @@ fn http2_expect_continue_unsupported(version: http::Version, headers: &HeaderMap
 
 /// Serve one HTTP/1 connection over a plain TCP or decrypted TLS stream.
 /// Already-consumed bytes can be restored by wrapping the stream in PrefixedIo.
-pub async fn serve<S>(io: S, scheme: &'static str, config: Arc<ArcSwap<AppConfig>>, resolver: DomainResolver, domains: Vec<String>, tls_proxy: Arc<crate::http_proxy::TlsProxy>) -> anyhow::Result<()>
+pub async fn serve<S>(io: S, scheme: &'static str, config: Arc<ArcSwap<AppConfig>>, resolver: DomainResolver, _domains: Vec<String>, tls_proxy: Arc<crate::http_proxy::TlsProxy>) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -294,9 +294,8 @@ where
     let service = service_fn(move |request: Request<Incoming>| {
         let config = Arc::clone(&config);
         let resolver = resolver.clone();
-        let domains = domains.clone();
         let tls_proxy = Arc::clone(&tls_proxy);
-        async move { Ok::<_, Infallible>(handle_request(request, scheme, &config, &resolver, &domains, &tls_proxy).await) }
+        async move { Ok::<_, Infallible>(handle_request(request, scheme, &config, &resolver, &tls_proxy).await) }
     });
     server_http2::Builder::new(TokioExecutor::new())
         .serve_connection(TokioIo::new(io), service)
