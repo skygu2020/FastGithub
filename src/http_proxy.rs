@@ -730,7 +730,7 @@ mod tests {
         use http_body_util::{BodyExt, Full};
         use hyper::{server::conn::http1, service::service_fn};
         use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-        use std::{convert::Infallible, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
+        use std::{convert::Infallible, sync::Arc};
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
