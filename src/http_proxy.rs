@@ -801,16 +801,19 @@ mod tests {
         let accepted = Arc::new(AtomicUsize::new(0));
         let accepted_server = Arc::clone(&accepted);
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            accepted_server.fetch_add(1, Ordering::Relaxed);
-            let service = service_fn(|_request: Request<hyper::body::Incoming>| async move {
-                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
-            });
-            http1::Builder::new()
-                .keep_alive(true)
-                .serve_connection(TokioIo::new(stream), service)
-                .await
-                .unwrap();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                accepted_server.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let service = service_fn(|_request: Request<hyper::body::Incoming>| async move {
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                    });
+                    let _ = http1::Builder::new()
+                        .keep_alive(true)
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
         });
 
         let config: AppConfig = serde_json::from_str(
@@ -850,7 +853,8 @@ mod tests {
 
         assert_eq!(accepted.load(Ordering::Relaxed), 1);
         drop(client);
-        server.await.unwrap();
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
