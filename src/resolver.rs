@@ -1,7 +1,7 @@
 use crate::{
     address_service::AddressService,
     dns::DnsClient,
-    persistence::{EndpointRecord, Persistence},
+    persistence::{AddressRecord, EndpointRecord, Persistence},
 };
 use anyhow::Result;
 use std::{
@@ -37,18 +37,34 @@ pub struct DomainResolver {
 impl DomainResolver {
     pub async fn new(dns: DnsClient, persistence: Persistence) -> Result<Self> {
         let known = persistence.read_endpoints().await?;
-        let endpoints = known
+        let saved_addresses = persistence.read_addresses().await?;
+        let mut endpoints: HashMap<EndpointRecord, EndpointState> = known
             .into_iter()
             .map(|item| {
                 (
                     item,
                     EndpointState {
                         addresses: Vec::new(),
-                        refreshed_at: Instant::now(),
+                        refreshed_at: Instant::now() - ENDPOINT_REFRESH_TTL,
                     },
                 )
             })
             .collect();
+        for record in saved_addresses {
+            let endpoint = EndpointRecord {
+                host: record.host.trim_end_matches('.').to_ascii_lowercase(),
+                port: record.port,
+            };
+            endpoints.insert(
+                endpoint,
+                EndpointState {
+                    addresses: record.addresses,
+                    // Revalidate on the first normal refresh, while retaining
+                    // the persisted addresses as fallback candidates.
+                    refreshed_at: Instant::now() - ENDPOINT_REFRESH_TTL,
+                },
+            );
+        }
         Ok(Self {
             dns,
             persistence,
@@ -117,6 +133,7 @@ impl DomainResolver {
                 refreshed_at: Instant::now(),
             },
         );
+        self.save_addresses().await;
         Ok(ordered)
     }
 
@@ -164,6 +181,7 @@ impl DomainResolver {
                 },
             );
         }
+        self.save_addresses().await;
         Ok(())
     }
 
@@ -189,6 +207,23 @@ impl DomainResolver {
                 state.addresses.remove(index);
                 state.addresses.insert(0, address);
             }
+        }
+    }
+
+    async fn save_addresses(&self) {
+        let snapshot: Vec<_> = self
+            .endpoints
+            .read()
+            .await
+            .iter()
+            .map(|(endpoint, state)| AddressRecord {
+                host: endpoint.host.clone(),
+                port: endpoint.port,
+                addresses: state.addresses.clone(),
+            })
+            .collect();
+        if let Err(error) = self.persistence.write_addresses(&snapshot).await {
+            tracing::warn!(%error, "could not persist verified DNS candidate addresses");
         }
     }
 
