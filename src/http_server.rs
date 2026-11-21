@@ -1610,16 +1610,28 @@ mod header_tests {
             Bytes::from_static(b"fast"),
         );
 
-        release_slow_tx.send(()).unwrap();
-        let slow_response = slow.await.unwrap();
-        assert_eq!(slow_response.status(), StatusCode::OK);
+        // Cancel the pending stream after its sibling has completed. The
+        // HTTP/2 connection must remain usable for a subsequent request.
+        slow.abort();
+        assert!(slow.await.unwrap_err().is_cancelled());
+
+        let mut followup_sender = sender.clone();
+        let followup_request = Request::builder()
+            .method(http::Method::GET)
+            .version(Version::HTTP_2)
+            .uri("https://localhost/fast")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let followup_response = followup_sender.send_request(followup_request).await.unwrap();
         assert_eq!(
-            slow_response.into_body().collect().await.unwrap().to_bytes(),
-            Bytes::from_static(b"slow"),
+            followup_response.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"fast"),
         );
 
+        drop(release_slow_tx);
         drop(sender);
         drop(fast_sender);
+        drop(followup_sender);
         driver.await.unwrap();
         server.await.unwrap();
     }
