@@ -153,7 +153,6 @@ const BAD_REQUEST_RESPONSE: &[u8] = b"HTTP/1.1 400 Bad Request\r\nConnection: cl
 
 pub async fn run(config: AppConfig, config_path: PathBuf, upstreams: Vec<SocketAddr>, certificates: Arc<CertificateService>) -> Result<()> {
     let port = config.fast_github.http_proxy_port;
-    let configured_domains = config.fast_github.domain_configs.keys().cloned().collect::<Vec<_>>();
     let resolver = DomainResolver::new(DnsClient::new(upstreams), Persistence::new("dnsendpoints.json")).await?;
     let refresh_resolver = resolver.clone();
     let refresh_task = tokio::spawn(async move {
@@ -202,7 +201,7 @@ pub async fn run(config: AppConfig, config_path: PathBuf, upstreams: Vec<SocketA
             accepted = listener.accept() => {
                 let (stream, peer) = accepted.context("accepting proxy connection")?;
                 let resolver = resolver.clone();
-                let domains = configured_domains.clone();
+                let domains = config.load_full().fast_github.domain_configs.keys().cloned().collect::<Vec<_>>();
                 let tls_proxy = Arc::clone(&tls_proxy);
                 let config = Arc::clone(&config);
                 tokio::spawn(async move {
@@ -403,43 +402,53 @@ impl TlsProxy {
 
     fn upstream_client(&self, original_host: &str) -> Result<UpstreamClient> {
         let key = original_host.trim_end_matches('.').to_ascii_lowercase();
-        if let Some(client) = self.upstream_clients.lock()
-            .map_err(|_| anyhow::anyhow!("upstream client pool lock poisoned"))?
-            .get(&key)
-            .cloned()
-        {
-            return Ok(client);
-        }
-
-        let config = self.config.load_full();
-        let domains = Arc::new(config.fast_github.domain_configs.keys().cloned().collect());
-        let connector = UpstreamConnector {
-            resolver: self.resolver.clone(),
-            domains,
-            config: Arc::clone(&config),
-            tls_connector: Arc::new(self.connector.clone()),
-            inherited_rule: config.domain_config(original_host).cloned(),
-        };
-        let mut builder = Client::builder(TokioExecutor::new());
-        builder
-            .pool_idle_timeout(Duration::from_secs(90))
-            .pool_timer(TokioTimer::new())
-            .pool_max_idle_per_host(8);
-        let client = builder.build(connector);
-        let mut clients = self.upstream_clients.lock()
-            .map_err(|_| anyhow::anyhow!("upstream client pool lock poisoned"))?;
-        if !clients.contains_key(&key) && clients.len() >= 256 {
-            if let Some(evicted) = clients.keys().next().cloned() {
-                clients.remove(&evicted);
+        loop {
+            if let Some(client) = self.upstream_clients.lock()
+                .map_err(|_| anyhow::anyhow!("upstream client pool lock poisoned"))?
+                .get(&key)
+                .cloned()
+            {
+                return Ok(client);
             }
+
+            let config = self.config.load_full();
+            let domains = Arc::new(config.fast_github.domain_configs.keys().cloned().collect());
+            let connector = UpstreamConnector {
+                resolver: self.resolver.clone(),
+                domains,
+                config: Arc::clone(&config),
+                tls_connector: Arc::new(self.connector.clone()),
+                inherited_rule: config.domain_config(original_host).cloned(),
+            };
+            let mut builder = Client::builder(TokioExecutor::new());
+            builder
+                .pool_idle_timeout(Duration::from_secs(90))
+                .pool_timer(TokioTimer::new())
+                .pool_max_idle_per_host(8);
+            let client = builder.build(connector);
+
+            let mut clients = self.upstream_clients.lock()
+                .map_err(|_| anyhow::anyhow!("upstream client pool lock poisoned"))?;
+            // A reload takes the same lock while swapping the snapshot and
+            // clearing pools, so an old-snapshot client cannot be inserted later.
+            if !Arc::ptr_eq(&config, &self.config.load_full()) {
+                continue;
+            }
+            if !clients.contains_key(&key) && clients.len() >= 256 {
+                if let Some(evicted) = clients.keys().next().cloned() {
+                    clients.remove(&evicted);
+                }
+            }
+            return Ok(clients.entry(key).or_insert_with(|| client.clone()).clone());
         }
-        Ok(clients.entry(key).or_insert_with(|| client.clone()).clone())
     }
 
-    pub(crate) fn clear_upstream_clients(&self) {
-        if let Ok(mut clients) = self.upstream_clients.lock() {
-            clients.clear();
-        }
+    pub(crate) fn reload_config(&self, updated: AppConfig) -> Result<()> {
+        let mut clients = self.upstream_clients.lock()
+            .map_err(|_| anyhow::anyhow!("upstream client pool lock poisoned"))?;
+        self.config.store(Arc::new(updated));
+        clients.clear();
+        Ok(())
     }
 
     pub(crate) async fn send_pooled_request(
