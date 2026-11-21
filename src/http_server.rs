@@ -515,7 +515,12 @@ async fn forward_request(
     response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
     let boxed_body = response_body.map_err(|error| Box::new(error) as BoxError).boxed_unsync();
     let remaining = body_timeout.map(|duration| duration.saturating_sub(request_started.elapsed()));
-    let response_body = TimeoutBody::with_flow(boxed_body, remaining, connection_guard, Some(flow)).boxed_unsync();
+    let response_body = TimeoutBody::with_flow(
+        boxed_body,
+        remaining,
+        connection_guard,
+        Some(resolver.flow_analyzer()),
+    ).boxed_unsync();
     Ok(Response::from_parts(response_parts, response_body))
 }
 
@@ -566,7 +571,7 @@ async fn forward_request_http2(
         boxed_body,
         remaining,
         connection_guard,
-        Some(resolver.flow_analyzer()),
+        Some(flow),
     ).boxed_unsync();
     Ok(Response::from_parts(response_parts, response_body))
 }
