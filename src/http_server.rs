@@ -1761,9 +1761,15 @@ mod header_tests {
                 tokio::spawn(async move {
                     let upgraded = on_upgrade.await.unwrap();
                     let mut io = TokioIo::new(upgraded);
-                    let mut payload = [0u8; 4];
-                    io.read_exact(&mut payload).await.unwrap();
-                    io.write_all(&payload).await.unwrap();
+                    let (mut backend, mut backend_peer) = tokio::io::duplex(64);
+                    let backend_task = tokio::spawn(async move {
+                        let mut payload = Vec::new();
+                        backend.read_to_end(&mut payload).await.unwrap();
+                        assert_eq!(payload, b"ping");
+                        backend.write_all(b"final").await.unwrap();
+                    });
+                    tokio::io::copy_bidirectional(&mut io, &mut backend_peer).await.unwrap();
+                    backend_task.await.unwrap();
                 });
                 let mut response = Response::new(Full::new(Bytes::new()));
                 *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
@@ -1795,9 +1801,12 @@ mod header_tests {
         let upgraded = hyper::upgrade::on(response).await.unwrap();
         let mut io = TokioIo::new(upgraded);
         io.write_all(b"ping").await.unwrap();
-        let mut echoed = [0u8; 4];
-        io.read_exact(&mut echoed).await.unwrap();
-        assert_eq!(&echoed, b"ping");
+        // Half-close the client-to-server direction. The peer must still be
+        // able to finish its response and send it back before the tunnel ends.
+        io.shutdown().await.unwrap();
+        let mut final_response = Vec::new();
+        io.read_to_end(&mut final_response).await.unwrap();
+        assert_eq!(final_response, b"final");
 
         drop(io);
         drop(sender);
