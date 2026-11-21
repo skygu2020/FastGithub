@@ -368,6 +368,11 @@ impl TlsProxy {
         let client = builder.build(connector);
         let mut clients = self.upstream_clients.lock()
             .map_err(|_| anyhow::anyhow!("upstream client pool lock poisoned"))?;
+        if !clients.contains_key(&key) && clients.len() >= 256 {
+            if let Some(evicted) = clients.keys().next().cloned() {
+                clients.remove(&evicted);
+            }
+        }
         Ok(clients.entry(key).or_insert_with(|| client.clone()).clone())
     }
 
