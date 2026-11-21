@@ -280,6 +280,17 @@ where
     Ok(())
 }
 
+fn request_host<B>(request: &Request<B>) -> String {
+    if let Some(host) = request.uri().host() {
+        return host.to_ascii_lowercase();
+    }
+    request.headers().get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<http::uri::Authority>().ok())
+        .map(|authority| authority.host().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
 async fn handle_request(
     request: Request<Incoming>,
     scheme: &str,
@@ -290,12 +301,7 @@ async fn handle_request(
 ) -> Response<ResponseBody> {
     let method = request.method().clone();
     let authority = request.uri().authority().map(|value| value.as_str()).unwrap_or("");
-    let host = request.uri().host()
-        .or_else(|| request.headers().get(header::HOST).and_then(|value| value.to_str().ok()))
-        .unwrap_or("")
-        .split(':').next().unwrap_or("")
-        .trim_matches(['[', ']'])
-        .to_owned();
+    let host = request_host(&request);
     let path = request.uri().path();
     let target = format!("{authority}{path}");
     let started = tokio::time::Instant::now();
