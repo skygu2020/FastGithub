@@ -148,6 +148,29 @@ impl FlowAnalyzer {
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn aggregates_errors_by_normalized_host_and_status() {
+        let analyzer = FlowAnalyzer::default();
+        analyzer.record_error("API.GITHUB.COM.", 502);
+        analyzer.record_error("api.github.com", 502);
+        analyzer.record_error("api.github.com", 404);
+        analyzer.record_error("api.github.com", 200);
+
+        let stats = analyzer.error_statistics();
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[0], ErrorStatistic {
+            host: "api.github.com".to_owned(),
+            status: 404,
+            count: 1,
+        });
+        assert_eq!(stats[1], ErrorStatistic {
+            host: "api.github.com".to_owned(),
+            status: 502,
+            count: 2,
+        });
+    }
+
     #[test]
     fn counts_bytes_and_reports_five_second_rates() {
         let analyzer = FlowAnalyzer::default();
