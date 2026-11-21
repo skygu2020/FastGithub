@@ -32,6 +32,12 @@ impl DnsClient {
         }
     }
 
+    /// Clear DNS response and upstream availability caches for an explicit refresh.
+    pub async fn clear_cache(&self) {
+        self.cache.lock().await.clear();
+        self.state_cache.lock().await.clear();
+    }
+
     /// Query configured DNS upstreams, merging unique A and AAAA answers.
     pub async fn resolve(&self, host: &str, port: u16, fast_sort: bool) -> Result<Vec<IpAddr>> {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
