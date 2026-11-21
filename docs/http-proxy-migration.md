@@ -43,7 +43,7 @@
 - TCP connect 和上游 TLS handshake 使用固定连接超时。
 - DomainConfig.Timeout 按单个 HTTP 请求处理：DNS、连接、TLS 握手、等待上游响应头受同一个请求超时预算约束；响应体流式传输使用剩余预算，而不是从响应头到达后重新计时。
 - 响应体超时会以 body error 终止流；此时如果响应头或部分响应体已经发送给客户端，无法再改写成新的 HTTP 状态码。
-- 上游 Hyper connection driver 由响应体持有取消守卫：请求发送阶段失败/超时、响应体正常结束、发生超时/上游 body error 或下游丢弃响应体时都会 abort driver，避免遗留后台连接任务；正常读取响应体时 driver 保持运行。
+- 上游 Hyper connection driver 由响应体持有取消守卫：请求发送阶段失败/超时、响应体正常结束、发生超时/上游 body error 或下游丢弃响应体时都会 abort driver，避免遗留后台连接任务；正常读取响应体时 driver 保持运行。 新增响应体直接丢弃时释放 driver 的包装层测试；HTTP/2 提前响应 loopback 也改为让 `TimeoutBody` 持有 driver guard，读取完 413 响应后由 guard 结束仍有 pending 上传体的连接 driver，而不再在测试中手动 abort。
 
 ## 与原版仍有差异 / 待完成
 
