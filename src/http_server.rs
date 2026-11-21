@@ -939,6 +939,71 @@ mod header_tests {
     }
 
     #[tokio::test]
+    async fn upstream_disconnect_during_upload_releases_connection_driver() {
+        use bytes::Bytes;
+        use http::{header, HeaderValue, Request};
+        use http_body::Frame;
+        use hyper::client::conn::http1 as client_http1;
+        use hyper_util::rt::TokioIo;
+        use std::{convert::Infallible, pin::Pin, task::{Context, Poll}};
+        use tokio::{io::AsyncReadExt, net::TcpListener};
+
+        struct PendingUpload;
+        impl http_body::Body for PendingUpload {
+            type Data = Bytes;
+            type Error = Infallible;
+
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                Poll::Pending
+            }
+
+            fn is_end_stream(&self) -> bool { false }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                head.push(byte[0]);
+            }
+            assert!(String::from_utf8_lossy(&head).starts_with("POST /upload HTTP/1.1"));
+            // Close while the request body is still pending.
+        });
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) = client_http1::handshake(TokioIo::new(stream)).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await });
+        let guard = super::UpstreamConnectionGuard(driver.abort_handle());
+
+        let mut request = Request::new(PendingUpload);
+        *request.method_mut() = http::Method::POST;
+        *request.uri_mut() = "/upload".parse().unwrap();
+        request.headers_mut().insert(header::HOST, HeaderValue::from_static("localhost"));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            sender.send_request(request),
+        ).await;
+        assert!(result.is_ok(), "upstream disconnect should wake the pending send_request");
+        assert!(result.unwrap().is_err(), "upstream disconnect must fail the upload");
+        drop(guard);
+        drop(sender);
+        match tokio::time::timeout(std::time::Duration::from_secs(2), driver).await.unwrap() {
+            Err(error) if error.is_cancelled() => {}
+            Ok(Err(_)) => {}
+            other => panic!("unexpected upstream driver completion: {other:?}"),
+        }
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn request_timeout_during_upload_aborts_upstream_driver() {
         use bytes::Bytes;
         use http::{header, HeaderValue, Request};
