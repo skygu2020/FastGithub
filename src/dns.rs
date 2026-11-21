@@ -19,11 +19,17 @@ pub struct DnsClient {
     upstreams: Arc<Vec<SocketAddr>>,
     cache: Arc<Mutex<HashMap<(SocketAddr, String), CacheEntry>>>,
     state_cache: Arc<Mutex<HashMap<SocketAddr, StateEntry>>>,
+    failure_counts: Arc<Mutex<HashMap<SocketAddr, u8>>>,
 }
 
 impl DnsClient {
     pub fn new(upstreams: Vec<SocketAddr>) -> Self {
-        Self { upstreams: Arc::new(upstreams), cache: Arc::new(Mutex::new(HashMap::new())), state_cache: Arc::new(Mutex::new(HashMap::new())) }
+        Self {
+            upstreams: Arc::new(upstreams),
+            cache: Arc::new(Mutex::new(HashMap::new())),
+            state_cache: Arc::new(Mutex::new(HashMap::new())),
+            failure_counts: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// Query configured DNS upstreams, merging unique A and AAAA answers.
@@ -39,11 +45,45 @@ impl DnsClient {
             if upstream.port() == 53 && !self.tcp_available(upstream).await { continue; }
             match self.lookup(upstream, &host).await {
                 Ok(found) => for ip in found { if !ip.is_loopback() && !addresses.contains(&ip) { addresses.push(ip); } },
-                Err(error) => tracing::warn!(%host, %upstream, %error, "DNS lookup failed"),
+                Err(error) => {
+                    self.report_query_failure(upstream).await;
+                    tracing::warn!(%host, %upstream, %error, "DNS lookup failed");
+                }
             }
         }
         if fast_sort && addresses.len() > 1 { self.prefer_fastest(&mut addresses, port).await; }
         Ok(addresses)
+    }
+
+    async fn report_query_failure(&self, upstream: SocketAddr) {
+        // Match the reference behavior: only public DNS on port 53 is
+        // circuit-broken. The local DNSCrypt proxy uses a private endpoint.
+        if upstream.port() != 53 {
+            return;
+        }
+        let mut counts = self.failure_counts.lock().await;
+        let count = counts.entry(upstream).or_insert(0);
+        *count = count.saturating_add(1);
+        if *count >= 3 {
+            self.state_cache.lock().await.insert(
+                upstream,
+                StateEntry {
+                    available: false,
+                    expires_at: Instant::now() + Duration::from_secs(300),
+                },
+            );
+            tracing::warn!(%upstream, failures = *count, "DNS server circuit opened for five minutes");
+        }
+    }
+
+    async fn report_query_success(&self, upstream: SocketAddr) {
+        if upstream.port() != 53 {
+            return;
+        }
+        let mut counts = self.failure_counts.lock().await;
+        if let Some(count) = counts.get_mut(&upstream) {
+            *count = count.saturating_sub(1);
+        }
     }
 
     async fn tcp_available(&self, upstream: SocketAddr) -> bool {
@@ -75,9 +115,20 @@ impl DnsClient {
         let mut ttl = MAX_TTL;
         for record_type in [1u16, 28u16] {
             match self.query(upstream, host, record_type).await {
-                Ok((found, record_ttl)) => { addresses.extend(found); ttl = ttl.min(record_ttl); }
-                Err(error) if record_type == 28 => tracing::debug!(%host, %error, "AAAA query failed"),
-                Err(error) => return Err(error),
+                Ok((found, record_ttl)) => {
+                    addresses.extend(found);
+                    ttl = ttl.min(record_ttl);
+                    if record_type == 1 {
+                        self.report_query_success(upstream).await;
+                    }
+                }
+                Err(error) if record_type == 28 => {
+                    tracing::debug!(%host, %error, "AAAA query failed");
+                }
+                Err(error) => {
+                    self.report_query_failure(upstream).await;
+                    return Err(error);
+                }
             }
         }
         addresses.dedup();
