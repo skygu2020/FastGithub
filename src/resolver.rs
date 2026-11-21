@@ -1,6 +1,7 @@
 use crate::{
     address_service::AddressService,
     dns::DnsClient,
+    flow::FlowAnalyzer,
     hosts::{HostsRefreshResult, HostsService},
     persistence::{AddressRecord, EndpointRecord, Persistence},
 };
@@ -33,6 +34,7 @@ pub struct DomainResolver {
     persistence: Persistence,
     addresses: AddressService,
     hosts: HostsService,
+    flow: FlowAnalyzer,
     endpoints: Arc<RwLock<HashMap<EndpointRecord, EndpointState>>>,
     failed_ips: Arc<RwLock<HashMap<IpAddr, Instant>>>,
 }
@@ -73,6 +75,7 @@ impl DomainResolver {
             persistence,
             addresses: AddressService::default(),
             hosts: HostsService::new()?,
+            flow: FlowAnalyzer::default(),
             endpoints: Arc::new(RwLock::new(endpoints)),
             failed_ips: Arc::new(RwLock::new(HashMap::new())),
         })
@@ -323,6 +326,10 @@ impl DomainResolver {
             .copied()
             .filter(|address| !failed.contains_key(address))
             .collect()
+    }
+
+    pub fn flow_analyzer(&self) -> FlowAnalyzer {
+        self.flow.clone()
     }
 
     pub async fn endpoints(&self) -> Vec<SocketAddr> {
