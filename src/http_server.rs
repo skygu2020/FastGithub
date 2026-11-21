@@ -946,7 +946,7 @@ mod header_tests {
         use hyper::client::conn::http1 as client_http1;
         use hyper_util::rt::TokioIo;
         use std::{convert::Infallible, pin::Pin, task::{Context, Poll}};
-        use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener};
+        use tokio::{io::AsyncReadExt, net::TcpListener};
 
         struct PendingUpload;
         impl http_body::Body for PendingUpload {
@@ -969,7 +969,7 @@ mod header_tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut head = Vec::new();
             let mut byte = [0_u8; 1];
-            while !head.ends_with(b"\\r\\n\\r\\n") {
+            while !head.ends_with(b"\r\n\r\n") {
                 stream.read_exact(&mut byte).await.unwrap();
                 head.push(byte[0]);
             }
