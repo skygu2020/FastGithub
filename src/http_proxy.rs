@@ -407,9 +407,9 @@ async fn connect_upstream_tls(
     connect_config.set_use_server_name_indication(!disable_sni);
     connect_config.set_verify_hostname(!ignore_name_mismatch);
     let alpn_protocols: &[u8] = if allow_http2 {
-        b"\\x02h2\\x08http/1.1"
+        b"\x02h2\x08http/1.1"
     } else {
-        b"\\x08http/1.1"
+        b"\x08http/1.1"
     };
     connect_config.set_alpn_protos(alpn_protocols)?;
     let mut ssl = connect_config.into_ssl(upstream_host)?;
