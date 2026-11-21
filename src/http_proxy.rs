@@ -259,9 +259,10 @@ async fn watch_config_file(
         match tokio::task::spawn_blocking(move || AppConfig::load(&load_path)).await {
             Ok(Ok(updated)) => {
                 let domains = updated.fast_github.domain_configs.len();
-                config.store(Arc::new(updated));
-                tls_proxy.clear_upstream_clients();
-                tracing::info!(domains, "configuration reloaded; upstream connection pools invalidated");
+                match tls_proxy.reload_config(updated) {
+                    Ok(()) => tracing::info!(domains, "configuration reloaded; upstream connection pools invalidated"),
+                    Err(error) => tracing::warn!(%error, "configuration snapshot could not be swapped"),
+                }
             }
             Ok(Err(error)) => {
                 tracing::warn!(%error, "configuration reload failed; keeping previous configuration");
