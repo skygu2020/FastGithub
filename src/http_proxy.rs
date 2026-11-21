@@ -199,18 +199,24 @@ pub async fn run(config: AppConfig, config_path: PathBuf, upstreams: Vec<SocketA
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, peer) = accepted.context("accepting proxy connection")?;
-                let resolver = resolver.clone();
-                let tls_proxy = Arc::clone(&tls_proxy);
-                let config = Arc::clone(&config);
-                tokio::spawn(async move {
-                    if let Err(error) = handle_connection(stream, resolver, config, tls_proxy, peer).await {
-                        tracing::debug!(%peer, %error, "proxy connection ended");
+                match accepted {
+                    Ok((stream, peer)) => {
+                        let resolver = resolver.clone();
+                        let tls_proxy = Arc::clone(&tls_proxy);
+                        let config = Arc::clone(&config);
+                        tokio::spawn(async move {
+                            if let Err(error) = handle_connection(stream, resolver, config, tls_proxy, peer).await {
+                                tracing::debug!(%peer, %error, "proxy connection ended");
+                            }
+                        });
                     }
-                });
+                    Err(error) => tracing::warn!(%error, "accepting proxy connection failed"),
+                }
             }
             signal = tokio::signal::ctrl_c() => {
-                signal.context("waiting for Ctrl-C")?;
+                if let Err(error) = signal {
+                    tracing::warn!(%error, "Ctrl-C signal handler failed");
+                }
                 tracing::info!("HTTP proxy shutting down");
                 break;
             }
