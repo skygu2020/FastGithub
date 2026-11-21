@@ -1749,7 +1749,7 @@ mod header_tests {
 
     #[tokio::test]
     async fn hyper_http2_loopback_serves_request_and_response_body() {
-        use super::{client_http2, server_http2, TokioExecutor, TimeoutBody, UpstreamConnectionGuard};
+        use super::{client_http2, server_http2, TokioExecutor};
         use bytes::Bytes;
         use http::{Request, Response, StatusCode, Version};
         use http_body_util::{BodyExt, Full};
@@ -1800,7 +1800,7 @@ mod header_tests {
 
     #[tokio::test]
     async fn hyper_http2_early_response_does_not_wait_for_request_body_completion() {
-        use super::{client_http2, server_http2, TokioExecutor};
+        use super::{client_http2, server_http2, TokioExecutor, TimeoutBody, UpstreamConnectionGuard};
         use bytes::Bytes;
         use http::{Request, Response, StatusCode, Version};
         use http_body::Frame;
