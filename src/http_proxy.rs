@@ -672,7 +672,7 @@ pub(crate) async fn connect_target(
     connect_target_excluding(host, port, resolver, domains, config, inherited_rule, &[]).await
 }
 
-async fn connect_target_excluding(
+pub(crate) async fn connect_target_excluding(
     host: &str,
     port: u16,
     resolver: &DomainResolver,
