@@ -1538,6 +1538,92 @@ mod header_tests {
     }
 
     #[tokio::test]
+    async fn hyper_http2_streams_progress_independently() {
+        use super::{client_http2, server_http2, TokioExecutor};
+        use bytes::Bytes;
+        use http::{Request, Response, StatusCode, Version};
+        use http_body_util::{BodyExt, Full};
+        use hyper::{body::Incoming, service::service_fn};
+        use hyper_util::rt::TokioIo;
+        use std::convert::Infallible;
+        use tokio::{net::TcpListener, sync::oneshot};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release_slow_tx, release_slow_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = service_fn(move |request: Request<Incoming>| {
+                let release_slow_rx = if request.uri().path() == "/slow" {
+                    Some(release_slow_rx)
+                } else {
+                    None
+                };
+                async move {
+                    if let Some(release) = release_slow_rx {
+                        release.await.unwrap();
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"slow"))))
+                    } else {
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"fast"))))
+                    }
+                }
+            });
+            server_http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (sender, connection) =
+            client_http2::handshake(TokioExecutor::new(), TokioIo::new(stream)).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await.unwrap() });
+
+        // Keep one stream waiting for its response headers while another stream
+        // completes on the same HTTP/2 connection.
+        let mut slow_sender = sender.clone();
+        let slow = tokio::spawn(async move {
+            let request = Request::builder()
+                .method(http::Method::GET)
+                .version(Version::HTTP_2)
+                .uri("https://localhost/slow")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            slow_sender.send_request(request).await.unwrap()
+        });
+
+        let mut fast_sender = sender.clone();
+        let fast_request = Request::builder()
+            .method(http::Method::GET)
+            .version(Version::HTTP_2)
+            .uri("https://localhost/fast")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let fast_response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            fast_sender.send_request(fast_request),
+        ).await.expect("fast HTTP/2 stream must not wait for slow stream").unwrap();
+        assert_eq!(fast_response.status(), StatusCode::OK);
+        assert_eq!(
+            fast_response.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"fast"),
+        );
+
+        release_slow_tx.send(()).unwrap();
+        let slow_response = slow.await.unwrap();
+        assert_eq!(slow_response.status(), StatusCode::OK);
+        assert_eq!(
+            slow_response.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"slow"),
+        );
+
+        drop(sender);
+        drop(fast_sender);
+        driver.await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn hyper_http1_upgrade_handoff_carries_bidirectional_bytes() {
         use super::client_http1;
         use bytes::Bytes;
