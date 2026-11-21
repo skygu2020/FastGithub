@@ -17,7 +17,10 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
@@ -32,6 +35,7 @@ use tokio_openssl::SslStream;
 const HEADER_LIMIT: usize = 16 * 1024;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+static NEXT_UPSTREAM_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) type UpstreamError = Box<dyn Error + Send + Sync>;
 pub(crate) type UpstreamBody = UnsyncBoxBody<Bytes, UpstreamError>;
@@ -53,6 +57,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> ProxyIo for T {}
 
 struct ConnectedUpstreamIo {
     inner: Box<dyn ProxyIo>,
+    peer_ip: IpAddr,
+    connection_id: u64,
     http2: bool,
 }
 
@@ -109,12 +115,12 @@ impl UpstreamConnector {
         let config = Arc::clone(&self.config);
         let domains = config.fast_github.domain_configs.keys().cloned().collect::<Vec<_>>();
 
-        let (io, http2): (Box<dyn ProxyIo>, bool) = match scheme {
+        let (io, peer_ip, http2): (Box<dyn ProxyIo>, IpAddr, bool) = match scheme {
             "http" => {
-                let (stream, _) = connect_target(
+                let (stream, ip) = connect_target(
                     host, port, &self.resolver, &domains, &config, self.inherited_rule.as_ref(),
                 ).await?;
-                (Box::new(stream), false)
+                (Box::new(stream), ip, false)
             }
             "https" => {
                 let rule = self.inherited_rule.as_ref().or_else(|| config.domain_config(host));
@@ -138,7 +144,7 @@ impl UpstreamConnector {
                     attempted.push(ip);
                     match connect_upstream_tls(&self.tls_connector, stream, host, ip, rule, true).await {
                         Ok((tls, http2)) => {
-                            connected = Some((Box::new(tls) as Box<dyn ProxyIo>, http2));
+                            connected = Some((Box::new(tls) as Box<dyn ProxyIo>, ip, http2));
                             break;
                         }
                         Err(error) => {
@@ -156,14 +162,17 @@ impl UpstreamConnector {
             other => bail!("unsupported upstream URI scheme '{other}'"),
         };
 
+        let connection_id = NEXT_UPSTREAM_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(
             %host,
             port,
+            %peer_ip,
+            connection_id,
             http2,
             elapsed_ms = connect_started.elapsed().as_millis(),
             "upstream transport connection ready"
         );
-        Ok(TokioIo::new(ConnectedUpstreamIo { inner: io, http2 }))
+        Ok(TokioIo::new(ConnectedUpstreamIo { inner: io, peer_ip, connection_id, http2 }))
     }
 }
 
