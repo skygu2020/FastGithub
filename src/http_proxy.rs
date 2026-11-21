@@ -40,6 +40,8 @@ type UpstreamClient = Client<UpstreamConnector, UpstreamBody>;
 struct UpstreamClientEntry {
     client: UpstreamClient,
     expires_at: tokio::time::Instant,
+    // Distinguishes an expired/replaced pool entry from an older in-flight request.
+    identity: Arc<()>,
 }
 
 trait ProxyIo: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -464,7 +466,7 @@ impl TlsProxy {
         })
     }
 
-    fn upstream_client(&self, original_host: &str) -> Result<UpstreamClient> {
+    fn upstream_client(&self, original_host: &str) -> Result<(UpstreamClient, Arc<()>)> {
         let key = original_host.trim_end_matches('.').to_ascii_lowercase();
         let mut lifetime = Duration::from_secs(10);
 
@@ -474,7 +476,7 @@ impl TlsProxy {
                     .map_err(|_| anyhow::anyhow!("upstream client pool lock poisoned"))?;
                 if let Some(entry) = clients.get(&key) {
                     if entry.expires_at > tokio::time::Instant::now() {
-                        return Ok(entry.client.clone());
+                        return Ok((entry.client.clone(), Arc::clone(&entry.identity)));
                     }
                     // The first handler is deliberately short-lived; replacements
                     // follow the reference implementation's 100-second lifetime.
@@ -504,7 +506,7 @@ impl TlsProxy {
             }
             if let Some(entry) = clients.get(&key) {
                 if entry.expires_at > tokio::time::Instant::now() {
-                    return Ok(entry.client.clone());
+                    return Ok((entry.client.clone(), Arc::clone(&entry.identity)));
                 }
                 clients.remove(&key);
                 lifetime = Duration::from_secs(100);
@@ -514,11 +516,13 @@ impl TlsProxy {
                     clients.remove(&evicted);
                 }
             }
+            let identity = Arc::new(());
             clients.insert(key.clone(), UpstreamClientEntry {
                 client: client.clone(),
                 expires_at: tokio::time::Instant::now() + lifetime,
+                identity: Arc::clone(&identity),
             });
-            return Ok(client);
+            return Ok((client, identity));
         }
     }
 
@@ -535,7 +539,7 @@ impl TlsProxy {
         original_host: &str,
         request: Request<UpstreamBody>,
     ) -> Result<Response<Incoming>> {
-        let client = self.upstream_client(original_host)?;
+        let (client, pool_identity) = self.upstream_client(original_host)?;
         let method = request.method().clone();
         let uri = request.uri().clone();
         let started = tokio::time::Instant::now();
@@ -560,14 +564,19 @@ impl TlsProxy {
             ),
         }
         if result.is_err() {
-            // A failed request may indicate that Hyper reused an upstream
-            // keep-alive/HTTP2 connection which the remote endpoint had
-            // already closed or reset. Retire this host's pool entry so the
-            // next browser request establishes a fresh TCP/TLS connection.
+            // Do not let a late failure from an old client evict a newer pool
+            // entry installed after expiry or configuration reload.
             let key = original_host.trim_end_matches('.').to_ascii_lowercase();
             match self.upstream_clients.lock() {
                 Ok(mut clients) => {
-                    clients.remove(&key);
+                    let is_current = clients.get(&key)
+                        .is_some_and(|entry| Arc::ptr_eq(&entry.identity, &pool_identity));
+                    if is_current {
+                        clients.remove(&key);
+                        tracing::debug!(%key, "invalidated failed upstream connection pool");
+                    } else {
+                        tracing::debug!(%key, "failed upstream request belongs to a retired pool entry; keeping replacement");
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(%error, %key, "could not invalidate failed upstream connection pool");
@@ -859,6 +868,14 @@ mod tests {
     }
     use super::*;
     use std::{convert::Infallible, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
+
+    #[test]
+    fn failed_old_pool_entry_does_not_match_replacement_identity() {
+        let old_identity = Arc::new(());
+        let replacement_identity = Arc::new(());
+        assert!(!Arc::ptr_eq(&old_identity, &replacement_identity));
+        assert!(Arc::ptr_eq(&old_identity, &Arc::clone(&old_identity)));
+    }
     use hyper::service::service_fn;
     use http_body_util::Full;
 
