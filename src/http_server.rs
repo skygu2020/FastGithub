@@ -1439,7 +1439,7 @@ mod header_tests {
 
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
         stream.write_all(
-            b"GET / HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n",
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         ).await.unwrap();
         let mut response = Vec::new();
         timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
@@ -1493,7 +1493,7 @@ mod header_tests {
 
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
         stream.write_all(
-            b"POST /upload HTTP/1.1\\r\\nHost: localhost\\r\\nContent-Length: 100\\r\\n\\r\\npartial",
+            b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\npartial",
         ).await.unwrap();
         stream.shutdown().await.unwrap();
 
