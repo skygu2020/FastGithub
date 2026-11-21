@@ -17,8 +17,7 @@ cargo build --release
 ```
 
 The Rust implementation includes JSON5 configuration loading and sorted
-`appsettings/appsettings.*.json` overlays, label-safe domain wildcard matching, systemd unit
-management, a native DNS-over-TCP/UDP client, endpoint persistence/health ordering, bundled
+`appsettings/appsettings.*.json` overlays, label-safe domain wildcard matching, a native DNS-over-TCP/UDP client, endpoint persistence/health ordering, bundled
 DNSCrypt process management, and an HTTP forward-proxy listener. The proxy supports ordinary
 HTTP forwarding, opaque non-TLS CONNECT tunnels, and TLS interception that routes decrypted
 HTTP through the same Hyper request layer. Domain rules support Response, Destination, IPAddress,
