@@ -1551,11 +1551,17 @@ mod header_tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (release_slow_tx, release_slow_rx) = oneshot::channel::<()>();
+        let (slow_started_tx, slow_started_rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let release_slow_rx = std::sync::Mutex::new(Some(release_slow_rx));
+            let slow_started_tx = std::sync::Mutex::new(Some(slow_started_tx));
             let service = service_fn(move |request: Request<Incoming>| {
-                let release_slow_rx = if request.uri().path() == "/slow" {
+                let is_slow = request.uri().path() == "/slow";
+                let release_slow_rx = if is_slow {
+                    if let Some(started) = slow_started_tx.lock().unwrap().take() {
+                        let _ = started.send(());
+                    }
                     release_slow_rx.lock().unwrap().take()
                 } else {
                     None
@@ -1592,6 +1598,7 @@ mod header_tests {
                 .unwrap();
             slow_sender.send_request(request).await.unwrap()
         });
+        slow_started_rx.await.unwrap();
 
         let mut fast_sender = sender.clone();
         let fast_request = Request::builder()
@@ -1622,7 +1629,10 @@ mod header_tests {
             .uri("https://localhost/fast")
             .body(Full::new(Bytes::new()))
             .unwrap();
-        let followup_response = followup_sender.send_request(followup_request).await.unwrap();
+        let followup_response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            followup_sender.send_request(followup_request),
+        ).await.expect("connection must remain usable after stream cancellation").unwrap();
         assert_eq!(
             followup_response.into_body().collect().await.unwrap().to_bytes(),
             Bytes::from_static(b"fast"),
