@@ -1413,6 +1413,101 @@ mod header_tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn http1_server_honors_client_connection_close() {
+        use bytes::Bytes;
+        use http::{Response, StatusCode};
+        use http_body_util::Full;
+        use hyper::{service::service_fn, server::conn::http1 as server_http1};
+        use hyper_util::rt::TokioIo;
+        use std::convert::Infallible;
+        use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener, time::{timeout, Duration}};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = service_fn(|_request: hyper::Request<hyper::body::Incoming>| async {
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+            });
+            server_http1::Builder::new()
+                .keep_alive(true)
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream.write_all(
+            b"GET / HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n",
+        ).await.unwrap();
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .expect("Connection: close must terminate the HTTP/1 connection")
+            .unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.ends_with("ok"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http1_server_terminates_incomplete_request_body_after_client_disconnect() {
+        use bytes::Bytes;
+        use http::{Response, StatusCode};
+        use http_body_util::Full;
+        use hyper::{service::service_fn, server::conn::http1 as server_http1};
+        use hyper_util::rt::TokioIo;
+        use std::convert::Infallible;
+        use tokio::{io::AsyncWriteExt, net::TcpListener, sync::oneshot, time::{timeout, Duration}};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (body_done_tx, body_done_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                let body_done_tx = std::sync::Mutex::new(Some(body_done_tx));
+                async move {
+                    let mut body = request.into_body();
+                    let mut saw_body_error = false;
+                    while let Some(frame) = body.frame().await {
+                        if frame.is_err() {
+                            saw_body_error = true;
+                            break;
+                        }
+                    }
+                    if let Some(sender) = body_done_tx.into_inner().unwrap() {
+                        let _ = sender.send(saw_body_error);
+                    }
+                    Ok::<_, Infallible>(Response::new(Full::new(Bytes::new())))
+                }
+            });
+            server_http1::Builder::new()
+                .keep_alive(true)
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream.write_all(
+            b"POST /upload HTTP/1.1\\r\\nHost: localhost\\r\\nContent-Length: 100\\r\\n\\r\\npartial",
+        ).await.unwrap();
+        stream.shutdown().await.unwrap();
+
+        let saw_body_error = timeout(Duration::from_secs(2), body_done_rx)
+            .await
+            .expect("incomplete request body must finish after client disconnect")
+            .unwrap();
+        assert!(saw_body_error, "truncated Content-Length body should be reported as an error");
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("HTTP/1 connection task must terminate after client disconnect")
+            .unwrap()
+            .unwrap_err();
+    }
+
     #[test]
     fn generated_responses_do_not_force_connection_close() {
         use crate::config::ResponseConfig;
