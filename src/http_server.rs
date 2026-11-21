@@ -1600,10 +1600,9 @@ mod header_tests {
                     .body(http_body_util::Full::new(Bytes::from_static(b"too large")))
                     .unwrap())
             });
-            server_http2::Builder::new(TokioExecutor::new())
+            let _ = server_http2::Builder::new(TokioExecutor::new())
                 .serve_connection(TokioIo::new(stream), service)
-                .await
-                .unwrap();
+                .await;
         });
 
         let stream = tokio::net::TcpStream::connect(address).await.unwrap();
