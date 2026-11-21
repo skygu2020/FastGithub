@@ -188,10 +188,9 @@ pub async fn run(config: AppConfig, config_path: PathBuf, upstreams: Vec<SocketA
         resolver.clone(),
         Arc::clone(&config),
     )?);
-    let watch_config = Arc::clone(&config);
     let watch_tls_proxy = Arc::clone(&tls_proxy);
     let config_task = tokio::spawn(async move {
-        watch_config_file(config_path, watch_config, watch_tls_proxy).await;
+        watch_config_file(config_path, watch_tls_proxy).await;
     });
     let listener = TcpListener::bind(("127.0.0.1", port)).await
         .with_context(|| format!("binding HTTP proxy 127.0.0.1:{port}"))?;
@@ -240,11 +239,7 @@ fn config_fingerprint(path: &Path) -> Vec<(PathBuf, Option<std::time::SystemTime
     }).collect()
 }
 
-async fn watch_config_file(
-    path: PathBuf,
-    config: Arc<ArcSwap<AppConfig>>,
-    tls_proxy: Arc<TlsProxy>,
-) {
+async fn watch_config_file(path: PathBuf, tls_proxy: Arc<TlsProxy>) {
     let mut fingerprint = config_fingerprint(&path);
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     interval.tick().await;
