@@ -20,7 +20,7 @@ use tokio::{
 
 const ENDPOINT_REFRESH_TTL: Duration = Duration::from_secs(10 * 60);
 const FAILED_ADDRESS_TTL: Duration = Duration::from_secs(90);
-const MAX_CANDIDATES: usize = 16;
+const MAX_CANDIDATES: usize = 8;
 
 #[derive(Clone)]
 struct EndpointState {
