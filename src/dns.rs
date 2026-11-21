@@ -66,10 +66,13 @@ impl DnsClient {
         if upstream.port() != 53 {
             return;
         }
-        let mut counts = self.failure_counts.lock().await;
-        let count = counts.entry(upstream).or_insert(0);
-        *count = count.saturating_add(1);
-        if *count >= 3 {
+        let count = {
+            let mut counts = self.failure_counts.lock().await;
+            let count = counts.entry(upstream).or_insert(0);
+            *count = count.saturating_add(1);
+            *count
+        };
+        if count >= 3 {
             self.state_cache.lock().await.insert(
                 upstream,
                 StateEntry {
@@ -77,7 +80,7 @@ impl DnsClient {
                     expires_at: Instant::now() + Duration::from_secs(300),
                 },
             );
-            tracing::warn!(%upstream, failures = *count, "DNS server circuit opened for five minutes");
+            tracing::warn!(%upstream, failures = count, "DNS server circuit opened for five minutes");
         }
     }
 
