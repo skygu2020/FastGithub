@@ -1,6 +1,7 @@
 use crate::{
     address_service::AddressService,
     dns::DnsClient,
+    hosts::{HostsRefreshResult, HostsService},
     persistence::{AddressRecord, EndpointRecord, Persistence},
 };
 use anyhow::Result;
@@ -30,6 +31,7 @@ pub struct DomainResolver {
     dns: DnsClient,
     persistence: Persistence,
     addresses: AddressService,
+    hosts: HostsService,
     endpoints: Arc<RwLock<HashMap<EndpointRecord, EndpointState>>>,
     failed_ips: Arc<RwLock<HashMap<IpAddr, Instant>>>,
 }
@@ -50,6 +52,7 @@ impl DomainResolver {
                 )
             })
             .collect();
+
         for record in saved_addresses {
             let endpoint = EndpointRecord {
                 host: record.host.trim_end_matches('.').to_ascii_lowercase(),
@@ -59,21 +62,24 @@ impl DomainResolver {
                 endpoint,
                 EndpointState {
                     addresses: record.addresses,
-                    // Revalidate on the first normal refresh, while retaining
-                    // the persisted addresses as fallback candidates.
                     refreshed_at: Instant::now() - ENDPOINT_REFRESH_TTL,
                 },
             );
         }
+
         Ok(Self {
             dns,
             persistence,
             addresses: AddressService::default(),
+            hosts: HostsService::new()?,
             endpoints: Arc::new(RwLock::new(endpoints)),
             failed_ips: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
+    /// Resolve candidates in the same priority order as the reference service:
+    /// online hosts first, then configured DNS, with built-in GitHub seeds added
+    /// as fallback candidates at both stages.
     pub async fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>> {
         let endpoint = EndpointRecord {
             host: host.trim_end_matches('.').to_ascii_lowercase(),
@@ -97,48 +103,90 @@ impl DomainResolver {
             }
         };
 
-        if !self.endpoints.read().await.contains_key(&endpoint) {
-            let mut endpoints = self.endpoints.write().await;
-            endpoints.entry(endpoint.clone()).or_insert_with(|| EndpointState {
-                addresses: Vec::new(),
-                refreshed_at: Instant::now() - ENDPOINT_REFRESH_TTL,
-            });
-            let snapshot: Vec<_> = endpoints.keys().cloned().collect();
-            drop(endpoints);
-            if let Err(error) = self.persistence.write_endpoints(&snapshot).await {
-                tracing::warn!(%error, "could not persist DNS endpoint list");
+        self.ensure_endpoint(&endpoint).await;
+
+        let hosts = self.hosts.addresses(&endpoint.host).await;
+        let hosts_candidates = append_seed_addresses(&endpoint.host, hosts);
+        if !hosts_candidates.is_empty() {
+            let probed = self
+                .addresses
+                .order_addresses(&endpoint.host, port, hosts_candidates, &previous)
+                .await;
+            let ordered = self.exclude_failed(&merge_candidates(probed, &previous)).await;
+            if !ordered.is_empty() {
+                self.store_endpoint(endpoint, ordered.clone()).await;
+                return Ok(ordered);
             }
         }
 
-        let fresh = match self.dns.resolve(&endpoint.host, port, false).await {
-            Ok(addresses) => addresses,
+        let dns_result = self.dns.resolve(&endpoint.host, port, false).await;
+        let dns_candidates = match dns_result {
+            Ok(addresses) => append_seed_addresses(&endpoint.host, addresses),
             Err(error) if !previous.is_empty() => {
-                tracing::warn!(host = %endpoint.host, %port, %error, "DNS refresh failed; retaining previous candidates");
+                tracing::warn!(
+                    host = %endpoint.host,
+                    port,
+                    %error,
+                    "DNS refresh failed; retaining previous candidates"
+                );
                 return Ok(self.exclude_failed(&previous).await);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                let seeds = seed_addresses(&endpoint.host);
+                if seeds.is_empty() {
+                    return Err(error);
+                }
+                tracing::warn!(host = %endpoint.host, %error, "DNS failed; using built-in seed candidates");
+                seeds
+            }
         };
 
-        let mut ordered = self
+        let probed = self
             .addresses
-            .order_addresses(&endpoint.host, port, fresh, &previous)
+            .order_addresses(&endpoint.host, port, dns_candidates, &previous)
             .await;
-        ordered = merge_candidates(ordered, &previous);
-        let ordered = self.exclude_failed(&ordered).await;
+        let ordered = self.exclude_failed(&merge_candidates(probed, &previous)).await;
+        self.store_endpoint(endpoint, ordered.clone()).await;
+        Ok(ordered)
+    }
 
+    async fn ensure_endpoint(&self, endpoint: &EndpointRecord) {
+        let mut endpoints = self.endpoints.write().await;
+        if endpoints.contains_key(endpoint) {
+            return;
+        }
+        endpoints.insert(
+            endpoint.clone(),
+            EndpointState {
+                addresses: Vec::new(),
+                refreshed_at: Instant::now() - ENDPOINT_REFRESH_TTL,
+            },
+        );
+        let snapshot: Vec<_> = endpoints.keys().cloned().collect();
+        drop(endpoints);
+        if let Err(error) = self.persistence.write_endpoints(&snapshot).await {
+            tracing::warn!(%error, "could not persist DNS endpoint list");
+        }
+    }
+
+    async fn store_endpoint(&self, endpoint: EndpointRecord, addresses: Vec<IpAddr>) {
         self.endpoints.write().await.insert(
             endpoint,
             EndpointState {
-                addresses: ordered.clone(),
+                addresses,
                 refreshed_at: Instant::now(),
             },
         );
         self.save_addresses().await;
-        Ok(ordered)
     }
 
-    /// Refresh every endpoint loaded from or discovered during this process.
-    /// Per-endpoint failures do not abort the whole refresh; old candidates survive.
+    /// Refresh online hosts sources and then re-probe every known endpoint.
+    pub async fn refresh_hosts(&self) -> HostsRefreshResult {
+        self.hosts.refresh().await
+    }
+
+    /// Refresh every known endpoint. A per-endpoint DNS failure never erases
+    /// its previous candidate set.
     pub async fn test_speed(&self) -> Result<()> {
         let keys: Vec<_> = self.endpoints.read().await.keys().cloned().collect();
         for endpoint in keys {
@@ -150,17 +198,27 @@ impl DomainResolver {
                 .map(|state| state.addresses.clone())
                 .unwrap_or_default();
 
-            let fresh = match self.dns.resolve(&endpoint.host, endpoint.port, false).await {
-                Ok(addresses) => addresses,
-                Err(error) => {
-                    tracing::warn!(host = %endpoint.host, port = endpoint.port, %error, "DNS refresh failed; retaining old candidates");
-                    continue;
+            let hosts = self.hosts.addresses(&endpoint.host).await;
+            let candidates = if hosts.is_empty() {
+                match self.dns.resolve(&endpoint.host, endpoint.port, false).await {
+                    Ok(addresses) => append_seed_addresses(&endpoint.host, addresses),
+                    Err(error) => {
+                        tracing::warn!(
+                            host = %endpoint.host,
+                            port = endpoint.port,
+                            %error,
+                            "DNS refresh failed; retaining old candidates"
+                        );
+                        continue;
+                    }
                 }
+            } else {
+                append_seed_addresses(&endpoint.host, hosts)
             };
 
             let probed = self
                 .addresses
-                .order_addresses(&endpoint.host, endpoint.port, fresh, &old)
+                .order_addresses(&endpoint.host, endpoint.port, candidates, &old)
                 .await;
             let merged = merge_candidates(probed, &old);
             let ordered = self.exclude_failed(&merged).await;
@@ -173,10 +231,12 @@ impl DomainResolver {
                 );
             }
 
+            // Never replace a known-good candidate list with an empty result.
+            let next = if ordered.is_empty() { old } else { ordered };
             self.endpoints.write().await.insert(
                 endpoint,
                 EndpointState {
-                    addresses: ordered,
+                    addresses: next,
                     refreshed_at: Instant::now(),
                 },
             );
@@ -248,8 +308,47 @@ impl DomainResolver {
     }
 }
 
+fn append_seed_addresses(host: &str, mut addresses: Vec<IpAddr>) -> Vec<IpAddr> {
+    for address in seed_addresses(host) {
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    addresses
+}
+
+fn seed_addresses(host: &str) -> Vec<IpAddr> {
+    let values: &[&str] = match host.trim_end_matches('.').to_ascii_lowercase().as_str() {
+        "github.com" => &[
+            "20.27.177.113", "20.205.243.166", "20.29.134.23",
+            "20.26.156.215", "20.233.83.145", "140.82.113.3",
+        ],
+        "api.github.com" => &[
+            "20.27.177.113", "20.205.243.166", "20.205.243.168", "20.29.134.23",
+        ],
+        "gist.github.com" => &[
+            "20.205.243.166", "20.27.177.113", "20.26.156.215",
+        ],
+        "codeload.github.com" => &[
+            "20.205.243.165", "20.27.177.113", "20.26.156.215",
+        ],
+        "raw.githubusercontent.com" | "avatars.githubusercontent.com" | "camo.githubusercontent.com" => &[
+            "185.199.110.133", "185.199.109.133", "185.199.111.133", "185.199.108.133",
+        ],
+        "github.githubassets.com" => &[
+            "185.199.108.154", "185.199.110.154", "185.199.109.154", "185.199.111.154",
+        ],
+        "github.io" => &[
+            "185.199.110.153", "185.199.111.153", "185.199.109.153", "185.199.108.153",
+        ],
+        _ => &[],
+    };
+    values.iter().filter_map(|value| value.parse().ok()).collect()
+}
+
 fn merge_candidates(new_addresses: Vec<IpAddr>, old_addresses: &[IpAddr]) -> Vec<IpAddr> {
-    let mut merged = Vec::with_capacity((new_addresses.len() + old_addresses.len()).min(MAX_CANDIDATES));
+    let mut merged =
+        Vec::with_capacity((new_addresses.len() + old_addresses.len()).min(MAX_CANDIDATES));
     for address in new_addresses.into_iter().chain(old_addresses.iter().copied()) {
         if !merged.contains(&address) {
             merged.push(address);
@@ -289,5 +388,23 @@ mod tests {
     fn candidate_merge_is_bounded() {
         let fresh = (1..=20).map(|last| IpAddr::from([192, 0, 2, last])).collect();
         assert_eq!(merge_candidates(fresh, &[]).len(), MAX_CANDIDATES);
+    }
+
+    #[test]
+    fn github_seed_pool_contains_core_service_hosts() {
+        for host in [
+            "github.com",
+            "api.github.com",
+            "gist.github.com",
+            "codeload.github.com",
+            "raw.githubusercontent.com",
+            "avatars.githubusercontent.com",
+            "camo.githubusercontent.com",
+            "github.githubassets.com",
+            "github.io",
+        ] {
+            assert!(!seed_addresses(host).is_empty(), "missing seed for {host}");
+        }
+        assert!(seed_addresses("example.com").is_empty());
     }
 }
