@@ -576,11 +576,16 @@ impl TlsProxy {
         let requested_host = client_tls.ssl().servername(NameType::HOST_NAME).unwrap_or(connect_host).to_owned();
 
         tracing::debug!(host = %requested_host, alpn = ?client_tls.ssl().selected_alpn_protocol(), "TLS interception established; handing decrypted HTTP to Hyper");
-        if negotiated_http2(client_tls.ssl().selected_alpn_protocol()) {
+        let alpn = client_tls.ssl().selected_alpn_protocol().map(|value| String::from_utf8_lossy(value).into_owned());
+        let result = if negotiated_http2(client_tls.ssl().selected_alpn_protocol()) {
             crate::http_server::serve_http2(client_tls, "https", config, resolver, domains, tls_proxy).await
         } else {
             crate::http_server::serve(client_tls, "https", config, resolver, domains, tls_proxy).await
+        };
+        if let Err(error) = &result {
+            tracing::debug!(%requested_host, ?alpn, %error, "intercepted HTTP connection ended with error");
         }
+        result
     }
 }
 
