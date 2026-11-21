@@ -3,7 +3,6 @@ use std::{collections::HashMap, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}, s
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpStream, UdpSocket}, sync::Mutex, time::{timeout, Instant}};
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(4);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const MIN_TTL: Duration = Duration::from_secs(30);
 const MAX_TTL: Duration = Duration::from_secs(600);
 static NEXT_ID: AtomicU16 = AtomicU16::new(1);
@@ -48,7 +47,7 @@ impl DnsClient {
         let mut addresses = Vec::new();
         for upstream in self.upstreams.iter().copied() {
             // The reference implementation probes TCP only for port 53; custom ports are UDP.
-            if upstream.port() == 53 && !self.tcp_available(upstream).await { continue; }
+            if upstream.port() == 53 && !self.upstream_available(upstream).await { continue; }
             match self.lookup(upstream, &host).await {
                 Ok(found) => for ip in found { if !ip.is_loopback() && !addresses.contains(&ip) { addresses.push(ip); } },
                 Err(error) => {
@@ -94,20 +93,15 @@ impl DnsClient {
         }
     }
 
-    async fn tcp_available(&self, upstream: SocketAddr) -> bool {
-        {
-            let mut cache = self.state_cache.lock().await;
-            if let Some(entry) = cache.get(&upstream) {
-                if entry.expires_at > Instant::now() { return entry.available; }
-                cache.remove(&upstream);
+    async fn upstream_available(&self, upstream: SocketAddr) -> bool {
+        let mut cache = self.state_cache.lock().await;
+        if let Some(entry) = cache.get(&upstream) {
+            if entry.expires_at > Instant::now() {
+                return entry.available;
             }
+            cache.remove(&upstream);
         }
-        let available = timeout(CONNECT_TIMEOUT, TcpStream::connect(upstream)).await.is_ok_and(|r| r.is_ok());
-        self.state_cache.lock().await.insert(upstream, StateEntry {
-            available,
-            expires_at: Instant::now() + Duration::from_secs(300),
-        });
-        available
+        true
     }
 
     async fn lookup(&self, upstream: SocketAddr, host: &str) -> Result<Vec<IpAddr>> {
@@ -148,11 +142,9 @@ impl DnsClient {
     async fn query(&self, upstream: SocketAddr, host: &str, record_type: u16) -> Result<(Vec<IpAddr>, Duration)> {
         timeout(DNS_TIMEOUT, async {
             let query = build_query(host, record_type)?;
-            if upstream.port() == 53 {
-                tcp_query(upstream, &query, record_type).await
-            } else {
-                udp_query(upstream, &query, record_type).await
-            }
+            // DNS uses UDP by default on every port. udp_query retries over
+            // TCP only when the response has the RFC 1035 TC (truncated) bit.
+            udp_query(upstream, &query, record_type).await
         }).await.context("DNS query timed out")?
     }
 
