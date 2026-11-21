@@ -19,7 +19,7 @@ mod tls;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::{path::PathBuf, sync::Arc};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{fmt::writer::MakeWriterExt, EnvFilter};
 
 #[derive(Debug, Parser)]
 #[command(name = "fastgithub", version, about = "Native Rust Linux FastGithub")]
@@ -51,7 +51,18 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let log_directory = std::env::current_dir()?.join("logs");
+    let file_appender = tracing_appender::rolling::Builder::default()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("fastgithub")
+        .filename_suffix("log")
+        .max_log_files(14)
+        .build(&log_directory)
+        .with_context(|| format!("initializing daily log directory {}", log_directory.display()))?;
+    let (file_writer, _log_guard) = tracing_appender::non_blocking(file_appender);
+    let writer = std::io::stdout.and(file_writer);
     tracing_subscriber::fmt()
+        .with_writer(writer)
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with_target(false).init();
 
