@@ -331,7 +331,7 @@ async fn forward_request(
     let (stream, upstream_ip) = crate::http_proxy::connect_target(host, port, resolver, domains, config, domain.as_ref()).await?;
     let (io, upstream_http2): (Box<dyn AsyncIo>, bool) = if uri.scheme() == "https" {
         let tls = tls_proxy.connect_upstream(stream, host, upstream_ip, domain.as_ref(), true).await?;
-        let use_http2 = tls.ssl().selected_alpn_protocol() == Some(&b"h2"[..]);
+        let use_http2 = crate::http_proxy::negotiated_http2(tls.ssl().selected_alpn_protocol());
         (Box::new(tls), use_http2)
     } else if uri.scheme() == "http" {
         (Box::new(stream), false)
