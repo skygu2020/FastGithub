@@ -105,6 +105,11 @@ impl FlowAnalyzer {
         }
         if let Ok(mut errors) = self.state.errors.lock() {
             let key = (host.trim_end_matches('.').to_ascii_lowercase(), status);
+            if !errors.contains_key(&key) && errors.len() >= 4096 {
+                if let Some(oldest_key) = errors.keys().next().cloned() {
+                    errors.remove(&oldest_key);
+                }
+            }
             let count = errors.entry(key).or_insert(0);
             *count = count.saturating_add(1);
         }
