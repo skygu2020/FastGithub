@@ -471,7 +471,7 @@ async fn handle_request_inner(request: Request<Incoming>, scheme: &str, config: 
                 return empty_response(StatusCode::EXPECTATION_FAILED);
             }
             let timeout_duration = match domain.as_ref().map(|rule| rule.request_timeout()).transpose() {
-                Ok(value) => value.flatten(),
+                Ok(value) => value.flatten().or(Some(Duration::from_secs(100))),
                 Err(error) => {
                     tracing::warn!(%error, "invalid configured request timeout");
                     return empty_response(StatusCode::BAD_GATEWAY);
@@ -697,7 +697,7 @@ async fn forward_upgrade_request(
         match tls_proxy.connect_upstream(stream, host, upstream_ip, domain.as_ref(), false).await {
             Ok(tls) => Box::new(tls),
             Err(error) => {
-                resolver.report_failure(upstream_ip).await;
+                resolver.report_failure(host, port, upstream_ip).await;
                 return Err(error);
             }
         }
