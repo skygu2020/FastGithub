@@ -141,10 +141,7 @@ where
         }
         if this.sleep.as_mut().is_some_and(|sleep| sleep.as_mut().poll(cx).is_ready()) {
             this.terminated = true;
-            tracing::warn!(
-                elapsed_timeout = this.sleep.as_ref().map(|_| "configured"),
-                "upstream response body stalled until request timeout"
-            );
+            tracing::warn!("upstream response body stalled until request timeout");
             // Dropping Incoming cancels the upstream HTTP/2 stream or makes an
             // incomplete HTTP/1 connection ineligible for keep-alive reuse.
             drop(this.inner.take());
