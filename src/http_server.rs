@@ -329,7 +329,7 @@ async fn handle_request(
     let path = request.uri().path();
     let target = format!("{authority}{path}");
     let started = tokio::time::Instant::now();
-    let response = handle_request_inner(request, scheme, &config, &domains, tls_proxy).await;
+    let response = handle_request_inner(request, scheme, &config, resolver, &domains, tls_proxy).await;
     let status = response.status();
     if status.is_client_error() || status.is_server_error() {
         resolver.flow_analyzer().record_error(&host, status.as_u16());
