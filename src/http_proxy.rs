@@ -15,7 +15,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
@@ -84,6 +84,7 @@ struct UpstreamConnector {
     domains: Arc<Vec<String>>,
     config: Arc<AppConfig>,
     tls_connector: Arc<SslConnector>,
+    inherited_rule: Option<crate::config::DomainConfig>,
 }
 
 impl UpstreamConnector {
@@ -97,13 +98,13 @@ impl UpstreamConnector {
             &self.resolver,
             &self.domains,
             &self.config,
-            None,
+            self.inherited_rule.as_ref(),
         ).await?;
 
         let (io, http2): (Box<dyn ProxyIo>, bool) = match scheme {
             "http" => (Box::new(stream), false),
             "https" => {
-                let rule = self.config.domain_config(host);
+                let rule = self.inherited_rule.as_ref().or_else(|| self.config.domain_config(host));
                 match connect_upstream_tls(&self.tls_connector, stream, host, ip, rule, true).await {
                     Ok((tls, http2)) => (Box::new(tls), http2),
                     Err(error) => {
@@ -298,7 +299,10 @@ pub(crate) struct TlsProxy {
     acceptor: SslAcceptor,
     connector: SslConnector,
     certificates: Arc<CertificateService>,
-    upstream_client: UpstreamClient,
+    resolver: DomainResolver,
+    config: Arc<AppConfig>,
+    domains: Arc<Vec<String>>,
+    upstream_clients: Mutex<std::collections::HashMap<String, UpstreamClient>>,
 }
 
 impl TlsProxy {
@@ -328,31 +332,54 @@ impl TlsProxy {
         let connector = SslConnector::builder(SslMethod::tls())
             .context("creating upstream TLS connector")?
             .build();
-        let upstream_connector = UpstreamConnector {
-            resolver,
-            domains: Arc::new(domains),
-            config,
-            tls_connector: Arc::new(connector.clone()),
-        };
-        let mut client_builder = Client::builder(TokioExecutor::new());
-        client_builder
-            .pool_idle_timeout(Duration::from_secs(90))
-            .pool_timer(TokioTimer::new())
-            .pool_max_idle_per_host(8);
-        let upstream_client = client_builder.build(upstream_connector);
         Ok(Self {
             acceptor: acceptor.build(),
             connector,
             certificates,
-            upstream_client,
+            resolver,
+            config,
+            domains: Arc::new(domains),
+            upstream_clients: Mutex::new(std::collections::HashMap::new()),
         })
+    }
+
+    fn upstream_client(&self, original_host: &str) -> Result<UpstreamClient> {
+        let key = original_host.trim_end_matches('.').to_ascii_lowercase();
+        if let Some(client) = self.upstream_clients.lock()
+            .map_err(|_| anyhow::anyhow!("upstream client pool lock poisoned"))?
+            .get(&key)
+            .cloned()
+        {
+            return Ok(client);
+        }
+
+        let connector = UpstreamConnector {
+            resolver: self.resolver.clone(),
+            domains: Arc::clone(&self.domains),
+            config: Arc::clone(&self.config),
+            tls_connector: Arc::new(self.connector.clone()),
+            inherited_rule: self.config.domain_config(original_host).cloned(),
+        };
+        let mut builder = Client::builder(TokioExecutor::new());
+        builder
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_timer(TokioTimer::new())
+            .pool_max_idle_per_host(8);
+        let client = builder.build(connector);
+        let mut clients = self.upstream_clients.lock()
+            .map_err(|_| anyhow::anyhow!("upstream client pool lock poisoned"))?;
+        Ok(clients.entry(key).or_insert_with(|| client.clone()).clone())
     }
 
     pub(crate) async fn send_pooled_request(
         &self,
+        original_host: &str,
         request: Request<UpstreamBody>,
     ) -> Result<Response<Incoming>> {
-        self.upstream_client.request(request).await.context("sending pooled upstream HTTP request")
+        self.upstream_client(original_host)?
+            .request(request)
+            .await
+            .context("sending pooled upstream HTTP request")
     }
 
     pub(crate) async fn connect_upstream(
