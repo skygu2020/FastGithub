@@ -12,7 +12,8 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::RwLock,
+    sync::{RwLock, Semaphore},
+    task::JoinSet,
     time::Instant,
 };
 
@@ -190,64 +191,85 @@ impl DomainResolver {
         Ok(hosts)
     }
 
-    /// Refresh every known endpoint. A per-endpoint DNS failure never erases
-    /// its previous candidate set.
+    /// Refresh every known endpoint with bounded concurrency. A per-endpoint
+    /// DNS failure never erases its previous candidate set.
     pub async fn test_speed(&self) -> Result<()> {
         let keys: Vec<_> = self.endpoints.read().await.keys().cloned().collect();
+        let semaphore = Arc::new(Semaphore::new(12));
+        let mut jobs = JoinSet::new();
+
         for endpoint in keys {
-            let old = self
-                .endpoints
-                .read()
-                .await
-                .get(&endpoint)
-                .map(|state| state.addresses.clone())
-                .unwrap_or_default();
-
-            let hosts = self.hosts.addresses(&endpoint.host).await;
-            let candidates = if hosts.is_empty() {
-                match self.dns.resolve(&endpoint.host, endpoint.port, false).await {
-                    Ok(addresses) => append_seed_addresses(&endpoint.host, addresses),
-                    Err(error) => {
-                        tracing::warn!(
-                            host = %endpoint.host,
-                            port = endpoint.port,
-                            %error,
-                            "DNS refresh failed; retaining old candidates"
-                        );
-                        continue;
-                    }
-                }
-            } else {
-                append_seed_addresses(&endpoint.host, hosts)
-            };
-
-            let probed = self
-                .addresses
-                .order_addresses(&endpoint.host, endpoint.port, candidates, &old)
-                .await;
-            let merged = merge_candidates(probed, &old);
-            let ordered = self.exclude_failed(&merged).await;
-
-            if old.iter().take(3).ne(ordered.iter().take(3)) {
-                tracing::info!(
-                    endpoint = %format!("{}:{}", endpoint.host, endpoint.port),
-                    addresses = ?ordered.iter().take(3).collect::<Vec<_>>(),
-                    "DNS endpoint speed order changed"
-                );
-            }
-
-            // Never replace a known-good candidate list with an empty result.
-            let next = if ordered.is_empty() { old } else { ordered };
-            self.endpoints.write().await.insert(
-                endpoint,
-                EndpointState {
-                    addresses: next,
-                    refreshed_at: Instant::now(),
-                },
-            );
+            let resolver = self.clone();
+            let semaphore = Arc::clone(&semaphore);
+            jobs.spawn(async move {
+                let Ok(_permit) = semaphore.acquire_owned().await else {
+                    return;
+                };
+                resolver.refresh_endpoint(endpoint).await;
+            });
         }
+
+        while let Some(result) = jobs.join_next().await {
+            if let Err(error) = result {
+                tracing::warn!(%error, "DNS endpoint refresh task failed");
+            }
+        }
+
         self.save_addresses().await;
         Ok(())
+    }
+
+    async fn refresh_endpoint(&self, endpoint: EndpointRecord) {
+        let old = self
+            .endpoints
+            .read()
+            .await
+            .get(&endpoint)
+            .map(|state| state.addresses.clone())
+            .unwrap_or_default();
+
+        let hosts = self.hosts.addresses(&endpoint.host).await;
+        let candidates = if hosts.is_empty() {
+            match self.dns.resolve(&endpoint.host, endpoint.port, false).await {
+                Ok(addresses) => append_seed_addresses(&endpoint.host, addresses),
+                Err(error) => {
+                    tracing::warn!(
+                        host = %endpoint.host,
+                        port = endpoint.port,
+                        %error,
+                        "DNS refresh failed; retaining old candidates"
+                    );
+                    return;
+                }
+            }
+        } else {
+            append_seed_addresses(&endpoint.host, hosts)
+        };
+
+        let probed = self
+            .addresses
+            .order_addresses(&endpoint.host, endpoint.port, candidates, &old)
+            .await;
+        let merged = merge_candidates(probed, &old);
+        let ordered = self.exclude_failed(&merged).await;
+
+        if old.iter().take(3).ne(ordered.iter().take(3)) {
+            tracing::info!(
+                endpoint = %format!("{}:{}", endpoint.host, endpoint.port),
+                addresses = ?ordered.iter().take(3).collect::<Vec<_>>(),
+                "DNS endpoint speed order changed"
+            );
+        }
+
+        // Never replace a known-good candidate list with an empty result.
+        let next = if ordered.is_empty() { old } else { ordered };
+        self.endpoints.write().await.insert(
+            endpoint,
+            EndpointState {
+                addresses: next,
+                refreshed_at: Instant::now(),
+            },
+        );
     }
 
     /// Mark an IP as failed for 90 seconds and remove it from current candidate lists.
