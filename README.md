@@ -53,6 +53,11 @@ Public DNS servers on port 53 are temporarily circuit-broken after repeated quer
 uses TCP; custom DNS ports use UDP and retry over TCP when a response is truncated. UDP transaction
 IDs are validated before parsing.
 
+The proxy reloads the main JSON5 configuration and `appsettings/appsettings.*.json` overlays
+when their files change (polled every two seconds). New requests use the updated domain rules and
+the upstream connection pools are invalidated; changing the listening port or DNS upstream list
+still requires a restart.
+
 The core parity and remaining-work checklist is maintained in [docs/CORE_PARITY.md](docs/CORE_PARITY.md).
 The current source updates have not yet been built or tested with Cargo; see that checklist for the
 required Linux validation commands.
