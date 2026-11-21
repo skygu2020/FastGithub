@@ -1739,7 +1739,7 @@ mod header_tests {
 
     #[tokio::test]
     async fn hyper_http2_loopback_serves_request_and_response_body() {
-        use super::{client_http2, server_http2, TokioExecutor};
+        use super::{client_http2, server_http2, TokioExecutor, TimeoutBody, UpstreamConnectionGuard};
         use bytes::Bytes;
         use http::{Request, Response, StatusCode, Version};
         use http_body_util::{BodyExt, Full};
@@ -1835,6 +1835,7 @@ mod header_tests {
         let (mut sender, connection) =
             client_http2::handshake(TokioExecutor::new(), TokioIo::new(stream)).await.unwrap();
         let driver = tokio::spawn(async move { connection.await });
+        let connection_guard = UpstreamConnectionGuard(driver.abort_handle());
         let request = Request::builder()
             .method(http::Method::POST)
             .version(Version::HTTP_2)
@@ -1847,14 +1848,20 @@ mod header_tests {
             sender.send_request(request),
         ).await.expect("early HTTP/2 response must not wait for request body EOF").unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(
-            response.into_body().collect().await.unwrap().to_bytes(),
-            Bytes::from_static(b"too large"),
-        );
+        let response_body = response.into_body()
+            .map_err(|error| Box::new(error) as super::BoxError)
+            .boxed_unsync();
+        let mut response_body = TimeoutBody::new(response_body, None, connection_guard);
+        let mut response_bytes = Vec::new();
+        while let Some(frame) = response_body.frame().await {
+            response_bytes.extend_from_slice(&frame.unwrap().into_data().unwrap());
+        }
+        assert_eq!(response_bytes, b"too large");
 
+        // Consuming the early response releases the guard and aborts the
+        // HTTP/2 driver, which also stops polling the still-pending upload.
         drop(sender);
-        driver.abort();
-        let _ = driver.await;
+        assert!(driver.await.unwrap_err().is_cancelled());
         server.await.unwrap();
     }
 
