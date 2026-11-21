@@ -83,7 +83,6 @@ impl Connection for ConnectedUpstreamIo {
 #[derive(Clone)]
 struct UpstreamConnector {
     resolver: DomainResolver,
-    domains: Arc<Vec<String>>,
     config: Arc<AppConfig>,
     tls_connector: Arc<SslConnector>,
     inherited_rule: Option<crate::config::DomainConfig>,
@@ -425,10 +424,8 @@ impl TlsProxy {
             }
 
             let config = self.config.load_full();
-            let domains = Arc::new(config.fast_github.domain_configs.keys().cloned().collect());
             let connector = UpstreamConnector {
                 resolver: self.resolver.clone(),
-                domains,
                 config: Arc::clone(&config),
                 tls_connector: Arc::new(self.connector.clone()),
                 inherited_rule: config.domain_config(original_host).cloned(),
@@ -821,7 +818,6 @@ mod tests {
         ).await.unwrap();
         let connector = UpstreamConnector {
             resolver,
-            domains: Arc::new(Vec::new()),
             config: Arc::new(config),
             tls_connector: Arc::new(SslConnector::builder(SslMethod::tls()).unwrap().build()),
             inherited_rule: None,
