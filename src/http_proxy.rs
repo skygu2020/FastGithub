@@ -589,6 +589,7 @@ mod tests {
     use super::*;
     use std::{convert::Infallible, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
     use hyper::service::service_fn;
+    use http_body_util::Full;
 
 
     #[derive(Clone)]
