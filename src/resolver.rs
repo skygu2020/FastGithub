@@ -115,21 +115,21 @@ impl DomainResolver {
 
         let hosts = self.hosts.addresses(&endpoint.host).await;
         let hosts_candidates = append_seed_addresses(&endpoint.host, hosts);
-        if !hosts_candidates.is_empty() {
-            let probed = self
-                .addresses
-                .order_addresses(&endpoint.host, port, hosts_candidates, &previous)
-                .await;
-            let ordered = self.exclude_failed(&endpoint.host, endpoint.port, &merge_candidates(probed, &previous)).await;
-            if !ordered.is_empty() {
-                self.store_endpoint(endpoint, ordered.clone()).await;
-                return Ok(ordered);
-            }
-        }
 
-        let dns_result = self.dns.resolve(&endpoint.host, port, false).await;
-        let dns_candidates = match dns_result {
+        // Hosts entries are preferred candidates, not an exclusive DNS override.
+        // Always obtain DNS candidates as well so stale or unreachable hosts entries
+        // cannot prevent a valid DNS address from being considered.
+        let dns_candidates = match self.dns.resolve(&endpoint.host, port, false).await {
             Ok(addresses) => append_seed_addresses(&endpoint.host, addresses),
+            Err(error) if !hosts_candidates.is_empty() => {
+                tracing::warn!(
+                    host = %endpoint.host,
+                    port,
+                    %error,
+                    "DNS lookup failed; continuing with online hosts candidates"
+                );
+                Vec::new()
+            }
             Err(error) if !previous.is_empty() => {
                 tracing::warn!(
                     host = %endpoint.host,
@@ -151,9 +151,13 @@ impl DomainResolver {
             }
         };
 
+        let candidates = merge_candidates(hosts_candidates, &dns_candidates);
+        if candidates.is_empty() && previous.is_empty() {
+            anyhow::bail!("DNS and online hosts returned no addresses for {}", endpoint.host);
+        }
         let probed = self
             .addresses
-            .order_addresses(&endpoint.host, port, dns_candidates, &previous)
+            .order_addresses(&endpoint.host, port, candidates, &previous)
             .await;
         let ordered = self.exclude_failed(&endpoint.host, endpoint.port, &merge_candidates(probed, &previous)).await;
         self.store_endpoint(endpoint, ordered.clone()).await;
@@ -238,31 +242,54 @@ impl DomainResolver {
             .map(|state| state.addresses.clone())
             .unwrap_or_default();
 
-        let hosts = self.hosts.addresses(&endpoint.host).await;
-        let candidates = if hosts.is_empty() {
-            match self.dns.resolve(&endpoint.host, endpoint.port, false).await {
-                Ok(addresses) => append_seed_addresses(&endpoint.host, addresses),
-                Err(error) => {
-                    tracing::warn!(
-                        host = %endpoint.host,
-                        port = endpoint.port,
-                        %error,
-                        "DNS refresh failed; retaining old candidates"
-                    );
-                    if !old.is_empty() {
-                        self.endpoints.write().await.insert(
-                            endpoint,
-                            EndpointState {
-                                addresses: old,
-                                refreshed_at: Instant::now(),
-                            },
-                        );
-                    }
-                    return;
-                }
+        let hosts_candidates = append_seed_addresses(
+            &endpoint.host,
+            self.hosts.addresses(&endpoint.host).await,
+        );
+        // Keep DNS in the candidate set even when hosts has an entry. A hosts
+        // record may be stale or unreachable while public DNS has recovered.
+        let dns_candidates = match self.dns.resolve(&endpoint.host, endpoint.port, false).await {
+            Ok(addresses) => append_seed_addresses(&endpoint.host, addresses),
+            Err(error) if !hosts_candidates.is_empty() => {
+                tracing::warn!(
+                    host = %endpoint.host,
+                    port = endpoint.port,
+                    %error,
+                    "DNS refresh failed; retaining online hosts candidates"
+                );
+                Vec::new()
             }
+            Err(error) => {
+                tracing::warn!(
+                    host = %endpoint.host,
+                    port = endpoint.port,
+                    %error,
+                    "DNS refresh failed; retaining old candidates"
+                );
+                if !old.is_empty() {
+                    self.endpoints.write().await.insert(
+                        endpoint,
+                        EndpointState {
+                            addresses: old,
+                            refreshed_at: Instant::now(),
+                        },
+                    );
+                }
+                return;
+            }
+        };
+        let candidates = merge_candidates(hosts_candidates, &dns_candidates);
+        if candidates.is_empty() && old.is_empty() {
+            let seeds = seed_addresses(&endpoint.host);
+            if seeds.is_empty() {
+                return;
+            }
+            tracing::warn!(host = %endpoint.host, "DNS returned no addresses; using built-in seed candidates");
+        }
+        let candidates = if candidates.is_empty() {
+            seed_addresses(&endpoint.host)
         } else {
-            append_seed_addresses(&endpoint.host, hosts)
+            candidates
         };
 
         let probed = self
