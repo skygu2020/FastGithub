@@ -1,4 +1,5 @@
 use crate::{cert::CertificateService, config::AppConfig, dns::DnsClient, persistence::Persistence, resolver::DomainResolver};
+use arc_swap::ArcSwap;
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use http::{Request, Response, Uri};
@@ -82,7 +83,7 @@ impl Connection for ConnectedUpstreamIo {
 struct UpstreamConnector {
     resolver: DomainResolver,
     domains: Arc<Vec<String>>,
-    config: Arc<AppConfig>,
+    config: Arc<ArcSwap<AppConfig>>,
     tls_connector: Arc<SslConnector>,
     inherited_rule: Option<crate::config::DomainConfig>,
 }
@@ -92,19 +93,21 @@ impl UpstreamConnector {
         let host = uri.host().context("upstream URI has no hostname")?;
         let scheme = uri.scheme_str().unwrap_or("http");
         let port = uri.port_u16().unwrap_or(if scheme == "https" { 443 } else { 80 });
+        let config = self.config.load_full();
+        let domains = config.fast_github.domain_configs.keys().cloned().collect::<Vec<_>>();
         let (stream, ip) = connect_target(
             host,
             port,
             &self.resolver,
-            &self.domains,
-            &self.config,
+            &domains,
+            &config,
             self.inherited_rule.as_ref(),
         ).await?;
 
         let (io, http2): (Box<dyn ProxyIo>, bool) = match scheme {
             "http" => (Box::new(stream), false),
             "https" => {
-                let rule = self.inherited_rule.as_ref().or_else(|| self.config.domain_config(host));
+                let rule = self.inherited_rule.as_ref().or_else(|| config.domain_config(host));
                 match connect_upstream_tls(&self.tls_connector, stream, host, ip, rule, true).await {
                     Ok((tls, http2)) => (Box::new(tls), http2),
                     Err(error) => {
@@ -300,8 +303,7 @@ pub(crate) struct TlsProxy {
     connector: SslConnector,
     certificates: Arc<CertificateService>,
     resolver: DomainResolver,
-    config: Arc<AppConfig>,
-    domains: Arc<Vec<String>>,
+    config: Arc<ArcSwap<AppConfig>>,
     upstream_clients: Mutex<std::collections::HashMap<String, UpstreamClient>>,
 }
 
@@ -309,8 +311,7 @@ impl TlsProxy {
     fn new(
         certificates: Arc<CertificateService>,
         resolver: DomainResolver,
-        config: Arc<AppConfig>,
-        domains: Vec<String>,
+        config: Arc<ArcSwap<AppConfig>>,
     ) -> Result<Self> {
         let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls())
             .context("creating inbound TLS acceptor")?;
@@ -338,7 +339,6 @@ impl TlsProxy {
             certificates,
             resolver,
             config,
-            domains: Arc::new(domains),
             upstream_clients: Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -353,12 +353,14 @@ impl TlsProxy {
             return Ok(client);
         }
 
+        let config = self.config.load_full();
+        let domains = Arc::new(config.fast_github.domain_configs.keys().cloned().collect());
         let connector = UpstreamConnector {
             resolver: self.resolver.clone(),
-            domains: Arc::clone(&self.domains),
+            domains,
             config: Arc::clone(&self.config),
             tls_connector: Arc::new(self.connector.clone()),
-            inherited_rule: self.config.domain_config(original_host).cloned(),
+            inherited_rule: config.domain_config(original_host).cloned(),
         };
         let mut builder = Client::builder(TokioExecutor::new());
         builder
@@ -374,6 +376,12 @@ impl TlsProxy {
             }
         }
         Ok(clients.entry(key).or_insert_with(|| client.clone()).clone())
+    }
+
+    pub(crate) fn clear_upstream_clients(&self) {
+        if let Ok(mut clients) = self.upstream_clients.lock() {
+            clients.clear();
+        }
     }
 
     pub(crate) async fn send_pooled_request(
@@ -405,7 +413,7 @@ impl TlsProxy {
         ).await.map(|(tls, _)| tls)
     }
 
-    pub(crate) async fn intercept(&self, client: TcpStream, connect_host: &str, config: Arc<AppConfig>, resolver: DomainResolver, domains: Vec<String>, tls_proxy: Arc<TlsProxy>) -> Result<()> {
+    pub(crate) async fn intercept(&self, client: TcpStream, connect_host: &str, config: Arc<ArcSwap<AppConfig>>, resolver: DomainResolver, domains: Vec<String>, tls_proxy: Arc<TlsProxy>) -> Result<()> {
         let default_certificate = self.certificates.server_certificate(connect_host)?;
         let mut ssl = Ssl::new(self.acceptor.context()).context("creating inbound TLS session")?;
         ssl.set_certificate(&default_certificate.certificate)?;
