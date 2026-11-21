@@ -58,6 +58,9 @@ when their files change (polled every two seconds). New requests use the updated
 the upstream connection pools are invalidated; changing the listening port or DNS upstream list
 still requires a restart.
 
+Logs are written to stdout and to non-blocking daily files under `./logs`; the file appender
+rotates by UTC date and retains up to 14 files.
+
 The core parity and remaining-work checklist is maintained in [docs/CORE_PARITY.md](docs/CORE_PARITY.md).
 The current source updates have not yet been built or tested with Cargo; see that checklist for the
 required Linux validation commands.
