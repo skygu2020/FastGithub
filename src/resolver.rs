@@ -37,6 +37,7 @@ pub struct DomainResolver {
     flow: FlowAnalyzer,
     endpoints: Arc<RwLock<HashMap<EndpointRecord, EndpointState>>>,
     failed_ips: Arc<RwLock<HashMap<IpAddr, Instant>>>,
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl DomainResolver {
@@ -80,6 +81,7 @@ impl DomainResolver {
             flow: FlowAnalyzer::default(),
             endpoints: Arc::new(RwLock::new(endpoints)),
             failed_ips: Arc::new(RwLock::new(HashMap::new())),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -191,6 +193,7 @@ impl DomainResolver {
     /// Force a full refresh: invalidate DNS/probe caches, update online hosts,
     /// then re-resolve and benchmark every known endpoint.
     pub async fn refresh_all(&self) -> Result<HostsRefreshResult> {
+        let _refresh_guard = self.refresh_lock.lock().await;
         self.dns.clear_cache().await;
         self.addresses.clear_cache().await;
         let hosts = self.hosts.refresh().await;
