@@ -192,6 +192,7 @@ pub async fn run(config: AppConfig, config_path: PathBuf, upstreams: Vec<SocketA
     let config_task = tokio::spawn(async move {
         watch_config_file(config_path, watch_tls_proxy).await;
     });
+    let mut parent_exit_task = tokio::spawn(wait_for_parent_exit(parent_pid));
     let listener = TcpListener::bind(("127.0.0.1", port)).await
         .with_context(|| format!("binding HTTP proxy 127.0.0.1:{port}"))?;
     tracing::info!(address = %listener.local_addr()?, "HTTP CONNECT proxy listening");
@@ -213,7 +214,7 @@ pub async fn run(config: AppConfig, config_path: PathBuf, upstreams: Vec<SocketA
                 tracing::info!("HTTP proxy shutting down");
                 break;
             }
-            _ = wait_for_parent_exit(parent_pid) => {
+            _ = &mut parent_exit_task => {
                 tracing::info!(parent_pid, "parent process exited; stopping HTTP proxy");
                 break;
             }
@@ -221,6 +222,7 @@ pub async fn run(config: AppConfig, config_path: PathBuf, upstreams: Vec<SocketA
     }
     refresh_task.abort();
     config_task.abort();
+    parent_exit_task.abort();
     Ok(())
 }
 
