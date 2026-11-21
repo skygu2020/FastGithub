@@ -824,8 +824,9 @@ mod tests {
         let resolver = DomainResolver::new(
             DnsClient::new(Vec::new()),
             Persistence::new(std::env::temp_dir().join(format!(
-                "fastgithub-pool-test-{}.json",
-                std::process::id()
+                "fastgithub-pool-test-{}-{}.json",
+                std::process::id(),
+                address.port()
             ))),
         ).await.unwrap();
         let connector = UpstreamConnector {
