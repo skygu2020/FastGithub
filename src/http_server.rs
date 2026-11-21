@@ -1859,6 +1859,83 @@ mod header_tests {
     }
 
     #[tokio::test]
+    async fn http2_upstream_disconnect_during_upload_releases_driver() {
+        use super::{client_http2, server_http2, TokioExecutor, UpstreamConnectionGuard};
+        use bytes::Bytes;
+        use http::{Request, Response, Version};
+        use http_body::Frame;
+        use hyper::{body::Incoming, service::service_fn};
+        use hyper_util::rt::TokioIo;
+        use std::{convert::Infallible, pin::Pin, task::{Context, Poll}};
+        use tokio::{net::TcpListener, sync::oneshot};
+
+        struct PendingUpload;
+        impl http_body::Body for PendingUpload {
+            type Data = Bytes;
+            type Error = Infallible;
+
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                Poll::Pending
+            }
+
+            fn is_end_stream(&self) -> bool { false }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_seen_tx, request_seen_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let request_seen_tx = std::sync::Mutex::new(Some(request_seen_tx));
+            let service = service_fn(move |_request: Request<Incoming>| {
+                if let Some(sender) = request_seen_tx.lock().unwrap().take() {
+                    let _ = sender.send(());
+                }
+                async move {
+                    std::future::pending::<()>().await;
+                    #[allow(unreachable_code)]
+                    Ok::<_, Infallible>(Response::new(http_body_util::Full::new(Bytes::new())))
+                }
+            });
+            let _ = server_http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) =
+            client_http2::handshake(TokioExecutor::new(), TokioIo::new(stream)).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await });
+        let guard = UpstreamConnectionGuard(driver.abort_handle());
+        let request = Request::builder()
+            .method(http::Method::POST)
+            .version(Version::HTTP_2)
+            .uri("https://localhost/upload")
+            .body(PendingUpload)
+            .unwrap();
+
+        let send = tokio::spawn(async move { sender.send_request(request).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), request_seen_rx)
+            .await.expect("upstream must receive request headers").unwrap();
+        // Simulate the upstream process disappearing before it can consume
+        // the pending upload stream or send response headers.
+        server.abort();
+        let _ = server.await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), send)
+            .await.expect("upstream disconnect must wake send_request").unwrap();
+        assert!(result.is_err(), "upstream disconnect must fail the HTTP/2 request");
+        drop(guard);
+        match tokio::time::timeout(std::time::Duration::from_secs(2), driver).await.unwrap() {
+            Err(error) if error.is_cancelled() => {}
+            Ok(Err(_)) => {}
+            other => panic!("unexpected HTTP/2 upstream driver completion: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn http2_request_timeout_during_upload_aborts_upstream_driver() {
         use super::{client_http2, server_http2, TokioExecutor, UpstreamConnectionGuard};
         use bytes::Bytes;
