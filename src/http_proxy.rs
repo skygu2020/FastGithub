@@ -92,6 +92,12 @@ impl AsyncWrite for ConnectedUpstreamIo {
 
 impl Connection for ConnectedUpstreamIo {
     fn connected(&self) -> Connected {
+        tracing::debug!(
+            %self.peer_ip,
+            connection_id = self.connection_id,
+            http2 = self.http2,
+            "upstream connection metadata supplied to Hyper"
+        );
         let connected = Connected::new();
         if self.http2 { connected.negotiated_h2() } else { connected }
     }
