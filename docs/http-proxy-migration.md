@@ -67,3 +67,41 @@
 ## 历史说明
 
 早期迁移阶段曾只有 Response 短路分支，普通 HTTP 未匹配请求返回 501，CONNECT TLS 仅作字节隧道。该状态已经过时，不应作为当前分支功能描述。
+
+## GitHub 多 IP 无响应排查与 C# 对照（2026-11-21）
+
+### 现场测试结果
+
+对 `github.com:443` 使用 `curl --resolve` 固定目标 IP，并分别测试 HTTP/1.1 与 HTTP/2：
+
+| IP | HTTP/1.1 | HTTP/2 | 观察到的阶段 |
+|---|---|---|---|
+| `20.27.177.113` | TCP connect 超时（5 秒） | TCP connect 超时（5 秒） | 尚未进入 TLS |
+| `140.82.114.4` | HTTP 200 | HTTP 200 | TCP、TLS、HTTP 均成功 |
+| `140.82.116.3` | TLS 成功，请求发出后 10 秒无响应 | TLS 成功，请求发出后 10 秒无响应 | HTTP 响应阶段无响应 |
+
+同一批 IP 在不同时间的结果并不稳定：此前 `20.27.177.113` 曾返回 HTTP/2 200，之后又出现 TCP 超时。因此不能把单次失败永久解释为该 IP 不可用。
+
+### 与 C# 原版的实现对照
+
+- C# `FastGithub.DomainResolve/IPAddressService.cs` 的 `GetAddressElapsedAsync` 只测 TCP connect 延迟，按连接耗时排序；缓存成功延迟 5 分钟，失败结果按本机网络错误或普通错误分别缓存 1 分钟或 5 分钟。
+- C# `FastGithub.Http/HttpClientHandler.cs` 的 `ConnectCallback` 按候选 IP 逐个尝试，每个 TCP connect 最多 10 秒；HTTPS 的 `ConnectAsync` 还会完成 TLS 握手和证书验证。TCP/TLS 连接失败会继续下一个 IP。
+- C# 一旦 TCP/TLS 连接成功，就把连接交给 `SocketsHttpHandler` 发送 HTTP 请求。原版没有在请求已经发出、但等待响应头超时时，自动重建请求并切换到另一个 IP 的通用逻辑。
+- Rust 的 `AddressService` 比 C# 的预探测更严格：预探测阶段完成 TCP + TLS 握手；真实请求阶段的 `connect_target_excluding` 也会逐个尝试 TCP，`UpstreamConnector` 在 TLS 握手失败时继续下一个候选，并对失败 IP 做 90 秒熔断。
+- Rust 的 `send_pooled_request` 在 Hyper 请求明确返回错误时会记录错误并淘汰该域名的连接池条目；但它不会把已发送的请求自动转发到另一个 IP。外层请求超时会取消转发 future，不能假定取消等价于收到一个可安全重放的请求错误。
+
+### 当前结论
+
+1. 这次现场结果不是 HTTP/2 独有故障：`140.82.116.3` 在 HTTP/1.1 和 HTTP/2 下都能完成 TLS、发送请求，但都没有收到响应；`140.82.114.4` 两种协议均正常。
+2. 只做 TCP 或 TLS 健康探测无法识别“握手成功、HTTP 请求无响应”的节点。Rust 的 TLS 预探测比 C# 更严格，但仍不能证明 HTTP 应用层可用。
+3. 不能把所有请求超时都直接记为 IP 故障：连接池可能复用 HTTP/2 多路复用连接，一个连接承载多个请求；而 POST 等非幂等请求在请求体已经发送后也不能盲目重放。
+4. 因此当前不实现无条件的请求级换 IP 重试，也不禁用 HTTP/2。后续如增强应用层健康度，必须先能把具体请求关联到实际上游连接/IP，并区分可重放方法、请求体是否可重放、响应是否已经开始，以及 HTTP/2 共享连接上的并发请求。
+5. DNSCrypt / fallback DNS 查询超时是另一条独立问题。持久化候选、hosts 映射和内置 seed 可能仍提供 IP，因此“刷新成功”不代表 DNS 上游查询本身正常。
+
+### 后续工作方向
+
+- 保留当前 TCP/TLS 失败时的候选 IP 故障转移行为。
+- 继续检查 Hyper 上游连接池在连接驱动报错、请求取消和响应体中断时的生命周期；特别注意 HTTP/2 多路复用，不能因单个 stream 超时而误杀其他正常 stream。
+- 若实现请求级故障转移，先限定为可安全重放且请求体可重建的请求，并以实际连接 IP 为故障记录依据；不对任意 POST/上传请求自动重放。
+- 需要在用户环境验证真实代理链路，不能用直连 curl 的结果替代代理端到端测试。
+
