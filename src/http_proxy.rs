@@ -23,7 +23,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
-    net::{lookup_host, TcpListener, TcpStream},
+    net::{TcpListener, TcpStream},
     time::timeout,
 };
 use tower_service::Service;
@@ -185,7 +185,6 @@ pub(crate) fn negotiated_http2(selected_alpn: Option<&[u8]>) -> bool {
     selected_alpn == Some(&b"h2"[..])
 }
 
-const SYSTEM_DNS_TIMEOUT: Duration = Duration::from_secs(10);
 const BAD_REQUEST_RESPONSE: &[u8] = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
 
 pub async fn run(config: AppConfig, config_path: PathBuf, upstreams: Vec<SocketAddr>, certificates: Arc<CertificateService>) -> Result<()> {
@@ -768,10 +767,14 @@ pub(crate) async fn connect_target_excluding(
             Err(error) => return Err(error).with_context(|| format!("resolving configured domain {host}")),
         }
     } else {
-        addresses.extend(timeout(SYSTEM_DNS_TIMEOUT, lookup_host((host, port))).await
-            .with_context(|| format!("system DNS lookup for {host} timed out"))?
-            .with_context(|| format!("system DNS lookup for {host}"))?
-            .map(|endpoint| endpoint.ip()));
+        // Never consult the operating system resolver here. Its nameserver list
+        // may be supplied by an untrusted network (DHCP/VPN/NetworkManager) and
+        // can return poisoned answers. All hostnames must use FastGithub's
+        // explicitly configured DNS upstreams through DomainResolver.
+        addresses.extend(
+            resolver.resolve(host, port).await
+                .with_context(|| format!("resolving upstream domain {host} via configured DNS"))?
+        );
     }
 
     tracing::debug!(
