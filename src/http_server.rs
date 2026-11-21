@@ -1421,7 +1421,7 @@ mod header_tests {
         use hyper::{service::service_fn, server::conn::http1 as server_http1};
         use hyper_util::rt::TokioIo;
         use std::convert::Infallible;
-        use tokio::{io::AsyncWriteExt, net::TcpListener, time::{timeout, Duration}};
+        use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener, time::{timeout, Duration}};
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
