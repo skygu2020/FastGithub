@@ -229,7 +229,7 @@ async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppCo
         match request.uri().authority() {
             Some(authority) => {
                 let path = request.uri().path_and_query().map(|value| value.as_str()).unwrap_or("/");
-                format!("{scheme}://{authority}{path}")
+                if path == "*" { "*".to_owned() } else { format!("{scheme}://{authority}{path}") }
             }
             None => request.uri().to_string(),
         }
@@ -354,7 +354,7 @@ async fn forward_request(
     let connection_guard = UpstreamConnectionGuard(connection_task.abort_handle());
 
     let (mut parts, body) = request.into_parts();
-    parts.uri = format!("{}://{}{}", uri.scheme(), host_authority(&uri), request_target).parse()
+    parts.uri = build_upstream_request_uri(&uri, &request_target)
         .context("building upstream request URI")?;
     strip_hop_by_hop_headers(&mut parts.headers);
     append_fastgithub_user_agent(&mut parts.headers)?;
@@ -410,7 +410,7 @@ async fn forward_request_http2(
 
     let (mut parts, body) = request.into_parts();
     let host = uri.host_str().context("upstream HTTP/2 URI has no host")?;
-    parts.uri = format!("{}://{}{}", uri.scheme(), host_authority(&uri), request_target).parse()
+    parts.uri = build_upstream_request_uri(&uri, &request_target)
         .context("building upstream HTTP/2 request URI")?;
     parts.version = http::Version::HTTP_2;
     strip_hop_by_hop_headers(&mut parts.headers);
@@ -666,6 +666,15 @@ fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
     ] {
         headers.remove(name);
     }
+}
+
+fn build_upstream_request_uri(uri: &url::Url, request_target: &str) -> anyhow::Result<http::Uri> {
+    http::Uri::builder()
+        .scheme(uri.scheme())
+        .authority(host_authority(uri))
+        .path_and_query(request_target)
+        .build()
+        .context("invalid upstream request target")
 }
 
 fn host_header(uri: &url::Url) -> String {
@@ -1296,6 +1305,18 @@ mod header_tests {
         let guard = super::UpstreamConnectionGuard(task.abort_handle());
         drop(guard);
         assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[test]
+    fn upstream_request_uri_preserves_asterisk_form() {
+        let uri = url::Url::parse("https://example.test/").unwrap();
+        let upstream = super::build_upstream_request_uri(&uri, "*").unwrap();
+        assert_eq!(upstream.scheme_str(), Some("https"));
+        assert_eq!(upstream.authority().unwrap().as_str(), "example.test");
+        assert_eq!(upstream.path_and_query().unwrap().as_str(), "*");
+
+        let upstream = super::build_upstream_request_uri(&uri, "/path?q=1").unwrap();
+        assert_eq!(upstream.path_and_query().unwrap().as_str(), "/path?q=1");
     }
 
     #[test]
