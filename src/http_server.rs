@@ -26,13 +26,13 @@ type ResponseBody = UnsyncBoxBody<Bytes, BoxError>;
 
 
 /// Count bytes crossing the accepted client connection, including HTTP headers and frames.
-struct CountingIo<S> {
+pub(crate) struct CountingIo<S> {
     inner: S,
     flow: FlowAnalyzer,
 }
 
 impl<S> CountingIo<S> {
-    fn new(inner: S, flow: FlowAnalyzer) -> Self {
+    pub(crate) fn new(inner: S, flow: FlowAnalyzer) -> Self {
         Self { inner, flow }
     }
 }
