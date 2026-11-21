@@ -154,6 +154,15 @@ pub async fn run(config: AppConfig, config_path: PathBuf, upstreams: Vec<SocketA
     let parent_pid = unsafe { libc::getppid() as u32 };
     let port = config.fast_github.http_proxy_port;
     let resolver = DomainResolver::new(DnsClient::new(upstreams), Persistence::new("dnsendpoints.json")).await?;
+    let config = Arc::new(ArcSwap::from_pointee(config));
+    let tls_proxy = Arc::new(TlsProxy::new(
+        certificates,
+        resolver.clone(),
+        Arc::clone(&config),
+    )?);
+    let listener = TcpListener::bind(("127.0.0.1", port)).await
+        .with_context(|| format!("binding HTTP proxy 127.0.0.1:{port}"))?;
+    tracing::info!(address = %listener.local_addr()?, "HTTP CONNECT proxy listening");
     let refresh_resolver = resolver.clone();
     let refresh_task = tokio::spawn(async move {
         // Refresh hosts once at startup, then periodically refresh all known endpoints.
@@ -182,20 +191,11 @@ pub async fn run(config: AppConfig, config_path: PathBuf, upstreams: Vec<SocketA
             }
         }
     });
-    let config = Arc::new(ArcSwap::from_pointee(config));
-    let tls_proxy = Arc::new(TlsProxy::new(
-        certificates,
-        resolver.clone(),
-        Arc::clone(&config),
-    )?);
     let watch_tls_proxy = Arc::clone(&tls_proxy);
     let config_task = tokio::spawn(async move {
         watch_config_file(config_path, watch_tls_proxy).await;
     });
     let mut parent_exit_task = tokio::spawn(wait_for_parent_exit(parent_pid));
-    let listener = TcpListener::bind(("127.0.0.1", port)).await
-        .with_context(|| format!("binding HTTP proxy 127.0.0.1:{port}"))?;
-    tracing::info!(address = %listener.local_addr()?, "HTTP CONNECT proxy listening");
     loop {
         tokio::select! {
             accepted = listener.accept() => {
