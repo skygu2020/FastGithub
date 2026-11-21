@@ -1917,7 +1917,7 @@ mod header_tests {
             .body(PendingUpload)
             .unwrap();
 
-        let send = tokio::spawn(async move { sender.send_request(request).await });
+        let send = tokio::spawn(async move {\n            tokio::time::timeout(\n                std::time::Duration::from_millis(100),\n                sender.send_request(request),\n            ).await\n        });
         tokio::time::timeout(std::time::Duration::from_secs(2), request_seen_rx)
             .await.expect("upstream must receive request headers").unwrap();
         // Model the request-scoped timeout firing while the upload body remains
