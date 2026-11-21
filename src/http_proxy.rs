@@ -111,7 +111,7 @@ impl UpstreamConnector {
                 match connect_upstream_tls(&self.tls_connector, stream, host, ip, rule, true).await {
                     Ok((tls, http2)) => (Box::new(tls), http2),
                     Err(error) => {
-                        self.resolver.report_failure(ip).await;
+                        self.resolver.report_failure(host, port, ip).await;
                         return Err(error);
                     }
                 }
@@ -672,7 +672,7 @@ pub(crate) async fn connect_target(
                 return Ok((stream, ip));
             }
             Ok(Err(error)) => {
-                resolver.report_failure(ip).await;
+                resolver.report_failure(host, port, ip).await;
                 failures.push(format!("{endpoint}: {error}"));
             }
             Err(_) => {
