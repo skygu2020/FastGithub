@@ -319,9 +319,19 @@ pub(crate) async fn connect_target(
     for ip in unique_addresses {
         let endpoint = SocketAddr::new(ip, port);
         match timeout(connect_timeout, TcpStream::connect(endpoint)).await {
-            Ok(Ok(stream)) => { stream.set_nodelay(true)?; return Ok((stream, ip)); }
-            Ok(Err(error)) => failures.push(format!("{endpoint}: {error}")),
-            Err(_) => failures.push(format!("{endpoint}: connection timed out")),
+            Ok(Ok(stream)) => {
+                stream.set_nodelay(true)?;
+                resolver.report_success(host, port, ip).await;
+                return Ok((stream, ip));
+            }
+            Ok(Err(error)) => {
+                resolver.report_failure(ip).await;
+                failures.push(format!("{endpoint}: {error}"));
+            }
+            Err(_) => {
+                resolver.report_failure(ip).await;
+                failures.push(format!("{endpoint}: connection timed out"));
+            }
         }
     }
     bail!("all connection attempts failed: {}", failures.join("; "))
