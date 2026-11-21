@@ -1970,9 +1970,7 @@ mod header_tests {
                     let _ = sender.send(());
                 }
                 async move {
-                    std::future::pending::<()>().await;
-                    #[allow(unreachable_code)]
-                    Ok::<_, Infallible>(Response::new(http_body_util::Full::new(Bytes::new())))
+                    std::future::pending::<Result<Response<http_body_util::Full<Bytes>>, Infallible>>().await
                 }
             });
             let _ = server_http2::Builder::new(TokioExecutor::new())
