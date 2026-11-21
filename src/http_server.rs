@@ -10,7 +10,7 @@ use http::{header, HeaderMap, HeaderName, HeaderValue, Method, Response, StatusC
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::{
     body::Incoming,
-    client::conn::http1 as client_http1,
+    client::conn::{http1 as client_http1, http2 as client_http2},
     server::conn::{http1, http2 as server_http2},
     service::service_fn,
     Request,
