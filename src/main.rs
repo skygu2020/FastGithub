@@ -13,7 +13,6 @@ mod destination;
 mod persistence;
 mod prefixed_io;
 mod resolver;
-mod service;
 mod tls;
 
 use anyhow::{Context, Result};
@@ -38,10 +37,6 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Install and enable the systemd unit.
-    Start,
-    /// Stop, disable, and remove the systemd unit.
-    Stop,
     /// Print the effective Linux configuration.
     Check,
     /// Create or load the local CA and print its file paths.
@@ -94,12 +89,9 @@ async fn main() -> Result<()> {
         .with_target(false).init();
 
     let cli = Cli::parse();
-    let executable = std::env::current_exe()?;
     let config_path = cli.config.unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("appsettings.json"));
 
     match cli.command {
-        Some(Command::Start) => service::install_and_start(&executable).await?,
-        Some(Command::Stop) => service::stop_and_remove(&executable).await?,
         Some(Command::Resolve { endpoint }) => {
             let config = config::AppConfig::load(&config_path)?;
             let (host, port) = endpoint.rsplit_once(':').context("endpoint must be host:port")?;
