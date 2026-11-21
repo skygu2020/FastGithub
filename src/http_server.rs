@@ -329,8 +329,11 @@ async fn handle_request(
     let authority = request.uri().authority().map(|value| value.as_str()).unwrap_or("");
     let host = request_host(&request);
     let path = request.uri().path();
-    let target = format!("{authority}{path}");
+    let query = request.uri().query().map(|value| format!("?{value}")).unwrap_or_default();
+    let target = format!("{authority}{path}{query}");
+    let version = request.version();
     let started = tokio::time::Instant::now();
+    tracing::debug!(%method, %host, %target, ?version, "HTTP request received");
     let response = handle_request_inner(request, scheme, &config, resolver, &domains, tls_proxy).await;
     let status = response.status();
     if status.is_client_error() || status.is_server_error() {
