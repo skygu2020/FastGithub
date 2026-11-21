@@ -291,7 +291,7 @@ impl DomainResolver {
         );
     }
 
-    /// Mark an IP as failed for 90 seconds and remove it from current candidate lists.
+    /// Mark an IP as failed for this host/port for 90 seconds and remove it from that endpoint's candidates.
     pub async fn report_failure(&self, host: &str, port: u16, address: IpAddr) {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
         self.failed_ips.write().await.insert(
