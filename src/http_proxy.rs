@@ -44,6 +44,10 @@ struct UpstreamClientEntry {
     identity: Arc<()>,
 }
 
+fn pool_entry_matches_request(entry_identity: &Arc<()>, request_identity: &Arc<()>) -> bool {
+    Arc::ptr_eq(entry_identity, request_identity)
+}
+
 trait ProxyIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> ProxyIo for T {}
 
@@ -570,7 +574,7 @@ impl TlsProxy {
             match self.upstream_clients.lock() {
                 Ok(mut clients) => {
                     let is_current = clients.get(&key)
-                        .is_some_and(|entry| Arc::ptr_eq(&entry.identity, &pool_identity));
+                        .is_some_and(|entry| pool_entry_matches_request(&entry.identity, &pool_identity));
                     if is_current {
                         clients.remove(&key);
                         tracing::debug!(%key, "invalidated failed upstream connection pool");
@@ -873,8 +877,8 @@ mod tests {
     fn failed_old_pool_entry_does_not_match_replacement_identity() {
         let old_identity = Arc::new(());
         let replacement_identity = Arc::new(());
-        assert!(!Arc::ptr_eq(&old_identity, &replacement_identity));
-        assert!(Arc::ptr_eq(&old_identity, &Arc::clone(&old_identity)));
+        assert!(!pool_entry_matches_request(&replacement_identity, &old_identity));
+        assert!(pool_entry_matches_request(&old_identity, &old_identity));
     }
     use hyper::service::service_fn;
     use http_body_util::Full;
