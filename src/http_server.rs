@@ -1,4 +1,9 @@
-use crate::{config::AppConfig, http_route::{route_request, RouteDecision}, resolver::DomainResolver};
+use crate::{
+    config::AppConfig,
+    flow::{FlowAnalyzer, FlowDirection},
+    http_route::{route_request, RouteDecision},
+    resolver::DomainResolver,
+};
 use bytes::Bytes;
 use http::{header, HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode};
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
@@ -26,6 +31,7 @@ struct TimeoutBody<B> {
     inner: Pin<Box<B>>,
     sleep: Option<Pin<Box<Sleep>>>,
     connection: Option<UpstreamConnectionGuard>,
+    flow: Option<FlowAnalyzer>,
     terminated: bool,
 }
 
@@ -41,10 +47,20 @@ impl Drop for UpstreamConnectionGuard {
 
 impl<B> TimeoutBody<B> {
     fn new(inner: B, duration: Option<Duration>, connection: UpstreamConnectionGuard) -> Self {
+        Self::with_flow(inner, duration, connection, None)
+    }
+
+    fn with_flow(
+        inner: B,
+        duration: Option<Duration>,
+        connection: UpstreamConnectionGuard,
+        flow: Option<FlowAnalyzer>,
+    ) -> Self {
         Self {
             inner: Box::pin(inner),
             sleep: duration.map(|duration| Box::pin(tokio::time::sleep(duration))),
             connection: Some(connection),
+            flow,
             terminated: false,
         }
     }
@@ -76,6 +92,12 @@ where
             )))));
         }
         match this.inner.as_mut().poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let (Some(flow), Some(data)) = (this.flow.as_ref(), frame.data_ref()) {
+                    flow.record(FlowDirection::Write, data.len());
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
             Poll::Ready(None) => {
                 this.terminated = true;
                 // The response is fully consumed. Do not leave an idle upstream
@@ -98,6 +120,55 @@ where
 
     fn size_hint(&self) -> http_body::SizeHint {
         if self.terminated { http_body::SizeHint::with_exact(0) } else { self.inner.as_ref().get_ref().size_hint() }
+    }
+}
+
+/// Count request-body bytes as Hyper consumes the downstream upload stream.
+struct CountingBody<B> {
+    inner: Pin<Box<B>>,
+    flow: FlowAnalyzer,
+    direction: FlowDirection,
+}
+
+impl<B> CountingBody<B> {
+    fn new(inner: B, flow: FlowAnalyzer, direction: FlowDirection) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            flow,
+            direction,
+        }
+    }
+}
+
+impl<B> http_body::Body for CountingBody<B>
+where
+    B: http_body::Body<Data = Bytes>,
+{
+    type Data = Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.flow.record(this.direction, data.len());
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.as_ref().get_ref().is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.as_ref().get_ref().size_hint()
     }
 }
 
@@ -398,7 +469,7 @@ async fn forward_request(
     };
     if upstream_http2 {
         return forward_request_http2(
-            request, uri, request_target, original_host, downstream_version, body_timeout, request_started, io,
+            request, uri, request_target, original_host, downstream_version, body_timeout, request_started, resolver.flow_analyzer(), io,
         ).await;
     }
     let (mut sender, connection) = client_http1::handshake(TokioIo::new(io)).await?;
@@ -422,7 +493,8 @@ async fn forward_request(
     let expect_continue = should_gate_expect_continue(&parts.headers, &body);
     let (continue_tx, continue_rx) = oneshot::channel();
     let gated_body = ExpectContinueBody::new(body, expect_continue.then_some(continue_rx));
-    let mut upstream_request = Request::from_parts(parts, gated_body);
+    let counted_body = CountingBody::new(gated_body, resolver.flow_analyzer(), FlowDirection::Read);
+    let mut upstream_request = Request::from_parts(parts, counted_body);
     if expect_continue {
         // Hyper's client polls the body after writing request headers. Gate it
         // until the upstream's actual 100 arrives. Polling Incoming only after
@@ -443,7 +515,7 @@ async fn forward_request(
     response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
     let boxed_body = response_body.map_err(|error| Box::new(error) as BoxError).boxed_unsync();
     let remaining = body_timeout.map(|duration| duration.saturating_sub(request_started.elapsed()));
-    let response_body = TimeoutBody::new(boxed_body, remaining, connection_guard).boxed_unsync();
+    let response_body = TimeoutBody::with_flow(boxed_body, remaining, connection_guard, Some(flow)).boxed_unsync();
     Ok(Response::from_parts(response_parts, response_body))
 }
 
@@ -455,6 +527,7 @@ async fn forward_request_http2(
     downstream_version: http::Version,
     body_timeout: Option<Duration>,
     request_started: tokio::time::Instant,
+    flow: FlowAnalyzer,
     io: Box<dyn AsyncIo>,
 ) -> anyhow::Result<Response<ResponseBody>> {
     let (mut sender, connection) =
@@ -480,7 +553,8 @@ async fn forward_request_http2(
     // Hyper's informational callback is currently HTTP/1-only. Keep HTTP/2
     // request bodies flowing rather than gating them on a 100 that we cannot
     // observe through this API.
-    let upstream_request = Request::from_parts(parts, body);
+    let counted_body = CountingBody::new(body, flow.clone(), FlowDirection::Read);
+    let upstream_request = Request::from_parts(parts, counted_body);
     let upstream_response = sender.send_request(upstream_request).await?;
     let (mut response_parts, response_body) = upstream_response.into_parts();
     response_parts.version = downstream_version;
@@ -488,7 +562,12 @@ async fn forward_request_http2(
     response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
     let boxed_body = response_body.map_err(|error| Box::new(error) as BoxError).boxed_unsync();
     let remaining = body_timeout.map(|duration| duration.saturating_sub(request_started.elapsed()));
-    let response_body = TimeoutBody::new(boxed_body, remaining, connection_guard).boxed_unsync();
+    let response_body = TimeoutBody::with_flow(
+        boxed_body,
+        remaining,
+        connection_guard,
+        Some(resolver.flow_analyzer()),
+    ).boxed_unsync();
     Ok(Response::from_parts(response_parts, response_body))
 }
 
@@ -637,7 +716,8 @@ async fn forward_upgrade_request(
     preserve_upgrade_hop_by_hop_headers(&mut parts.headers);
     append_fastgithub_user_agent(&mut parts.headers)?;
     parts.headers.insert(header::HOST, HeaderValue::from_str(&host_header(&uri))?);
-    let upstream_request = Request::from_parts(parts, body);
+    let counted_body = CountingBody::new(body, resolver.flow_analyzer(), FlowDirection::Read);
+    let upstream_request = Request::from_parts(parts, counted_body);
     tracing::debug!(%original_host, upstream = %uri, "forwarding HTTP protocol upgrade");
 
     let mut upstream_response = sender.send_request(upstream_request).await?;
@@ -647,7 +727,12 @@ async fn forward_upgrade_request(
         response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
         let boxed_body = response_body.map_err(|error| Box::new(error) as BoxError).boxed_unsync();
         let remaining = body_timeout.map(|duration| duration.saturating_sub(request_started.elapsed()));
-        let response_body = TimeoutBody::new(boxed_body, remaining, connection_guard).boxed_unsync();
+        let response_body = TimeoutBody::with_flow(
+            boxed_body,
+            remaining,
+            connection_guard,
+            Some(resolver.flow_analyzer()),
+        ).boxed_unsync();
         return Ok(Response::from_parts(response_parts, response_body));
     }
 
