@@ -657,6 +657,25 @@ pub(crate) async fn connect_target(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn config_fingerprint_tracks_overlay_files() {
+        let root = std::env::temp_dir().join(format!(
+            "fastgithub-config-watch-test-{}",
+            std::process::id()
+        ));
+        let overlay_dir = root.join("appsettings");
+        std::fs::create_dir_all(&overlay_dir).unwrap();
+        let config_path = root.join("appsettings.json");
+        std::fs::write(&config_path, r#"{"FastGithub":{}}"#).unwrap();
+
+        let before = config_fingerprint(&config_path);
+        std::fs::write(overlay_dir.join("appsettings.dev.json"), "{}").unwrap();
+        let after = config_fingerprint(&config_path);
+        assert_ne!(before, after);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
     use super::*;
     use std::{convert::Infallible, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
     use hyper::service::service_fn;
