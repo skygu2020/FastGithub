@@ -628,6 +628,8 @@ async fn connect_upstream_tls(
     domain_config: Option<&crate::config::DomainConfig>,
     allow_http2: bool,
 ) -> Result<(SslStream<TcpStream>, bool)> {
+    let tls_started = tokio::time::Instant::now();
+    tracing::debug!(host = %upstream_host, %upstream_ip, "starting upstream TLS handshake");
     let configured_sni = domain_config.and_then(|rule| rule.tls_sni_value(upstream_host, upstream_ip));
     let disable_sni = domain_config.is_some_and(|rule| rule.tls_sni != Some(true));
     let ignore_name_mismatch = domain_config.is_some_and(|rule| rule.tls_ignore_name_mismatch == Some(true));
@@ -648,6 +650,13 @@ async fn connect_upstream_tls(
     timeout(CONNECT_TIMEOUT, Pin::new(&mut tls).connect())
         .await.context("upstream TLS handshake timed out")??;
     let http2 = negotiated_http2(tls.ssl().selected_alpn_protocol());
+    tracing::debug!(
+        host = %upstream_host,
+        %upstream_ip,
+        http2,
+        elapsed_ms = tls_started.elapsed().as_millis(),
+        "upstream TLS handshake completed"
+    );
     Ok((tls, http2))
 }
 
@@ -739,6 +748,7 @@ pub(crate) async fn connect_target_excluding(
     // not a TCP dial timeout. Keep connection establishment on its fixed limit;
     // request-scoped cancellation will be applied by the HTTP forwarding layer.
     let connect_timeout = CONNECT_TIMEOUT;
+    let resolve_started = tokio::time::Instant::now();
     let mut addresses = Vec::new();
     if let Ok(ip) = host.parse::<IpAddr>() {
         addresses.push(ip);
@@ -764,6 +774,14 @@ pub(crate) async fn connect_target_excluding(
             .map(|endpoint| endpoint.ip()));
     }
 
+    tracing::debug!(
+        %host,
+        port,
+        candidate_count = addresses.len(),
+        candidates = ?addresses,
+        elapsed_ms = resolve_started.elapsed().as_millis(),
+        "upstream address candidates resolved"
+    );
     let mut unique_addresses = Vec::with_capacity(addresses.len());
     for ip in addresses {
         if !excluded.contains(&ip) && !unique_addresses.contains(&ip) {
@@ -775,17 +793,38 @@ pub(crate) async fn connect_target_excluding(
     let mut failures = Vec::new();
     for ip in unique_addresses {
         let endpoint = SocketAddr::new(ip, port);
+        let tcp_started = tokio::time::Instant::now();
+        tracing::debug!(%host, %endpoint, "starting upstream TCP connection");
         match timeout(connect_timeout, TcpStream::connect(endpoint)).await {
             Ok(Ok(stream)) => {
+                tracing::debug!(
+                    %host,
+                    %endpoint,
+                    elapsed_ms = tcp_started.elapsed().as_millis(),
+                    "upstream TCP connection established"
+                );
                 stream.set_nodelay(true)?;
                 resolver.report_success(host, port, ip).await;
                 return Ok((stream, ip));
             }
             Ok(Err(error)) => {
+                tracing::warn!(
+                    %host,
+                    %endpoint,
+                    %error,
+                    elapsed_ms = tcp_started.elapsed().as_millis(),
+                    "upstream TCP connection failed"
+                );
                 resolver.report_failure(host, port, ip).await;
                 failures.push(format!("{endpoint}: {error}"));
             }
             Err(_) => {
+                tracing::warn!(
+                    %host,
+                    %endpoint,
+                    elapsed_ms = tcp_started.elapsed().as_millis(),
+                    "upstream TCP connection timed out"
+                );
                 resolver.report_failure(host, port, ip).await;
                 failures.push(format!("{endpoint}: connection timed out"));
             }
