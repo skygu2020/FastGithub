@@ -1563,6 +1563,77 @@ mod header_tests {
     }
 
     #[tokio::test]
+    async fn hyper_http2_early_response_does_not_wait_for_request_body_completion() {
+        use super::{client_http2, server_http2, TokioExecutor};
+        use bytes::Bytes;
+        use http::{Request, Response, StatusCode, Version};
+        use http_body::Frame;
+        use http_body_util::BodyExt;
+        use hyper::{body::Incoming, service::service_fn};
+        use hyper_util::rt::TokioIo;
+        use std::{convert::Infallible, pin::Pin, task::{Context, Poll}};
+        use tokio::net::TcpListener;
+
+        struct PendingBody;
+        impl http_body::Body for PendingBody {
+            type Data = Bytes;
+            type Error = Infallible;
+
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                Poll::Pending
+            }
+
+            fn is_end_stream(&self) -> bool { false }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = service_fn(|_request: Request<Incoming>| async move {
+                // Deliberately reject without polling the request body.
+                Ok::<_, Infallible>(Response::builder()
+                    .status(StatusCode::PAYLOAD_TOO_LARGE)
+                    .body(http_body_util::Full::new(Bytes::from_static(b"too large")))
+                    .unwrap())
+            });
+            server_http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) =
+            client_http2::handshake(TokioExecutor::new(), TokioIo::new(stream)).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await });
+        let request = Request::builder()
+            .method(http::Method::POST)
+            .version(Version::HTTP_2)
+            .uri("https://localhost/upload")
+            .body(PendingBody)
+            .unwrap();
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            sender.send_request(request),
+        ).await.expect("early HTTP/2 response must not wait for request body EOF").unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"too large"),
+        );
+
+        drop(sender);
+        driver.abort();
+        let _ = driver.await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn hyper_http2_streams_progress_independently() {
         use super::{client_http2, server_http2, TokioExecutor};
         use bytes::Bytes;
