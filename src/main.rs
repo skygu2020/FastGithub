@@ -4,6 +4,7 @@ mod cert;
 mod dns;
 mod dnscrypt;
 mod http_proxy;
+mod hosts;
 mod http_response;
 mod http_server;
 mod http_route;
