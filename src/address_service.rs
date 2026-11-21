@@ -146,24 +146,32 @@ impl AddressService {
         })
         .await;
 
-        let elapsed = match result {
-            Ok(Ok(())) => Some(started.elapsed()),
+        let (elapsed, failure_ttl) = match result {
+            Ok(Ok(())) => (Some(started.elapsed()), GOOD_LATENCY_TTL),
             Ok(Err(error)) => {
                 tracing::debug!(%host, %endpoint, %error, "DNS candidate TLS probe failed");
-                None
+                let local_network_problem = error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(is_local_network_problem);
+                (
+                    None,
+                    if local_network_problem {
+                        FAILED_LOCAL_TTL
+                    } else {
+                        GOOD_LATENCY_TTL
+                    },
+                )
             }
             Err(_) => {
                 tracing::debug!(%host, %endpoint, "DNS candidate TCP/TLS probe timed out");
-                None
+                (None, GOOD_LATENCY_TTL)
             }
         };
 
         let ttl = if elapsed.is_some() {
             GOOD_LATENCY_TTL
         } else {
-            // Failed probes are short-lived; request-stage failures have their
-            // own 90-second circuit breaker in the resolver.
-            FAILED_LOCAL_TTL
+            failure_ttl
         };
         self.latency.lock().await.insert(
             key,
