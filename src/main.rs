@@ -213,3 +213,26 @@ async fn main() -> Result<()> {
 fn certificate_directory(config_path: &std::path::Path) -> PathBuf {
     config_path.parent().unwrap_or_else(|| std::path::Path::new(".")).join("certs")
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instance_lock_rejects_second_process_and_releases_on_drop() {
+        let directory = std::env::temp_dir().join(format!(
+            "fastgithub-instance-lock-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("appsettings.json");
+
+        let first = acquire_instance_lock(&config_path).unwrap();
+        assert!(acquire_instance_lock(&config_path).is_err());
+        drop(first);
+        assert!(acquire_instance_lock(&config_path).is_ok());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
