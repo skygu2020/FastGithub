@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -22,6 +22,14 @@ pub struct FlowStatistics {
     pub total_write: u64,
     pub read_rate: f64,
     pub write_rate: f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorStatistic {
+    pub host: String,
+    pub status: u16,
+    pub count: u64,
 }
 
 #[derive(Default)]
@@ -58,6 +66,7 @@ struct FlowState {
     total_write: AtomicU64,
     read_queue: Mutex<FlowQueue>,
     write_queue: Mutex<FlowQueue>,
+    errors: Mutex<BTreeMap<(String, u16), u64>>,
 }
 
 /// Shared transport-flow counters and five-second rolling rates.
@@ -87,6 +96,28 @@ impl FlowAnalyzer {
                 }
             }
         }
+    }
+
+    /// Record HTTP client-visible errors, grouped by normalized host and status.
+    pub fn record_error(&self, host: &str, status: u16) {
+        if status < 400 {
+            return;
+        }
+        if let Ok(mut errors) = self.state.errors.lock() {
+            let key = (host.trim_end_matches('.').to_ascii_lowercase(), status);
+            let count = errors.entry(key).or_insert(0);
+            *count = count.saturating_add(1);
+        }
+    }
+
+    pub fn error_statistics(&self) -> Vec<ErrorStatistic> {
+        self.state.errors.lock().map(|errors| {
+            errors.iter().map(|((host, status), count)| ErrorStatistic {
+                host: host.clone(),
+                status: *status,
+                count: *count,
+            }).collect()
+        }).unwrap_or_default()
     }
 
     pub fn statistics(&self) -> FlowStatistics {
