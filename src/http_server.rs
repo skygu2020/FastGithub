@@ -286,7 +286,7 @@ where
 
 /// Serve decrypted TLS traffic negotiated as HTTP/2. The same request router
 /// and response/body pipeline are shared with the HTTP/1 entry point.
-pub async fn serve_http2<S>(io: S, scheme: &'static str, config: Arc<ArcSwap<AppConfig>>, resolver: DomainResolver, domains: Vec<String>, tls_proxy: Arc<crate::http_proxy::TlsProxy>) -> anyhow::Result<()>
+pub async fn serve_http2<S>(io: S, scheme: &'static str, config: Arc<ArcSwap<AppConfig>>, resolver: DomainResolver, _domains: Vec<String>, tls_proxy: Arc<crate::http_proxy::TlsProxy>) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
