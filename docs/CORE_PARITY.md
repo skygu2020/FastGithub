@@ -37,7 +37,7 @@
 - [x] HTTP 请求完成日志：方法、authority/path、状态码和耗时；5xx 额外记录 warning。
 - [x] 按域名/状态码聚合 HTTP 4xx/5xx 错误计数，提供 `/errorStatistics` 查询接口。
 - [x] `/flowStatistics` 查询接口。
-- [ ] 配置文件热重载，变更后更新规则并清理相关缓存。
+- [x] 配置文件及 `appsettings/appsettings.*.json` overlay 热重载：2 秒轮询检测，成功解析后原子替换配置快照并清空上游连接池。监听端口和 DNS 上游列表仍需重启生效。
 - [ ] 补齐 HTTP/1、HTTP/2 连接池的取消、超时、早期响应和连接失效回收测试（已新增 HTTP/1 顺序复用与 HTTP/2 并发多路复用测试，但尚未执行）。
 
 ## P2：运行观测与生命周期
