@@ -200,11 +200,10 @@ pub async fn run(config: AppConfig, config_path: PathBuf, upstreams: Vec<SocketA
             accepted = listener.accept() => {
                 let (stream, peer) = accepted.context("accepting proxy connection")?;
                 let resolver = resolver.clone();
-                let domains = config.load_full().fast_github.domain_configs.keys().cloned().collect::<Vec<_>>();
                 let tls_proxy = Arc::clone(&tls_proxy);
                 let config = Arc::clone(&config);
                 tokio::spawn(async move {
-                    if let Err(error) = handle_connection(stream, resolver, &domains, config, tls_proxy, peer).await {
+                    if let Err(error) = handle_connection(stream, resolver, config, tls_proxy, peer).await {
                         tracing::debug!(%peer, %error, "proxy connection ended");
                     }
                 });
@@ -292,7 +291,7 @@ async fn watch_config_file(path: PathBuf, tls_proxy: Arc<TlsProxy>) {
     }
 }
 
-async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, domains: &[String], config: Arc<ArcSwap<AppConfig>>, tls_proxy: Arc<TlsProxy>, peer: SocketAddr) -> Result<()> {
+async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, config: Arc<ArcSwap<AppConfig>>, tls_proxy: Arc<TlsProxy>, peer: SocketAddr) -> Result<()> {
     let header = match timeout(HEADER_TIMEOUT, read_header(&mut client)).await {
         Ok(Ok(header)) => header,
         Ok(Err(error)) => return Err(error),
@@ -310,7 +309,7 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, doma
     };
     if !method.eq_ignore_ascii_case("CONNECT") {
         let stream = crate::prefixed_io::PrefixedIo::new(client, header);
-        return crate::http_server::serve(stream, "http", config, resolver, domains.to_vec(), Arc::clone(&tls_proxy)).await
+        return crate::http_server::serve(stream, "http", config, resolver, Vec::new(), Arc::clone(&tls_proxy)).await
             .with_context(|| format!("serving plain HTTP request from {peer}"));
     }
     let (host, port) = match parse_authority(authority) {
@@ -320,6 +319,7 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, doma
             return Err(error);
         }
     };
+    let domains = config.load_full().fast_github.domain_configs.keys().cloned().collect::<Vec<_>>();
     let flow = resolver.flow_analyzer();
     flow.record(crate::flow::FlowDirection::Read, header.len());
     const CONNECT_ESTABLISHED: &[u8] =
@@ -334,14 +334,14 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, doma
     if is_tls {
         // Intercepted TLS requests are routed by the decrypted HTTP Host and
         // configured Destination; the CONNECT authority is not an upstream.
-        tls_proxy.intercept(client, host.as_str(), Arc::clone(&config), resolver.clone(), domains.to_vec(), Arc::clone(&tls_proxy)).await?;
+        tls_proxy.intercept(client, host.as_str(), Arc::clone(&config), resolver.clone(), domains, Arc::clone(&tls_proxy)).await?;
         return Ok(());
     }
 
     // A raw CONNECT tunnel has no HTTP request to route, so connect to its
     // authority only after determining that the client is not starting TLS.
     let config_snapshot = config.load_full();
-    let (mut upstream, _upstream_ip) = connect_target(&host, port, &resolver, domains, &config_snapshot, None)
+    let (mut upstream, _upstream_ip) = connect_target(&host, port, &resolver, &domains, &config_snapshot, None)
         .await.with_context(|| format!("connecting to raw CONNECT target {host}:{port}"))?;
     let mut client = crate::http_server::CountingIo::new(client, resolver.flow_analyzer());
     let (up, down) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
