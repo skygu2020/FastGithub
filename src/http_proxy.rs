@@ -527,10 +527,24 @@ impl TlsProxy {
         original_host: &str,
         request: Request<UpstreamBody>,
     ) -> Result<Response<Incoming>> {
-        self.upstream_client(original_host)?
-            .request(request)
-            .await
-            .context("sending pooled upstream HTTP request")
+        let client = self.upstream_client(original_host)?;
+        let result = client.request(request).await;
+        if result.is_err() {
+            // A failed request may indicate that Hyper reused an upstream
+            // keep-alive/HTTP2 connection which the remote endpoint had
+            // already closed or reset. Retire this host's pool entry so the
+            // next browser request establishes a fresh TCP/TLS connection.
+            let key = original_host.trim_end_matches('.').to_ascii_lowercase();
+            match self.upstream_clients.lock() {
+                Ok(mut clients) => {
+                    clients.remove(&key);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, %key, "could not invalidate failed upstream connection pool");
+                }
+            }
+        }
+        result.context("sending pooled upstream HTTP request")
     }
 
     pub(crate) async fn connect_upstream(
