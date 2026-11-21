@@ -95,7 +95,9 @@ struct UpstreamConnector {
 
 impl UpstreamConnector {
     async fn connect(&self, uri: Uri) -> Result<TokioIo<ConnectedUpstreamIo>> {
+        let connect_started = tokio::time::Instant::now();
         let host = uri.host().context("upstream URI has no hostname")?;
+        tracing::debug!(%host, %uri, "starting upstream transport connection");
         let scheme = uri.scheme_str().unwrap_or("http");
         let port = uri.port_u16().unwrap_or(if scheme == "https" { 443 } else { 80 });
         let config = Arc::clone(&self.config);
@@ -148,6 +150,13 @@ impl UpstreamConnector {
             other => bail!("unsupported upstream URI scheme '{other}'"),
         };
 
+        tracing::debug!(
+            %host,
+            port,
+            http2,
+            elapsed_ms = connect_started.elapsed().as_millis(),
+            "upstream transport connection ready"
+        );
         Ok(TokioIo::new(ConnectedUpstreamIo { inner: io, http2 }))
     }
 }
@@ -528,7 +537,29 @@ impl TlsProxy {
         request: Request<UpstreamBody>,
     ) -> Result<Response<Incoming>> {
         let client = self.upstream_client(original_host)?;
+        let method = request.method().clone();
+        let uri = request.uri().clone();
+        let started = tokio::time::Instant::now();
+        tracing::debug!(%original_host, %method, %uri, "sending request through upstream connection pool");
         let result = client.request(request).await;
+        match &result {
+            Ok(response) => tracing::debug!(
+                %original_host,
+                %method,
+                %uri,
+                status = response.status().as_u16(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "upstream response headers received"
+            ),
+            Err(error) => tracing::warn!(
+                %original_host,
+                %method,
+                %uri,
+                %error,
+                elapsed_ms = started.elapsed().as_millis(),
+                "upstream pooled request failed"
+            ),
+        }
         if result.is_err() {
             // A failed request may indicate that Hyper reused an upstream
             // keep-alive/HTTP2 connection which the remote endpoint had
