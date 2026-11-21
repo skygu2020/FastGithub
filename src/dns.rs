@@ -3,6 +3,7 @@ use std::{collections::HashMap, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}, s
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpStream, UdpSocket}, sync::Mutex, time::{timeout, Instant}};
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(4);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const MIN_TTL: Duration = Duration::from_secs(30);
 const MAX_TTL: Duration = Duration::from_secs(600);
 static NEXT_ID: AtomicU16 = AtomicU16::new(1);
