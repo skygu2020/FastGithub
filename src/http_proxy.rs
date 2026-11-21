@@ -1,13 +1,141 @@
 use crate::{cert::CertificateService, config::AppConfig, dns::DnsClient, persistence::Persistence, resolver::DomainResolver};
 use anyhow::{bail, Context, Result};
+use bytes::Bytes;
+use http::{Request, Response, Uri};
+use http_body_util::combinators::UnsyncBoxBody;
+use hyper::body::Incoming;
+use hyper_util::{
+    client::legacy::{connect::{Connected, Connection}, Client},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
+};
 use openssl::ssl::{AlpnError, NameType, SniError, Ssl, SslAcceptor, SslConnector, SslMethod};
-use std::{net::{IpAddr, SocketAddr}, pin::Pin, sync::Arc, time::Duration};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{lookup_host, TcpListener, TcpStream}, time::timeout};
+use std::{
+    error::Error,
+    future::Future,
+    io,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+    sync::Arc,
+    task::{Context as TaskContext, Poll},
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+    net::{lookup_host, TcpListener, TcpStream},
+    time::timeout,
+};
+use tower_service::Service;
 use tokio_openssl::SslStream;
 
 const HEADER_LIMIT: usize = 16 * 1024;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+type UpstreamError = Box<dyn Error + Send + Sync>;
+type UpstreamBody = UnsyncBoxBody<Bytes, UpstreamError>;
+type UpstreamClient = Client<UpstreamConnector, UpstreamBody>;
+
+trait ProxyIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> ProxyIo for T {}
+
+struct ConnectedUpstreamIo {
+    inner: Box<dyn ProxyIo>,
+    http2: bool,
+}
+
+impl AsyncRead for ConnectedUpstreamIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.get_mut().inner).poll_read(cx, buffer)
+    }
+}
+
+impl AsyncWrite for ConnectedUpstreamIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.get_mut().inner).poll_write(cx, bytes)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+impl Connection for ConnectedUpstreamIo {
+    fn connected(&self) -> Connected {
+        let connected = Connected::new();
+        if self.http2 { connected.negotiated_h2() } else { connected }
+    }
+}
+
+#[derive(Clone)]
+struct UpstreamConnector {
+    resolver: DomainResolver,
+    domains: Arc<Vec<String>>,
+    config: Arc<AppConfig>,
+    tls_connector: Arc<SslConnector>,
+}
+
+impl UpstreamConnector {
+    async fn connect(&self, uri: Uri) -> Result<TokioIo<ConnectedUpstreamIo>> {
+        let host = uri.host().context("upstream URI has no hostname")?;
+        let scheme = uri.scheme_str().unwrap_or("http");
+        let port = uri.port_u16().unwrap_or(if scheme == "https" { 443 } else { 80 });
+        let (stream, ip) = connect_target(
+            host,
+            port,
+            &self.resolver,
+            &self.domains,
+            &self.config,
+            None,
+        ).await?;
+
+        let (io, http2): (Box<dyn ProxyIo>, bool) = match scheme {
+            "http" => (Box::new(stream), false),
+            "https" => {
+                let rule = self.config.domain_config(host);
+                match connect_upstream_tls(&self.tls_connector, stream, host, ip, rule, true).await {
+                    Ok((tls, http2)) => (Box::new(tls), http2),
+                    Err(error) => {
+                        self.resolver.report_failure(ip).await;
+                        return Err(error);
+                    }
+                }
+            }
+            other => bail!("unsupported upstream URI scheme '{other}'"),
+        };
+
+        Ok(TokioIo::new(ConnectedUpstreamIo { inner: io, http2 }))
+    }
+}
+
+impl Service<Uri> for UpstreamConnector {
+    type Response = TokioIo<ConnectedUpstreamIo>;
+    type Error = io::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let connector = self.clone();
+        Box::pin(async move {
+            connector.connect(uri).await.map_err(|error| io::Error::other(error.to_string()))
+        })
+    }
+}
+
 
 /// Only an explicit h2 ALPN selection enables HTTP/2. No ALPN extension,
 /// no overlap, and an explicit http/1.1 selection all use the HTTP/1 path.
@@ -50,8 +178,13 @@ pub async fn run(config: AppConfig, upstreams: Vec<SocketAddr>, certificates: Ar
             }
         }
     });
-    let tls_proxy = Arc::new(TlsProxy::new(certificates)?);
     let config = Arc::new(config);
+    let tls_proxy = Arc::new(TlsProxy::new(
+        certificates,
+        resolver.clone(),
+        Arc::clone(&config),
+        configured_domains.clone(),
+    )?);
     let listener = TcpListener::bind(("127.0.0.1", port)).await
         .with_context(|| format!("binding HTTP proxy 127.0.0.1:{port}"))?;
     tracing::info!(address = %listener.local_addr()?, "HTTP CONNECT proxy listening");
@@ -165,10 +298,16 @@ pub(crate) struct TlsProxy {
     acceptor: SslAcceptor,
     connector: SslConnector,
     certificates: Arc<CertificateService>,
+    upstream_client: UpstreamClient,
 }
 
 impl TlsProxy {
-    fn new(certificates: Arc<CertificateService>) -> Result<Self> {
+    fn new(
+        certificates: Arc<CertificateService>,
+        resolver: DomainResolver,
+        config: Arc<AppConfig>,
+        domains: Vec<String>,
+    ) -> Result<Self> {
         let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls())
             .context("creating inbound TLS acceptor")?;
         acceptor.set_alpn_select_callback(|_, client_protocols| {
@@ -189,7 +328,31 @@ impl TlsProxy {
         let connector = SslConnector::builder(SslMethod::tls())
             .context("creating upstream TLS connector")?
             .build();
-        Ok(Self { acceptor: acceptor.build(), connector, certificates })
+        let upstream_connector = UpstreamConnector {
+            resolver,
+            domains: Arc::new(domains),
+            config,
+            tls_connector: Arc::new(connector.clone()),
+        };
+        let mut client_builder = Client::builder(TokioExecutor::new());
+        client_builder
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_timer(TokioTimer::new())
+            .pool_max_idle_per_host(8);
+        let upstream_client = client_builder.build(upstream_connector);
+        Ok(Self {
+            acceptor: acceptor.build(),
+            connector,
+            certificates,
+            upstream_client,
+        })
+    }
+
+    pub(crate) async fn send_pooled_request(
+        &self,
+        request: Request<UpstreamBody>,
+    ) -> Result<Response<Incoming>> {
+        self.upstream_client.request(request).await.context("sending pooled upstream HTTP request")
     }
 
     pub(crate) async fn connect_upstream(
@@ -200,28 +363,14 @@ impl TlsProxy {
         domain_config: Option<&crate::config::DomainConfig>,
         allow_http2: bool,
     ) -> Result<SslStream<TcpStream>> {
-        let configured_sni = domain_config.and_then(|rule| rule.tls_sni_value(upstream_host, upstream_ip));
-        // A configured DomainConfig defaults TlsSni to false in the .NET
-        // implementation. Unconfigured hosts retain normal TLS SNI behavior.
-        let disable_sni = domain_config.is_some_and(|rule| rule.tls_sni != Some(true));
-        let ignore_name_mismatch = domain_config.is_some_and(|rule| rule.tls_ignore_name_mismatch == Some(true));
-        let mut connect_config = self.connector.configure()?;
-        connect_config.set_use_server_name_indication(!disable_sni);
-        connect_config.set_verify_hostname(!ignore_name_mismatch);
-        let alpn_protocols: &[u8] = if allow_http2 {
-            b"\x02h2\x08http/1.1"
-        } else {
-            b"\x08http/1.1"
-        };
-        connect_config.set_alpn_protos(alpn_protocols)?;
-        let mut ssl = connect_config.into_ssl(upstream_host)?;
-        if let Some(sni) = configured_sni.as_deref() {
-            ssl.set_hostname(sni)?;
-        }
-        let mut tls = SslStream::new(ssl, upstream).context("wrapping upstream TLS stream")?;
-        timeout(CONNECT_TIMEOUT, Pin::new(&mut tls).connect())
-            .await.context("upstream TLS handshake timed out")??;
-        Ok(tls)
+        connect_upstream_tls(
+            &self.connector,
+            upstream,
+            upstream_host,
+            upstream_ip,
+            domain_config,
+            allow_http2,
+        ).await.map(|(tls, _)| tls)
     }
 
     pub(crate) async fn intercept(&self, client: TcpStream, connect_host: &str, config: Arc<AppConfig>, resolver: DomainResolver, domains: Vec<String>, tls_proxy: Arc<TlsProxy>) -> Result<()> {
@@ -241,6 +390,37 @@ impl TlsProxy {
             crate::http_server::serve(client_tls, "https", config, resolver, domains, tls_proxy).await
         }
     }
+}
+
+async fn connect_upstream_tls(
+    connector: &SslConnector,
+    upstream: TcpStream,
+    upstream_host: &str,
+    upstream_ip: IpAddr,
+    domain_config: Option<&crate::config::DomainConfig>,
+    allow_http2: bool,
+) -> Result<(SslStream<TcpStream>, bool)> {
+    let configured_sni = domain_config.and_then(|rule| rule.tls_sni_value(upstream_host, upstream_ip));
+    let disable_sni = domain_config.is_some_and(|rule| rule.tls_sni != Some(true));
+    let ignore_name_mismatch = domain_config.is_some_and(|rule| rule.tls_ignore_name_mismatch == Some(true));
+    let mut connect_config = connector.configure()?;
+    connect_config.set_use_server_name_indication(!disable_sni);
+    connect_config.set_verify_hostname(!ignore_name_mismatch);
+    let alpn_protocols: &[u8] = if allow_http2 {
+        b"\\x02h2\\x08http/1.1"
+    } else {
+        b"\\x08http/1.1"
+    };
+    connect_config.set_alpn_protos(alpn_protocols)?;
+    let mut ssl = connect_config.into_ssl(upstream_host)?;
+    if let Some(sni) = configured_sni.as_deref() {
+        ssl.set_hostname(sni)?;
+    }
+    let mut tls = SslStream::new(ssl, upstream).context("wrapping upstream TLS stream")?;
+    timeout(CONNECT_TIMEOUT, Pin::new(&mut tls).connect())
+        .await.context("upstream TLS handshake timed out")??;
+    let http2 = negotiated_http2(tls.ssl().selected_alpn_protocol());
+    Ok((tls, http2))
 }
 
 async fn read_header(stream: &mut TcpStream) -> Result<Vec<u8>> {
