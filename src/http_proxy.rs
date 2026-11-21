@@ -108,7 +108,12 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, doma
             return Err(error);
         }
     };
-    client.write_all(b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: FastGithub-Rust\r\n\r\n").await?;
+    let flow = resolver.flow_analyzer();
+    flow.record(crate::flow::FlowDirection::Read, header.len());
+    const CONNECT_ESTABLISHED: &[u8] =
+        b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: FastGithub-Rust\r\n\r\n";
+    client.write_all(CONNECT_ESTABLISHED).await?;
+    flow.record(crate::flow::FlowDirection::Write, CONNECT_ESTABLISHED.len());
     tracing::debug!(%peer, %host, port, "HTTP CONNECT tunnel established");
     let is_tls = match timeout(HEADER_TIMEOUT, sniff_tls(&client)).await {
         Ok(result) => result?,
@@ -125,6 +130,7 @@ async fn handle_connection(mut client: TcpStream, resolver: DomainResolver, doma
     // authority only after determining that the client is not starting TLS.
     let (mut upstream, _upstream_ip) = connect_target(&host, port, &resolver, domains, &config, None)
         .await.with_context(|| format!("connecting to raw CONNECT target {host}:{port}"))?;
+    let mut client = crate::http_server::CountingIo::new(client, resolver.flow_analyzer());
     let (up, down) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
     tracing::debug!(%peer, %host, port, client_to_upstream = up, upstream_to_client = down, tls_intercepted = is_tls, "HTTP CONNECT tunnel closed");
     Ok(())
