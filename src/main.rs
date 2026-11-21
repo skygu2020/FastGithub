@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
             let mut upstreams = Vec::new();
             if let Some(proxy) = proxy.as_ref() {
                 match proxy.start().await {
-                    Ok(endpoint) => { upstreams.push(endpoint); upstreams.push(endpoint); }
+                    Ok(endpoint) => { upstreams.push(endpoint); }
                     Err(error) => tracing::warn!(%error, "dnscrypt-proxy unavailable; using fallback DNS"),
                 }
             }
@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
             let mut upstreams = Vec::new();
             if let Some(proxy) = proxy.as_ref() {
                 match proxy.start().await {
-                    Ok(endpoint) => { upstreams.push(endpoint); upstreams.push(endpoint); }
+                    Ok(endpoint) => { upstreams.push(endpoint); }
                     Err(error) => tracing::warn!(%error, "dnscrypt-proxy unavailable; using fallback DNS"),
                 }
             }
@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
             let mut upstreams = Vec::new();
             if let Some(proxy) = proxy.as_ref() {
                 match proxy.start().await {
-                    Ok(endpoint) => { upstreams.push(endpoint); upstreams.push(endpoint); }
+                    Ok(endpoint) => { upstreams.push(endpoint); }
                     Err(error) => tracing::warn!(%error, "dnscrypt-proxy unavailable; using fallback DNS"),
                 }
             }
@@ -192,7 +192,6 @@ async fn main() -> Result<()> {
             if let Some(proxy) = proxy.as_ref() {
                 match proxy.start().await {
                     Ok(endpoint) => {
-                        upstreams.push(endpoint);
                         upstreams.push(endpoint);
                     }
                     Err(error) => tracing::warn!(%error, "DNSCrypt proxy failed to start; using fallback DNS"),
