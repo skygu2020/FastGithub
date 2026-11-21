@@ -538,7 +538,9 @@ async fn forward_request(
         .context("building upstream request URI")?;
     strip_hop_by_hop_headers(&mut parts.headers);
     append_fastgithub_user_agent(&mut parts.headers)?;
-    parts.headers.insert(header::HOST, HeaderValue::from_str(&host_header(&uri))?);
+    // hyper-util synthesizes Host for HTTP/1 and derives :authority from URI
+    // for HTTP/2; do not leak a duplicate Host field into HTTP/2 requests.
+    parts.headers.remove(header::HOST);
     tracing::debug!(%original_host, upstream = %uri, "forwarding HTTP request");
 
     let expect_continue = should_gate_expect_continue(&parts.headers, &body);
