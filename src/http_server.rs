@@ -320,10 +320,19 @@ async fn handle_request(request: Request<Incoming>, scheme: &str, config: &AppCo
                 .unwrap_or(if management_uri.scheme() == "https" { 443 } else { 80 });
             if local_host
                 && local_port == config.fast_github.http_proxy_port
-                && matches!(management_uri.path(), "/ping" | "/refresh-ip")
+                && matches!(management_uri.path(), "/ping" | "/refresh-ip" | "/flowStatistics")
             {
                 if management_uri.path() == "/ping" && method == Method::GET {
                     return management_response(StatusCode::OK, "text/plain; charset=utf-8", "pong".to_owned());
+                }
+                if management_uri.path() == "/flowStatistics" && method == Method::GET {
+                    let body = serde_json::to_string(&resolver.flow_analyzer().statistics())
+                        .unwrap_or_else(|_| "{}".to_owned());
+                    return management_response(
+                        StatusCode::OK,
+                        "application/json; charset=utf-8",
+                        body,
+                    );
                 }
                 if management_uri.path() == "/refresh-ip"
                     && (method == Method::GET || method == Method::POST)
