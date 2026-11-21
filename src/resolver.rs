@@ -133,7 +133,9 @@ impl DomainResolver {
                     %error,
                     "DNS refresh failed; retaining previous candidates"
                 );
-                return Ok(self.exclude_failed(&previous).await);
+                let retained = self.exclude_failed(&previous).await;
+                self.store_endpoint(endpoint.clone(), retained.clone()).await;
+                return Ok(retained);
             }
             Err(error) => {
                 let seeds = seed_addresses(&endpoint.host);
@@ -242,6 +244,15 @@ impl DomainResolver {
                         %error,
                         "DNS refresh failed; retaining old candidates"
                     );
+                    if !old.is_empty() {
+                        self.endpoints.write().await.insert(
+                            endpoint,
+                            EndpointState {
+                                addresses: old,
+                                refreshed_at: Instant::now(),
+                            },
+                        );
+                    }
                     return;
                 }
             }
