@@ -248,3 +248,87 @@ Rust 普通 HTTP 转发现已引入共享 `ActivityTimeout`：100 秒 deadline �
 - 这是添加 UA 后 gitcdn 下载成功的正向观测，说明当前实现可正常获取该源；但单次前后对比不能严格证明成功完全由 UA 引起，网络状态变化也是可能因素。暂时保留该 UA，不扩大到其他 hosts 源。
 - 同一轮日志仍有若干 DNS 上游查询超时（包括本地 dnscrypt-proxy endpoint 和 `8.8.8.8:53`），但部分域名仍完成解析与候选测速排序，整轮 hosts/DNS 刷新最终成功。候选 TCP/TLS probe timeout 是单个候选测速未在预算内完成，不应直接解释为真实请求必然不可用；需结合后续实际请求结果判断。
 - 本轮没有修改 DNS 候选、探测超时或故障熔断策略；没有本地 Cargo 工具链，未运行 fmt/build/test；没有触发 GitHub Actions/CI。
+
+
+## 加密 DNS 客户端内嵌化可行性分析（2026-11-24）
+
+目标：评估把当前随 Linux 发行物提供的 Go `dnscrypt-proxy` 从外部子进程替换为 Rust 进程内客户端。此阶段只记录协议能力和迁移边界，不删除现有代理、不改 DNS 运行路径。
+
+### 当前实现边界
+
+- `src/dnscrypt.rs` 负责查找外部可执行文件和 TOML，选择 loopback 临时端口，修改 `listen_addresses` / 日志 / 负载均衡 / 缓存参数，启动子进程并等待 TCP 端口就绪；退出时 kill/wait。
+- `src/main.rs` 在正常代理启动、`resolve`、`test-dns`、`watch-dns` 中均先尝试启动该进程，再把返回的 loopback `SocketAddr` 放到 DNS 上游列表首位，最后追加 `FastGithub.FallbackDns`。
+- `src/dns.rs` 只实现传统 DNS wire query：A/AAAA、UDP 查询、TC 截断后 TCP 重试、响应 ID 校验、TTL 缓存及公共 53 端口失败熔断。它不理解 DNSCrypt、DoH 或 ODoH。
+- 因此当前加密协议、resolver 列表/证书更新、上游选择与负载均衡都在 Go 子进程内；Rust 主程序只把它当作一个本地普通 DNS 服务器。仅把 `dnscrypt-proxy` 的 UDP/TCP socket 改成 Rust socket，并不能完成客户端内嵌化。
+
+### 可复用的 Rust 协议组件
+
+1. **DNSCrypt v2：`dnscrypt` crate 0.3.x**
+   - 文档确认它是 Tokio 异步、纯 Rust 的 DNSCrypt v2 客户端，支持 resolver stamp、签名证书验证、会话密钥、查询缓存和可选 Anonymized DNSCrypt relay。
+   - 它提供 `Client::lookup` / `Client::query`，不需要再启动 loopback DNS 服务；可直接在 DNS 解析调用链中查询并返回 A/AAAA。
+   - 该 crate 文档描述的是 DNSCrypt v2，不应据此推断它实现了 PQDNSCrypt。
+
+2. **DoH / DoT / DoQ / DoH3：Hickory Resolver**
+   - Hickory 当前文档列出 DoT、DoH over HTTP/2、DoQ、DoH over HTTP/3 的可选协议支持，并提供 resolver pool、缓存和 DNSSEC 能力。
+   - 它可以作为多个标准加密 DNS transport 的统一实现，但不是 DNSCrypt/ODoH 的替代品。
+   - 项目当前 `rust-version = 1.78`；不能直接把 docs.rs 的最新版作为依赖。选定版本前必须核实该版本 MSRV、Tokio 兼容性和 TLS provider，避免抬高项目最低 Rust 版本或引入第二套冲突的 TLS 栈。
+
+3. **ODoH：`odoh-rs`**
+   - 该库实现 RFC 9230 的 ODoH 消息/HPKE 加密协议，文档说明默认套件为 X25519/HKDF-SHA256/AES-GCM-128。
+   - 它不是完整 DNS resolver 服务；客户端仍需实现 target-config 获取/缓存、HTTP POST 传输、响应解密、超时、重试和密钥轮换处理。不能只增加依赖就视为 ODoH 已完成。
+
+4. **PQDNSCrypt**
+   - 当前检索到的 Rust `dnscrypt` crate 文档只承诺 DNSCrypt v2；没有找到可确认支持 DNSCrypt 2026 后量子握手的 Rust 客户端实现。
+   - Go 代理当前上游配置模板已出现 `pqdnscrypt` 选项。实际随项目打包的 Go 版本和 TOML 必须再核对，不能因上游模板出现该选项就假定本项目打包版本已启用。
+   - 在找到可验证的实现并通过互通测试前，PQDNSCrypt 是阻止“完全替换外部代理”的明确缺口。
+
+### 与当前 Go 代理的能力差距
+
+| 能力 | 现有 Go 子进程 | 可用 Rust 组件/状态 |
+|---|---|---|
+| DNSCrypt v2 | 支持 | `dnscrypt` crate 可实现基础客户端 |
+| Anonymized DNSCrypt relay | 支持 | `dnscrypt` crate builder 有 relay 配置 |
+| DoH | 支持 | Hickory 可提供 DoH；需适配现有配置 |
+| DoT / DoQ / DoH3 | 取决于 Go 配置与版本 | Hickory 可选支持 |
+| ODoH | 支持 | `odoh-rs` 提供协议层，客户端 transport/配置管理需自行整合 |
+| PQDNSCrypt | 新版 Go 代理有配置选项 | 尚无已确认可用的 Rust 等价实现 |
+| resolver sources / stamp 列表更新 | Go 代理内建 | 需要自行实现来源下载、签名/格式校验、原子更新 |
+| 服务器筛选、测速、负载均衡 | Go 代理内建 | 需要统一调度层；不能只依赖各库默认策略 |
+| 证书/配置刷新、缓存、失败退避 | Go 代理内建 | 需要统一生命周期、缓存和并发控制 |
+
+### 推荐的融合架构
+
+不要把多个协议 crate 直接塞进当前 `DnsClient` 的 `Vec<SocketAddr>`。应把“加密 DNS 上游”抽象为异步查询接口，返回统一 DNS 响应/地址结果：
+
+- `EncryptedDnsBackend`：统一查询接口、超时和错误分类。
+- `DnsCryptBackend`：封装 `dnscrypt::Client`，先实现 DNSCrypt v2 与 relay。
+- `HickoryBackend`：封装 DoH/DoT/DoQ/DoH3，按项目选定版本和 feature 编译。
+- `OdohBackend`：后续单独接入 ODoH target config 与 HTTP transport。
+- `ResolverCatalog`：读取/更新 resolver stamps 与来源列表，校验后原子替换。
+- `ResolverPool`：负责候选选择、并发查询、延迟统计、失败退避和负载均衡；不要让各 backend 各自维护彼此不一致的服务器优先级。
+- 当前 `DnsClient` 保留为上层地址解析门面：hosts 优先、A/AAAA 合并、地址去重、TTL 与现有 endpoint 测速/持久化逻辑继续复用。
+
+隐私策略必须显式化：加密上游失败时是否允许退回 `FallbackDns` 明文 DNS，不能默认静默降级。建议配置一个明确的 fallback policy，并在日志中区分“加密查询失败”和“用户允许明文回退”；默认策略应避免意外泄漏查询。
+
+### 分阶段实施顺序
+
+1. **先建立协议能力与配置映射表**：逐项读取随项目打包的 TOML、resolver source、stamp、relay、bootstrap 和缓存设置；记录 Go 代理实际版本及启用项。这是后续验收基线。
+2. **实现 DNSCrypt v2 内嵌 backend**：使用静态 resolver stamps 做最小互通，不先实现远程 source 管理；保留 Go 子进程作为可切换的旧 backend。验证 A/AAAA、超时、证书过期/刷新、并发查询和 relay。
+3. **接入 Hickory 的 DoH/DoT/DoQ/DoH3**：只选择与 Rust 1.78 兼容的版本/feature；逐协议验证 TLS 校验、HTTP/3 运行时依赖、IPv4/IPv6、缓存和连接复用。
+4. **补 resolver catalog 与调度层**：实现来源下载、stamp 解析、筛选、探测、负载均衡、失败退避和热更新，使其行为接近当前 Go 配置，而不是只支持硬编码服务器。
+5. **再评估 ODoH 与 PQDNSCrypt**：ODoH 需补齐客户端 transport/config 生命周期；PQDNSCrypt 需先找到可审计、可互通的实现。未完成前继续保留 Go fallback。
+6. **双 backend 对照运行**：同一批域名同时查询 Rust backend 与 Go 子进程，比较答案集合、DNSSEC 状态、TTL、错误、延迟和失败恢复；确认无意外明文回退后，才考虑默认切换。
+7. **最后移除 Go 发行物与进程管理**：必须在所有启用协议达到验收标准后进行，不能先删二进制再补协议。
+
+### 本阶段结论
+
+- 可以开始把 DNSCrypt v2 作为第一个进程内 Rust backend；这是最小、边界清晰的切入点。
+- 不能把 `dnscrypt` crate 当成当前 Go `dnscrypt-proxy` 的完整替代品：DoH/ODoH/PQDNSCrypt、resolver source 管理和统一调度仍有缺口。
+- 第一阶段不改 `src/dns.rs` 的现有普通 DNS 行为、不移除 `src/dnscrypt.rs`，先新增可独立测试的 backend，再通过配置开关做双栈验证。
+- 当前环境没有本地 Cargo 工具链；本分析没有执行 build/test，也没有触发 GitHub Actions/CI。
+
+参考：
+- https://docs.rs/dnscrypt/latest/dnscrypt/
+- https://docs.rs/hickory-resolver/latest/hickory_resolver/
+- https://docs.rs/odoh-rs/latest/odoh_rs/
+- https://github.com/DNSCrypt/dnscrypt-proxy/blob/master/dnscrypt-proxy/example-dnscrypt-proxy.toml
