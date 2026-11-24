@@ -437,3 +437,26 @@ initial hosts and DNS/IP refresh completed success=true domains=41 errors=
 - 本次日志没有显示 `upstream transport connection ready` 的 peer_ip/connection_id 记录，因此尚不能将具体成功请求精确关联到一个 GitHub peer IP。后续如需定位慢请求，应保留连接建立日志，并补充请求级关联信息；不要因单个 HTTP/2 stream 失败而关闭共享连接，也不要盲目重放已发送请求。
 - 当前 4 秒 DoH timeout 会触发明文 fallback，这是现有实现的明确隐私降级行为，不是 DoH 仍在查询明文 DNS。后续应把 fallback policy 变成显式配置/策略：允许时记录降级原因，不允许时失败关闭；在用户确认策略前不擅自改变默认行为。
 - 本轮没有修改连接候选、超时、DoH fallback 或请求重试策略。没有本地 Cargo 工具链，未运行 fmt/build/test；没有触发 GitHub Actions/CI。
+
+## 原生 DoH 明文回退策略配置化（2026-11-24）
+
+根据用户实测，Cloudflare DoH 对部分域名偶发超过当前 4 秒查询预算；此前实现会自动将这些查询发送到 `FastGithub.FallbackDns` 中的普通 DNS。为避免加密查询失败时无提示地泄漏查询名称，本轮将该行为改为显式配置：
+
+- `FastGithubConfig` 新增 `AllowPlainDnsFallback`，serde 默认值为 `false`。
+- 启用 `native-doh` 时，默认严格模式只使用内置 Cloudflare DoH；DoH 查询错误或超过 4 秒时返回错误，不再自动访问普通 DNS。
+- 用户明确设置 `"AllowPlainDnsFallback": true` 后，DoH 错误/超时才会查询 `FallbackDns`。DoH 正常返回（包括有效空答案）仍不会触发明文查询。
+- 启动日志会明确显示 strict mode 或 plaintext fallback explicitly allowed；实际进入回退时也会输出单独警告。
+- `FallbackDns` 仍是程序配置中的明确上游列表；没有引入系统 resolver 列表发现，也没有让 Hickory DoH resolver 使用系统 DNS。
+- 未启用 `native-doh` 的默认构建仍沿用原 Go DNSCrypt 子进程和既有 DNS 上游行为；新增布尔字段不改变该路径。
+
+如需保留本次实测时“DoH 超时后继续普通 DNS”的行为，在 appsettings 配置中加入：
+
+```json
+{
+  "FastGithub": {
+    "AllowPlainDnsFallback": true
+  }
+}
+```
+
+该选项只控制原生 DoH 失败后的明文回退，不会把普通 DNS 变成 DoH 的首选上游。新增配置默认值有单元测试覆盖；当前环境没有本地 Cargo 工具链，未运行 fmt/build/test，也没有触发 GitHub Actions/CI。
