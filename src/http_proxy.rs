@@ -2,11 +2,11 @@ use crate::{cert::CertificateService, config::AppConfig, dns::DnsClient, persist
 use arc_swap::ArcSwap;
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use http::{Request, Response, Uri};
+use http::{Extensions, Request, Response, Uri};
 use http_body_util::combinators::UnsyncBoxBody;
 use hyper::body::Incoming;
 use hyper_util::{
-    client::legacy::{connect::{Connected, Connection}, Client},
+    client::legacy::{connect::{capture_connection, Connected, Connection}, Client},
     rt::{TokioExecutor, TokioIo, TokioTimer},
 };
 use openssl::ssl::{AlpnError, NameType, SniError, Ssl, SslAcceptor, SslConnector, SslMethod};
@@ -55,6 +55,12 @@ fn pool_entry_matches_request(entry_identity: &Arc<()>, request_identity: &Arc<(
 trait ProxyIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> ProxyIo for T {}
 
+#[derive(Clone, Copy, Debug)]
+struct UpstreamPeerInfo {
+    peer_ip: IpAddr,
+    connection_id: u64,
+}
+
 struct ConnectedUpstreamIo {
     inner: Box<dyn ProxyIo>,
     peer_ip: IpAddr,
@@ -98,7 +104,10 @@ impl Connection for ConnectedUpstreamIo {
             http2 = self.http2,
             "upstream connection metadata supplied to Hyper"
         );
-        let connected = Connected::new();
+        let connected = Connected::new().extra(UpstreamPeerInfo {
+            peer_ip: self.peer_ip,
+            connection_id: self.connection_id,
+        });
         if self.http2 { connected.negotiated_h2() } else { connected }
     }
 }
@@ -556,19 +565,28 @@ impl TlsProxy {
     pub(crate) async fn send_pooled_request(
         &self,
         original_host: &str,
-        request: Request<UpstreamBody>,
+        mut request: Request<UpstreamBody>,
     ) -> Result<Response<Incoming>> {
         let (client, pool_identity) = self.upstream_client(original_host)?;
+        let captured_connection = capture_connection(&mut request);
         let method = request.method().clone();
         let uri = request.uri().clone();
         let started = tokio::time::Instant::now();
         tracing::debug!(%original_host, %method, %uri, "sending request through upstream connection pool");
         let result = client.request(request).await;
+        let connection_metadata = captured_connection.connection_metadata();
+        let peer_info = connection_metadata.as_ref().and_then(|connected| {
+            let mut extensions = Extensions::new();
+            connected.get_extras(&mut extensions);
+            extensions.get::<UpstreamPeerInfo>().copied()
+        });
         match &result {
             Ok(response) => tracing::debug!(
                 %original_host,
                 %method,
                 %uri,
+                peer_ip = ?peer_info.map(|info| info.peer_ip),
+                connection_id = ?peer_info.map(|info| info.connection_id),
                 status = response.status().as_u16(),
                 elapsed_ms = started.elapsed().as_millis(),
                 "upstream response headers received"
@@ -578,6 +596,8 @@ impl TlsProxy {
                 %method,
                 %uri,
                 %error,
+                peer_ip = ?peer_info.map(|info| info.peer_ip),
+                connection_id = ?peer_info.map(|info| info.connection_id),
                 elapsed_ms = started.elapsed().as_millis(),
                 "upstream pooled request failed"
             ),
