@@ -88,7 +88,7 @@
 - C# `FastGithub.Http/HttpClientHandler.cs` 的 `ConnectCallback` 按候选 IP 逐个尝试，每个 TCP connect 最多 10 秒；HTTPS 的 `ConnectAsync` 还会完成 TLS 握手和证书验证。TCP/TLS 连接失败会继续下一个 IP。
 - C# 一旦 TCP/TLS 连接成功，就把连接交给 `SocketsHttpHandler` 发送 HTTP 请求。原版没有在请求已经发出、但等待响应头超时时，自动重建请求并切换到另一个 IP 的通用逻辑。
 - Rust 的 `AddressService` 比 C# 的预探测更严格：预探测阶段完成 TCP + TLS 握手；真实请求阶段的 `connect_target_excluding` 也会逐个尝试 TCP，`UpstreamConnector` 在 TLS 握手失败时继续下一个候选，并对失败 IP 做 90 秒熔断。
-- Rust 的 `send_pooled_request` 在 Hyper 请求明确返回错误时会记录错误并淘汰该域名的连接池条目；但它不会把已发送的请求自动转发到另一个 IP。外层请求超时会取消转发 future，不能假定取消等价于收到一个可安全重放的请求错误。
+- Rust 的 `send_pooled_request` 只在 Hyper legacy client 明确报告 `Error::is_connect()` 时淘汰当前域名连接池条目；普通请求错误可能来自 HTTP/2 单个 stream reset，也可能来自连接级故障，不能仅凭通用错误类型就销毁整个 per-host Client。Hyper 自身负责管理失效的池连接。请求错误日志同时读取 `Error::connect_info()`，尽可能记录失败关联的 peer IP/connection ID。该策略不把所有请求错误都认定为 stream 错误，只是避免在证据不足时执行整池淘汰。它不会把已发送的请求自动转发到另一个 IP；外层请求超时会取消转发 future，不能假定取消等价于收到一个可安全重放的请求错误。
 
 ### 当前结论
 
@@ -142,3 +142,12 @@
 - 响应体超时与上游 body stream error 日志会携带这些字段。没有连接元数据时字段保持为空，不会伪造 peer IP 或 connection ID。
 - 该包装只增加日志上下文，不缓存、不聚合、不预读响应体；每个 body frame 仍按原有 backpressure 逐帧转发。单个 HTTP/2 stream 超时/失败仍只终止该响应体，不主动关闭共享连接。
 - 本次未改变独立 HTTP/1 Upgrade 分支的 body trace；该分支使用专属连接且已有独立 driver guard。没有本地 Cargo 工具链可用，本次未运行 fmt、build 或 test，也没有触发 GitHub Actions/CI。
+
+
+## Hyper pooled request 错误分类与连接池淘汰边界（2026-11-24）
+
+- 对照固定版本 `hyper-util 0.1.20` 的 `client/legacy/client.rs`：`Error::is_connect()` 公开区分 connector 建连错误；`Error::connect_info()` 在部分已选定连接的请求错误上提供 `Connected` 元数据。HTTP/2 response stream 错误和底层连接 driver 终止不能仅靠 `client.request()` 返回的通用错误一概归类为连接故障。
+- `send_pooled_request` 现仅在 `is_connect()` 为 true 时淘汰当前 host 的 Client 条目；普通 `SendRequest` / `ChannelClosed` 等非 connector 错误只记录为 `request_or_connection`，不主动清空整个 per-host Client。Hyper 的 pool/connection 层仍负责处理已失效的底层连接。
+- 错误日志优先从 `Error::connect_info()` 读取 peer IP 和 connection ID；没有连接信息时回退到 `capture_connection` 已记录的元数据。连接信息缺失时保留空值。
+- 该分类是保守的淘汰策略，不声称已从 `hyper::Error` 精确区分 HTTP/2 RST_STREAM、GOAWAY 和 socket EOF。下一阶段应在不改动 Hyper driver 管理权的前提下，补充可验证的连接关闭/stream reset loopback 场景，观察各自错误类别与 pool 后续请求行为。
+- 本轮没有更改请求重放策略；没有本地 Cargo 工具链，未运行 fmt/build/test，也未触发 GitHub Actions/CI。
