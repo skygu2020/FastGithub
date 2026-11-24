@@ -19,6 +19,8 @@ pub struct DnsClient {
     upstreams: Arc<Vec<SocketAddr>>,
     #[cfg(feature = "native-doh")]
     doh: Option<Arc<hickory_resolver::TokioResolver>>,
+    #[cfg(feature = "native-doh")]
+    allow_plain_fallback: bool,
     cache: Arc<Mutex<HashMap<(SocketAddr, String), CacheEntry>>>,
     state_cache: Arc<Mutex<HashMap<SocketAddr, StateEntry>>>,
     failure_counts: Arc<Mutex<HashMap<SocketAddr, u8>>>,
@@ -30,6 +32,8 @@ impl DnsClient {
             upstreams: Arc::new(upstreams),
             #[cfg(feature = "native-doh")]
             doh: None,
+            #[cfg(feature = "native-doh")]
+            allow_plain_fallback: false,
             cache: Arc::new(Mutex::new(HashMap::new())),
             state_cache: Arc::new(Mutex::new(HashMap::new())),
             failure_counts: Arc::new(Mutex::new(HashMap::new())),
@@ -43,10 +47,12 @@ impl DnsClient {
     pub fn with_doh(
         upstreams: Vec<SocketAddr>,
         resolver: hickory_resolver::TokioResolver,
+        allow_plain_fallback: bool,
     ) -> Self {
         Self {
             upstreams: Arc::new(upstreams),
             doh: Some(Arc::new(resolver)),
+            allow_plain_fallback,
             cache: Arc::new(Mutex::new(HashMap::new())),
             state_cache: Arc::new(Mutex::new(HashMap::new())),
             failure_counts: Arc::new(Mutex::new(HashMap::new())),
@@ -74,6 +80,8 @@ impl DnsClient {
         #[cfg(feature = "native-doh")]
         let mut encrypted_resolved = false;
         #[cfg(feature = "native-doh")]
+        let mut encrypted_error = None;
+        #[cfg(feature = "native-doh")]
         if let Some(resolver) = self.doh.as_ref() {
             match timeout(DNS_TIMEOUT, resolver.lookup_ip(host.as_str())).await {
                 Ok(Ok(lookup)) => {
@@ -85,12 +93,23 @@ impl DnsClient {
                     }
                 }
                 Ok(Err(error)) => {
-                    tracing::warn!(%host, %error, "DoH lookup failed; trying configured fallback DNS");
+                    encrypted_error = Some(error.to_string());
+                    tracing::warn!(%host, %error, "DoH lookup failed");
                 }
                 Err(_) => {
-                    tracing::warn!(%host, timeout_ms = DNS_TIMEOUT.as_millis(), "DoH lookup timed out; trying configured fallback DNS");
+                    encrypted_error = Some(format!("lookup timed out after {} ms", DNS_TIMEOUT.as_millis()));
+                    tracing::warn!(%host, timeout_ms = DNS_TIMEOUT.as_millis(), "DoH lookup timed out");
                 }
             }
+        }
+        #[cfg(feature = "native-doh")]
+        if !encrypted_resolved && !self.allow_plain_fallback {
+            let reason = encrypted_error.as_deref().unwrap_or("encrypted resolver is unavailable");
+            bail!("encrypted DNS lookup for {host} failed ({reason}); plaintext DNS fallback is disabled");
+        }
+        #[cfg(feature = "native-doh")]
+        if !encrypted_resolved {
+            tracing::warn!(%host, upstreams = self.upstreams.len(), "using explicitly allowed plaintext DNS fallback");
         }
         #[cfg(feature = "native-doh")]
         if !encrypted_resolved {
