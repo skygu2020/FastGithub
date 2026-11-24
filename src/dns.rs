@@ -17,6 +17,8 @@ struct StateEntry { available: bool, expires_at: Instant }
 #[derive(Clone)]
 pub struct DnsClient {
     upstreams: Arc<Vec<SocketAddr>>,
+    #[cfg(feature = "native-doh")]
+    doh: Option<Arc<hickory_resolver::TokioResolver>>,
     cache: Arc<Mutex<HashMap<(SocketAddr, String), CacheEntry>>>,
     state_cache: Arc<Mutex<HashMap<SocketAddr, StateEntry>>>,
     failure_counts: Arc<Mutex<HashMap<SocketAddr, u8>>>,
@@ -26,6 +28,25 @@ impl DnsClient {
     pub fn new(upstreams: Vec<SocketAddr>) -> Self {
         Self {
             upstreams: Arc::new(upstreams),
+            #[cfg(feature = "native-doh")]
+            doh: None,
+            cache: Arc::new(Mutex::new(HashMap::new())),
+            state_cache: Arc::new(Mutex::new(HashMap::new())),
+            failure_counts: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+ 
+    /// Create a DNS client backed by an in-process DNS-over-HTTPS resolver.
+    /// Plain DNS upstreams are only used if the encrypted lookup fails.
+    #[cfg(feature = "native-doh")]
+    pub fn with_doh(
+        upstreams: Vec<SocketAddr>,
+        resolver: hickory_resolver::TokioResolver,
+    ) -> Self {
+        Self {
+            upstreams: Arc::new(upstreams),
+            doh: Some(Arc::new(resolver)),
             cache: Arc::new(Mutex::new(HashMap::new())),
             state_cache: Arc::new(Mutex::new(HashMap::new())),
             failure_counts: Arc::new(Mutex::new(HashMap::new())),
@@ -46,6 +67,29 @@ impl DnsClient {
         if host == "localhost" { return Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)]); }
 
         let mut addresses = Vec::new();
+        #[cfg(feature = "native-doh")]
+        let mut encrypted_resolved = false;
+        #[cfg(feature = "native-doh")]
+        if let Some(resolver) = self.doh.as_ref() {
+            match timeout(DNS_TIMEOUT, resolver.lookup_ip(&host)).await {
+                Ok(Ok(lookup)) => {
+                    encrypted_resolved = true;
+                    let found = lookup.iter().collect::<Vec<_>>();
+                    tracing::debug!(%host, addresses = found.len(), "DoH lookup succeeded");
+                    for ip in found {
+                        if !ip.is_loopback() && !addresses.contains(&ip) { addresses.push(ip); }
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%host, %error, "DoH lookup failed; trying configured fallback DNS");
+                }
+                Err(_) => {
+                    tracing::warn!(%host, timeout_ms = DNS_TIMEOUT.as_millis(), "DoH lookup timed out; trying configured fallback DNS");
+                }
+            }
+        }
+        #[cfg(feature = "native-doh")]
+        if !encrypted_resolved {
         for upstream in self.upstreams.iter().copied() {
             // The reference implementation probes TCP only for port 53; custom ports are UDP.
             if upstream.port() == 53 && !self.upstream_available(upstream).await { continue; }
