@@ -223,3 +223,11 @@ Rust 普通 HTTP 转发现已引入共享 `ActivityTimeout`：100 秒 deadline �
 - 现将 Rust 单候选测速预算调整为 5 秒，与原版超时上限对齐。该预算仍覆盖 TCP+TLS 两阶段；真实请求连接仍使用独立的每 IP 10 秒 TCP+TLS deadline。候选测速任务并行执行，不会按候选数量累加 5 秒。
 - 若所有候选测速均失败，Rust 仍保留候选地址交由真实请求路径验证；这比原版 `GetAddressesAsync` 返回空列表更保守，避免一次测速故障清空 DNS/hosts 候选。请求阶段明确失败的 IP 仍按 host/port 熔断 90 秒。
 - 本次只调整探测预算，不改变候选排序、TLS 验证、失败缓存 TTL 或请求阶段熔断策略。没有本地 Cargo 工具链，未运行 fmt/build/test；没有触发 GitHub Actions/CI。
+
+## DNS 刷新与请求熔断并发安全（2026-11-24）
+
+- 修复 `resolve()` 的锁顺序反转：此前它持有 `endpoints` 读锁时等待 `failed_ips` 锁；`report_failure()` 则先写 `failed_ips` 再写 `endpoints`，两者并发可能形成死锁。现在先在 endpoint 锁内复制候选与刷新时间，立即释放 endpoint 锁，再查询失败表。
+- 修复后台 `refresh_endpoint()` 覆盖请求阶段熔断结果的竞态：测速阶段的 `exclude_failed()` 只是一个时间点快照，不能保证随后的 endpoint 写回仍排除刚刚失败的 IP。现在所有候选状态提交都经 `store_endpoint_state()`，持有失败表写锁直到 endpoint 快照提交，并在提交时重新过滤尚未过期的 host/port/IP 熔断项。
+- 锁顺序统一为 `failed_ips -> endpoints`。`resolve()` 不再反向嵌套获取这两把锁；`report_failure()` 与 `report_success()` 也按同一顺序更新两个状态。
+- 后台批量测速使用不触发单次持久化的 `store_endpoint_state()`，待所有 endpoint 刷新任务完成后再统一 `save_addresses()`；普通按需解析仍通过 `store_endpoint()` 在提交后持久化。
+- 这些修正不改变 90 秒熔断期限、测速缓存 TTL、候选排序或请求重试策略。当前无本地 Cargo 工具链，未运行 fmt/build/test；没有触发 GitHub Actions/CI。
