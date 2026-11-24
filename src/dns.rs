@@ -65,9 +65,12 @@ impl DnsClient {
 
         let mut addresses = Vec::new();
         #[cfg(feature = "native-dnscrypt")]
+        let mut encrypted_resolved = false;
+        #[cfg(feature = "native-dnscrypt")]
         if let Some(encrypted) = self.encrypted.as_ref() {
             match timeout(DNS_TIMEOUT, encrypted.lookup(&host)).await {
                 Ok(Ok(found)) => {
+                    encrypted_resolved = true;
                     tracing::debug!(%host, addresses = found.len(), "DNSCrypt v2 lookup succeeded");
                     for ip in found {
                         if !ip.is_loopback() && !addresses.contains(&ip) { addresses.push(ip); }
@@ -81,6 +84,8 @@ impl DnsClient {
                 }
             }
         }
+        #[cfg(feature = "native-dnscrypt")]
+        if !encrypted_resolved {
         for upstream in self.upstreams.iter().copied() {
             // The reference implementation probes TCP only for port 53; custom ports are UDP.
             if upstream.port() == 53 && !self.upstream_available(upstream).await { continue; }
@@ -90,6 +95,7 @@ impl DnsClient {
                     tracing::warn!(%host, %upstream, %error, "DNS lookup failed");
                 }
             }
+        }
         }
         if fast_sort && addresses.len() > 1 { self.prefer_fastest(&mut addresses, port).await; }
         Ok(addresses)
