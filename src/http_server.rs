@@ -136,6 +136,7 @@ impl ActivityTimeout {
         loop {
             let deadline = self.deadline();
             tokio::select! {
+                biased;
                 result = &mut future => return Ok(result),
                 _ = tokio::time::sleep_until(deadline) => {
                     if self.is_expired() {
@@ -247,7 +248,7 @@ where
                     request_target = %trace.request_target,
                     peer_ip = ?trace.peer.map(|peer| peer.peer_ip),
                     connection_id = ?trace.peer.map(|peer| peer.connection_id),
-                    "upstream response body stalled until activity timeout"
+                    "upstream HTTP body stalled until activity timeout"
                 );
             } else {
                 tracing::warn!("upstream body stalled until activity timeout");
@@ -1255,6 +1256,60 @@ mod header_tests {
         ).await.expect("active body must not hit a total-duration timeout")
             .unwrap().to_bytes();
         assert_eq!(bytes, Bytes::from_static(b"abc"));
+    }
+
+    #[tokio::test]
+    async fn shared_activity_timeout_is_refreshed_by_upload_frames() {
+        use super::{ActivityTimeout, TimeoutBody};
+        use bytes::Bytes;
+        use http_body::Frame;
+        use http_body_util::BodyExt;
+        use std::{convert::Infallible, pin::Pin, task::{Context, Poll}, time::Duration};
+
+        struct DelayedFrames {
+            next: u8,
+            delay: Pin<Box<tokio::time::Sleep>>,
+        }
+
+        impl http_body::Body for DelayedFrames {
+            type Data = Bytes;
+            type Error = Infallible;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                if self.next >= 3 {
+                    return Poll::Ready(None);
+                }
+                if self.delay.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                let value = self.next;
+                self.next += 1;
+                self.delay.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(25));
+                Poll::Ready(Some(Ok(Frame::data(Bytes::from(vec![b'a' + value])))))
+            }
+        }
+
+        let activity = ActivityTimeout::new(Duration::from_millis(40));
+        let inner = DelayedFrames {
+            next: 0,
+            delay: Box::pin(tokio::time::sleep(Duration::from_millis(25))),
+        }
+        .map_err(|never| -> super::BoxError { match never {} })
+        .boxed_unsync();
+        let mut body = TimeoutBody::new_shared(inner, activity.clone(), None, None);
+
+        let upload = async move {
+            while let Some(frame) = body.frame().await {
+                frame?;
+            }
+            Ok::<_, super::BoxError>(())
+        };
+        let result = activity.run(upload).await;
+        assert!(result.is_ok(), "active upload must refresh the shared idle deadline");
+        assert!(result.unwrap().is_ok());
     }
 
     #[tokio::test]
