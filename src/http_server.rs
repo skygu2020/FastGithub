@@ -83,8 +83,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingIo<S> {
     }
 }
 
-/// Enforce the complete request timeout while the upstream response body is streamed.
-/// The forwarding future has its own timeout for DNS, connect, TLS and response headers.
+/// Enforce an idle activity timeout while a request or response body is streamed.
+/// Successful body frames reset the deadline; this is not a total transfer timeout.
 struct TimeoutBody<B> {
     inner: Option<Pin<Box<B>>>,
     sleep: Option<Pin<Box<Sleep>>>,
@@ -162,7 +162,7 @@ where
                     request_target = %trace.request_target,
                     peer_ip = ?trace.peer.map(|peer| peer.peer_ip),
                     connection_id = ?trace.peer.map(|peer| peer.connection_id),
-                    "upstream response body stalled until request timeout"
+                    "upstream response body stalled until activity timeout"
                 );
             } else {
                 tracing::warn!("upstream response body stalled until request timeout");
@@ -173,7 +173,7 @@ where
             drop(this.connection.take());
             return Poll::Ready(Some(Err(Box::new(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "HTTP request timeout elapsed while streaming the response body",
+                "HTTP activity timeout elapsed while streaming the body",
             )))));
         }
         let frame = match this.inner.as_mut() {
@@ -544,7 +544,7 @@ async fn handle_request_inner(request: Request<Incoming>, scheme: &str, config: 
             // a single concrete future type.
             let forwarding = async {
                 if is_upgrade_request(&request) {
-                    forward_upgrade_request(request, uri, request_target, original_host, domain, timeout_duration, request_started, resolver, domains, config, tls_proxy).await
+                    forward_upgrade_request(request, uri, request_target, original_host, domain, resolver, domains, config, tls_proxy).await
                 } else {
                     forward_request(request, uri, request_target, original_host, tls_proxy).await
                 }
@@ -770,8 +770,6 @@ async fn forward_upgrade_request(
     request_target: String,
     original_host: String,
     domain: Option<crate::config::DomainConfig>,
-    body_timeout: Option<Duration>,
-    request_started: tokio::time::Instant,
     resolver: &DomainResolver,
     domains: &[String],
     config: &AppConfig,
