@@ -240,3 +240,11 @@ Rust 普通 HTTP 转发现已引入共享 `ActivityTimeout`：100 秒 deadline �
 - 只对 gitcdn 源设置该头；`raw.hellogithub.com` 请求保持原样，便于通过同一次并发刷新对照两个来源，避免把试验变量扩散到所有 hosts 服务。
 - 这只是诊断性尝试，不代表已经确认 gitcdn 要求该 User-Agent。下一次启动/刷新重点观察 gitcdn 是否仍出现 timeout，以及是否取得有效 hosts 内容；若仍超时，应继续检查 DNS、TCP、TLS 或响应头阶段，不能仅凭结果归因于 UA。
 - 未改变 20 秒请求超时、禁用系统代理或来源合并/回退逻辑。当前环境没有本地 Cargo 工具链，未运行 fmt/build/test；没有触发 GitHub Actions/CI。
+
+
+### Hosts User-Agent 试验结果（用户环境，2026-11-24）
+
+- 用户在加入定向 `User-Agent: FastGithub/1.0` 后重新运行，日志显示 `hosts.gitcdn.top` 与 `raw.hellogithub.com` 均建立连接并成功完成下载；最终记录为 `online hosts mapping refreshed sources=2 total_sources=2 domains=41`，启动汇总为 `success=true domains=41 errors=`（错误列表为空）。
+- 这是添加 UA 后 gitcdn 下载成功的正向观测，说明当前实现可正常获取该源；但单次前后对比不能严格证明成功完全由 UA 引起，网络状态变化也是可能因素。暂时保留该 UA，不扩大到其他 hosts 源。
+- 同一轮日志仍有若干 DNS 上游查询超时（包括本地 dnscrypt-proxy endpoint 和 `8.8.8.8:53`），但部分域名仍完成解析与候选测速排序，整轮 hosts/DNS 刷新最终成功。候选 TCP/TLS probe timeout 是单个候选测速未在预算内完成，不应直接解释为真实请求必然不可用；需结合后续实际请求结果判断。
+- 本轮没有修改 DNS 候选、探测超时或故障熔断策略；没有本地 Cargo 工具链，未运行 fmt/build/test；没有触发 GitHub Actions/CI。
