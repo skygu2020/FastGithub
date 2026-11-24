@@ -391,3 +391,26 @@ Rust 普通 HTTP 转发现已引入共享 `ActivityTimeout`：100 秒 deadline �
 - Hickory 0.25.2 MSRV 与 DoH feature：https://docs.rs/crate/hickory-resolver/0.25.2
 - 0.25.2 feature 列表：https://docs.rs/crate/hickory-resolver/0.25.2/features
 - 0.25.2 DoH 测试使用 `ResolverConfig::cloudflare_https()`：https://docs.rs/crate/hickory-resolver/0.25.2/source/src/h2.rs
+
+## 原生 DoH 首次手动解析验证（用户环境，2026-11-24）
+
+用户在启用 `native-doh` 的构建上执行：
+
+```text
+./fastgithub resolve github.com:443
+2026-11-24T19:30:06.731343Z  INFO using in-process Cloudflare DNS-over-HTTPS; plain DNS servers are fallback only
+20.27.177.113
+57.155.223.240
+20.205.243.166
+20.247.166.64
+20.29.134.23
+20.233.83.145
+20.26.156.215
+140.82.113.3
+```
+
+- 命令正常结束并输出 8 个候选地址；启动日志确认走进程内 Cloudflare DoH 路径，配置的普通 DNS 仅作为错误/超时后的 fallback。
+- 本次输出中包含 `57.155.223.240`，与此前记录的 GitHub 候选列表不同，说明本次解析得到的地址集合存在变化；候选 IP 本身会随 DNS/CDN 状态变化，不应硬编码为固定清单。
+- 这证明当前用户环境中的 Hickory DoH 查询链路可用，并成功向上层 resolver 提供地址。由于本次没有记录 fallback DNS 查询日志，只能结合代码路径和启动信息判断本次没有观察到明文回退；不能据此证明 DoH 失败时的 fallback 分支也已验证。
+- 该命令只验证解析和候选地址输出，不验证通过 HTTP 代理访问 GitHub 时的 TCP/TLS、上游 HTTP 响应或连接池行为。后续应单独用 `native-doh` 构建启动代理，再访问 GitHub 页面并结合 peer IP / connection ID 日志观察。
+- 用户尚未提供 Rust 1.78 工具链构建结果；本次记录不代表 `cargo build`、`cargo test` 或 `cargo fmt` 已通过。没有触发 GitHub Actions/CI。
