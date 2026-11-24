@@ -1020,7 +1020,15 @@ async fn forward_upgrade_request(
 
     let mut upstream_response = match activity.run(sender.send_request(upstream_request)).await {
         Ok(result) => result?,
-        Err(()) => anyhow::bail!("upstream protocol upgrade exceeded the 100-second activity idle timeout"),
+        Err(()) => {
+            tracing::warn!(
+                original_host = %original_host,
+                request_target = %request_target,
+                activity_timeout_ms = DEFAULT_ACTIVITY_TIMEOUT.as_millis(),
+                "upstream protocol upgrade made no progress before response headers"
+            );
+            anyhow::bail!("upstream protocol upgrade exceeded the 100-second activity idle timeout")
+        }
     };
     if upstream_response.status() != StatusCode::SWITCHING_PROTOCOLS {
         let (mut response_parts, response_body) = upstream_response.into_parts();
@@ -1294,6 +1302,26 @@ mod header_tests {
         assert!(body.frame().await.expect("timeout error frame").is_err());
         assert!(body.frame().await.is_none());
         assert!(connection_task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn upgraded_tunnel_idle_timeout_expires_without_io_progress() {
+        use super::{ActivityIo, ActivityTimeout};
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        let (client, _peer) = tokio::io::duplex(16);
+        let activity = ActivityTimeout::new(Duration::from_millis(10));
+        let mut client = ActivityIo::new(client, activity.clone());
+        let tunnel_read = async {
+            let mut byte = [0_u8; 1];
+            client.read_exact(&mut byte).await
+        };
+
+        assert!(
+            activity.run(tunnel_read).await.is_err(),
+            "an idle upgraded tunnel must expire"
+        );
     }
 
     #[tokio::test]
