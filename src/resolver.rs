@@ -192,7 +192,7 @@ impl DomainResolver {
         }
     }
 
-    async fn store_endpoint(&self, endpoint: EndpointRecord, addresses: Vec<IpAddr>) {
+    async fn store_endpoint_state(&self, endpoint: EndpointRecord, addresses: Vec<IpAddr>) {
         // Keep the failure-table write guard until the endpoint snapshot is
         // committed. report_failure takes these locks in the same order, so a
         // concurrent failure is either observed here or removes the address
@@ -212,7 +212,10 @@ impl DomainResolver {
                 refreshed_at: now,
             },
         );
-        drop(failed);
+    }
+
+    async fn store_endpoint(&self, endpoint: EndpointRecord, addresses: Vec<IpAddr>) {
+        self.store_endpoint_state(endpoint, addresses).await;
         self.save_addresses().await;
     }
 
@@ -333,7 +336,7 @@ impl DomainResolver {
         let next = if ordered.is_empty() { old } else { ordered };
         // Re-check the circuit-breaker table while committing the refreshed list;
         // the earlier exclude_failed() is only a ranking-stage snapshot.
-        self.store_endpoint(endpoint, next).await;
+        self.store_endpoint_state(endpoint, next).await;
     }
 
     /// Mark an IP as failed for this host/port for 90 seconds and remove it from that endpoint's candidates.
