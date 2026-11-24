@@ -139,14 +139,14 @@ impl DomainResolver {
                 );
                 Vec::new()
             }
-            Err(error) if !previous.is_empty() => {
+            Err(error) if !previous_addresses.is_empty() => {
                 tracing::warn!(
                     host = %endpoint.host,
                     port,
                     %error,
                     "DNS refresh failed; retaining previous candidates"
                 );
-                let retained = self.exclude_failed(&endpoint.host, endpoint.port, &previous).await;
+                let retained = self.exclude_failed(&endpoint.host, endpoint.port, &previous_addresses).await;
                 self.store_endpoint(endpoint.clone(), retained.clone()).await;
                 return Ok(retained);
             }
@@ -166,9 +166,9 @@ impl DomainResolver {
         }
         let probed = self
             .addresses
-            .order_addresses(&endpoint.host, port, candidates, &previous)
+            .order_addresses(&endpoint.host, port, candidates, &previous_addresses)
             .await;
-        let ordered = self.exclude_failed(&endpoint.host, endpoint.port, &merge_candidates(probed, &previous)).await;
+        let ordered = self.exclude_failed(&endpoint.host, endpoint.port, &merge_candidates(probed, &previous_addresses)).await;
         self.store_endpoint(endpoint, ordered.clone()).await;
         Ok(ordered)
     }
