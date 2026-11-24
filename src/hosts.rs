@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::IpAddr, sync::Arc, time::{Duration, Instant}};
 
 use reqwest::{header::USER_AGENT, Client};
 use tokio::{sync::RwLock, task::JoinSet};
@@ -53,8 +53,72 @@ impl HostsService {
                     } else {
                         request
                     };
-                    let response = request.send().await?.error_for_status()?;
-                    response.text().await
+
+                    // Separate response-header latency from body-read latency. reqwest's
+                    // request timeout still bounds the whole operation; this instrumentation
+                    // tells us which phase consumed that budget.
+                    let request_started = Instant::now();
+                    let response = match request.send().await {
+                        Ok(response) => response,
+                        Err(error) => {
+                            tracing::warn!(
+                                url = %url,
+                                stage = "response_headers",
+                                elapsed_ms = request_started.elapsed().as_millis(),
+                                timeout = error.is_timeout(),
+                                connect = error.is_connect(),
+                                "online hosts request failed before response headers"
+                            );
+                            return Err(error);
+                        }
+                    };
+
+                    let headers_elapsed = request_started.elapsed();
+                    let status = response.status();
+                    tracing::debug!(
+                        url = %url,
+                        %status,
+                        headers_elapsed_ms = headers_elapsed.as_millis(),
+                        "online hosts response headers received"
+                    );
+
+                    let response = match response.error_for_status() {
+                        Ok(response) => response,
+                        Err(error) => {
+                            tracing::warn!(
+                                url = %url,
+                                %status,
+                                headers_elapsed_ms = headers_elapsed.as_millis(),
+                                "online hosts source returned an unsuccessful HTTP status"
+                            );
+                            return Err(error);
+                        }
+                    };
+
+                    let body_started = Instant::now();
+                    let body_result = response.text().await;
+                    match &body_result {
+                        Ok(content) => tracing::debug!(
+                            url = %url,
+                            %status,
+                            headers_elapsed_ms = headers_elapsed.as_millis(),
+                            body_elapsed_ms = body_started.elapsed().as_millis(),
+                            body_bytes = content.len(),
+                            total_elapsed_ms = request_started.elapsed().as_millis(),
+                            "online hosts response body read"
+                        ),
+                        Err(error) => tracing::warn!(
+                            url = %url,
+                            %status,
+                            stage = "response_body",
+                            headers_elapsed_ms = headers_elapsed.as_millis(),
+                            body_elapsed_ms = body_started.elapsed().as_millis(),
+                            total_elapsed_ms = request_started.elapsed().as_millis(),
+                            timeout = error.is_timeout(),
+                            "online hosts response body read failed"
+                        ),
+                    }
+                    body_result
                 }
                 .await;
                 (url.to_owned(), result)
