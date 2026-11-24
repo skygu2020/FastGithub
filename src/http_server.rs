@@ -1297,6 +1297,40 @@ mod header_tests {
     }
 
     #[tokio::test]
+    async fn upgraded_io_activity_resets_shared_idle_timeout() {
+        use super::{ActivityIo, ActivityTimeout};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, mut peer) = tokio::io::duplex(16);
+        let activity = ActivityTimeout::new(Duration::from_millis(40));
+        let mut client = ActivityIo::new(client, activity.clone());
+
+        let transfer = async {
+            let writer = async {
+                for byte in b"abc" {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    peer.write_all(&[*byte]).await?;
+                }
+                Ok::<(), std::io::Error>(())
+            };
+            let reader = async {
+                let mut received = [0_u8; 3];
+                client.read_exact(&mut received).await?;
+                Ok::<_, std::io::Error>(received)
+            };
+            let (write_result, read_result) = tokio::join!(writer, reader);
+            write_result?;
+            read_result
+        };
+
+        let received = activity.run(transfer).await
+            .expect("ongoing tunnel reads must refresh the idle deadline")
+            .expect("duplex transfer must complete");
+        assert_eq!(&received, b"abc");
+    }
+
+    #[tokio::test]
     async fn pooled_response_body_activity_resets_idle_timeout() {
         use super::{TimeoutBody, UpstreamBodyTrace};
         use bytes::Bytes;
