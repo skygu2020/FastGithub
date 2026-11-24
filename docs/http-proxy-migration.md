@@ -133,3 +133,12 @@
 - 代码和测试尚未由本地 Cargo 工具链编译或执行；没有触发 GitHub Actions/CI。
 
 - 将既有 HTTP/2 多路复用 loopback 测试扩展为两个并发请求分别调用 `capture_connection`，验证二者捕获到同一个 peer IP 和 `connection_id`，且底层只建立一条 HTTP/2 连接。该用例直接覆盖连接池复用场景下的请求级连接关联，而不仅是单独测试 `Connected::extra`。
+
+
+## 上游响应体阶段的请求/连接关联（2026-11-24）
+
+- `send_pooled_request` 已能把请求关联到实际选中的上游连接，但此前关联信息只出现在连接分配和响应头日志中；`TimeoutBody` 在响应体超时或 stream 读取失败时只输出通用日志，无法从该条日志反查请求和 HTTP/2 连接。
+- 现在从 Hyper 响应 `Extensions` 读取连接器通过 `Connected::extra` 附加的 `UpstreamPeerInfo`，并将 method、原始 Host、request-target、peer IP 和 connection ID 作为轻量上下文传给 pooled response 的 `TimeoutBody`。
+- 响应体超时与上游 body stream error 日志会携带这些字段。没有连接元数据时字段保持为空，不会伪造 peer IP 或 connection ID。
+- 该包装只增加日志上下文，不缓存、不聚合、不预读响应体；每个 body frame 仍按原有 backpressure 逐帧转发。单个 HTTP/2 stream 超时/失败仍只终止该响应体，不主动关闭共享连接。
+- 本次未改变独立 HTTP/1 Upgrade 分支的 body trace；该分支使用专属连接且已有独立 driver guard。没有本地 Cargo 工具链可用，本次未运行 fmt、build 或 test，也没有触发 GitHub Actions/CI。
