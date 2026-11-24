@@ -95,21 +95,26 @@ impl DomainResolver {
         };
 
         let previous = {
+            // Clone endpoint state and release the endpoint lock before consulting
+            // the failure table. All paths that mutate both locks use the order
+            // failed_ips -> endpoints; never acquire them in reverse order.
             let endpoints = self.endpoints.read().await;
-            if let Some(state) = endpoints.get(&endpoint) {
-                if !state.addresses.is_empty()
-                    && state.refreshed_at.elapsed() < ENDPOINT_REFRESH_TTL
-                {
-                    let usable = self.exclude_failed(&endpoint.host, endpoint.port, &state.addresses).await;
-                    if !usable.is_empty() {
-                        return Ok(usable);
-                    }
-                }
-                state.addresses.clone()
-            } else {
-                Vec::new()
-            }
+            endpoints
+                .get(&endpoint)
+                .map(|state| (state.addresses.clone(), state.refreshed_at))
+                .unwrap_or_default()
         };
+        let previous_addresses = previous.0;
+        if !previous_addresses.is_empty()
+            && previous.1.elapsed() < ENDPOINT_REFRESH_TTL
+        {
+            let usable = self
+                .exclude_failed(&endpoint.host, endpoint.port, &previous_addresses)
+                .await;
+            if !usable.is_empty() {
+                return Ok(usable);
+            }
+        }
 
         self.ensure_endpoint(&endpoint).await;
 
@@ -184,13 +189,26 @@ impl DomainResolver {
     }
 
     async fn store_endpoint(&self, endpoint: EndpointRecord, addresses: Vec<IpAddr>) {
+        // Keep the failure-table read guard until the endpoint snapshot is
+        // committed. report_failure takes these locks in the same order, so a
+        // concurrent failure is either observed here or removes the address
+        // immediately after this write; it cannot be overwritten by a stale refresh.
+        let now = Instant::now();
+        let mut failed = self.failed_ips.write().await;
+        failed.retain(|_, expires| *expires > now);
+        let host = endpoint.host.clone();
+        let usable: Vec<_> = addresses
+            .into_iter()
+            .filter(|address| !failed.contains_key(&(host.clone(), endpoint.port, *address)))
+            .collect();
         self.endpoints.write().await.insert(
             endpoint,
             EndpointState {
-                addresses,
-                refreshed_at: Instant::now(),
+                addresses: usable,
+                refreshed_at: now,
             },
         );
+        drop(failed);
         self.save_addresses().await;
     }
 
@@ -309,13 +327,9 @@ impl DomainResolver {
 
         // Never replace a known-good candidate list with an empty result.
         let next = if ordered.is_empty() { old } else { ordered };
-        self.endpoints.write().await.insert(
-            endpoint,
-            EndpointState {
-                addresses: next,
-                refreshed_at: Instant::now(),
-            },
-        );
+        // Re-check the circuit-breaker table while committing the refreshed list;
+        // the earlier exclude_failed() is only a ranking-stage snapshot.
+        self.store_endpoint(endpoint, next).await;
     }
 
     /// Mark an IP as failed for this host/port for 90 seconds and remove it from that endpoint's candidates.
