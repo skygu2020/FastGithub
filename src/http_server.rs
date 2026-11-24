@@ -509,8 +509,12 @@ async fn handle_request_inner(request: Request<Incoming>, scheme: &str, config: 
             if http2_expect_continue_unsupported(request.version(), request.headers()) {
                 return empty_response(StatusCode::EXPECTATION_FAILED);
             }
+            // The C# implementation uses HttpMessageInvoker, not HttpClient's
+            // default 100-second timeout. An absent DomainConfig.Timeout is
+            // therefore unbounded; an explicit timeout covers forwarding through
+            // response headers, not the subsequent streamed response body.
             let timeout_duration = match domain.as_ref().map(|rule| rule.request_timeout()).transpose() {
-                Ok(value) => value.flatten().or(Some(Duration::from_secs(100))),
+                Ok(value) => value.flatten(),
                 Err(error) => {
                     tracing::warn!(%error, "invalid configured request timeout");
                     return empty_response(StatusCode::BAD_GATEWAY);
@@ -527,7 +531,7 @@ async fn handle_request_inner(request: Request<Incoming>, scheme: &str, config: 
                 if is_upgrade_request(&request) {
                     forward_upgrade_request(request, uri, request_target, original_host, domain, timeout_duration, request_started, resolver, domains, config, tls_proxy).await
                 } else {
-                    forward_request(request, uri, request_target, original_host, timeout_duration, request_started, tls_proxy).await
+                    forward_request(request, uri, request_target, original_host, tls_proxy).await
                 }
             };
             match timeout_duration {
@@ -575,8 +579,6 @@ async fn forward_request(
     uri: url::Url,
     request_target: String,
     original_host: String,
-    body_timeout: Option<Duration>,
-    request_started: tokio::time::Instant,
     tls_proxy: &crate::http_proxy::TlsProxy,
 ) -> anyhow::Result<Response<ResponseBody>> {
     if has_fastgithub_user_agent(request.headers()) {
@@ -626,10 +628,12 @@ async fn forward_request(
     strip_hop_by_hop_headers(&mut response_parts.headers);
     response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
     let boxed_body = response_body.map_err(|error| Box::new(error) as BoxError).boxed_unsync();
-    let remaining = body_timeout.map(|duration| duration.saturating_sub(request_started.elapsed()));
+    // C# applies DomainConfig.Timeout while SendAsync is obtaining the
+    // upstream response, but does not impose that timeout on streamed content.
+    // Keep the pooled response body streaming without an artificial deadline.
     let response_body = TimeoutBody::new_pooled(
         boxed_body,
-        remaining,
+        None,
         UpstreamBodyTrace {
             method: request_method,
             original_host,
