@@ -414,3 +414,26 @@ Rust 普通 HTTP 转发现已引入共享 `ActivityTimeout`：100 秒 deadline �
 - 这证明当前用户环境中的 Hickory DoH 查询链路可用，并成功向上层 resolver 提供地址。由于本次没有记录 fallback DNS 查询日志，只能结合代码路径和启动信息判断本次没有观察到明文回退；不能据此证明 DoH 失败时的 fallback 分支也已验证。
 - 该命令只验证解析和候选地址输出，不验证通过 HTTP 代理访问 GitHub 时的 TCP/TLS、上游 HTTP 响应或连接池行为。后续应单独用 `native-doh` 构建启动代理，再访问 GitHub 页面并结合 peer IP / connection ID 日志观察。
 - 用户尚未提供 Rust 1.78 工具链构建结果；本次记录不代表 `cargo build`、`cargo test` 或 `cargo fmt` 已通过。没有触发 GitHub Actions/CI。
+
+## 原生 DoH 代理访问 GitHub 的首次实测（用户环境，2026-11-24）
+
+用户以启用 `native-doh` 的二进制启动代理并打开 `https://github.com/Cyridd/cmpunlocker/issues`。本次关键日志：
+
+```text
+HTTP request completed method=GET target=github.com/Cyridd/cmpunlocker/issues status=200 elapsed_ms=871
+HTTP request completed method=GET target=github.com/Cyridd/cmpunlocker/issues/deferred?... status=304 elapsed_ms=436
+HTTP request completed method=GET target=github.com/Cyridd/cmpunlocker/issues/views.json status=304 elapsed_ms=313
+HTTP request completed method=GET target=github.githubassets.com/assets/...js status=200 elapsed_ms=447
+HTTP request completed method=GET target=github.com/.../ws?... status=101 elapsed_ms=1355
+HTTP request completed method=POST target=api.github.com/_private/browser/stats status=200 elapsed_ms=920
+initial hosts and DNS/IP refresh completed success=true domains=41 errors=
+```
+
+- 这是原生 DoH 首次真实代理访问验证：Issues 页面主请求返回 200；GitHub 页面接口与缓存校验请求返回 304；静态 JS 返回 200；WebSocket 返回 101；GitHub API stats 请求返回 200。此前 GitHub 页面请求长时间没有响应头、最终触发 100 秒 activity timeout 并返回 502 的问题，本次访问没有重现。
+- 多个 `collector.github.com/github/collect` POST 返回 422，但页面、静态资源、WebSocket 与 API 请求仍成功。当前日志不足以判断 422 的服务端业务原因；不能把它当作代理 TCP/TLS 故障，也不应据此改变转发逻辑。
+- 运行期间有三个 DoH 查询在 4 秒预算内未完成：`private-user-images.githubusercontent.com`、`viewscreen.githubusercontent.com`、`release-assets.githubusercontent.com`。代码随后进入配置的普通 DNS fallback；之后这些域名都出现了 endpoint speed order 更新，且整轮 hosts/DNS/IP 刷新最终成功（41 domains、空 errors）。这说明当前 fallback 路径在该轮运行中帮助维持了可用性，但日志没有单独标明每个地址究竟来自 fallback 查询、已有缓存还是 hosts 映射，不能把来源归因到某一种。
+- `github.com:443` 的测速排序更新为 `[20.247.166.64, 20.233.83.145, 20.27.177.113]`。后续多个请求/连接尝试记录到这些候选以及 `57.155.223.240` 的 TCP connect deadline 约 10 秒超时。与此同时浏览器请求仍有 304 响应，说明这些候选连接超时没有阻断全部并发请求；不能从聚合日志推断每条成功响应最终使用了哪个 peer IP。
+- 这些 TCP 超时发生在 TCP connect 阶段，尚未进入 TLS，更不是此前“TLS 成功但 HTTP 响应头不返回”的同一种故障。应继续观察候选 IP 的实际成功连接和熔断状态；不能仅凭单次超时永久剔除 IP。
+- 本次日志没有显示 `upstream transport connection ready` 的 peer_ip/connection_id 记录，因此尚不能将具体成功请求精确关联到一个 GitHub peer IP。后续如需定位慢请求，应保留连接建立日志，并补充请求级关联信息；不要因单个 HTTP/2 stream 失败而关闭共享连接，也不要盲目重放已发送请求。
+- 当前 4 秒 DoH timeout 会触发明文 fallback，这是现有实现的明确隐私降级行为，不是 DoH 仍在查询明文 DNS。后续应把 fallback policy 变成显式配置/策略：允许时记录降级原因，不允许时失败关闭；在用户确认策略前不擅自改变默认行为。
+- 本轮没有修改连接候选、超时、DoH fallback 或请求重试策略。没有本地 Cargo 工具链，未运行 fmt/build/test；没有触发 GitHub Actions/CI。
