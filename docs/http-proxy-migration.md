@@ -438,6 +438,22 @@ initial hosts and DNS/IP refresh completed success=true domains=41 errors=
 - 当前 4 秒 DoH timeout 会触发明文 fallback，这是现有实现的明确隐私降级行为，不是 DoH 仍在查询明文 DNS。后续应把 fallback policy 变成显式配置/策略：允许时记录降级原因，不允许时失败关闭；在用户确认策略前不擅自改变默认行为。
 - 本轮没有修改连接候选、超时、DoH fallback 或请求重试策略。没有本地 Cargo 工具链，未运行 fmt/build/test；没有触发 GitHub Actions/CI。
 
+## 上游连接失败日志补充协议标识（2026-11-24）
+
+用户实测日志出现一次 pooled request failure：GET 请求分配到 `20.205.243.166`、`connection_id=1`，等待约 32 秒后 Hyper 返回 `client error (SendRequest)`，代理向客户端返回 502。该日志能确认请求关联到某条已有上游连接，但还不足以判断它是 HTTP/1.1 keep-alive 连接问题还是 HTTP/2 stream/connection 问题。
+
+为缩小诊断范围：
+
+- `UpstreamPeerInfo` 现在随 peer IP 和 connection ID 一起记录协商结果 `http2`。
+- 连接分配、收到响应头、pooled request failure 日志都输出该字段。
+- 上游响应 body stall / body stream failure 日志也输出对应连接协议。
+- 该改动只增加诊断元数据，不改变连接池寿命、HTTP 协议协商、错误淘汰策略或请求重试行为。
+- 不能把普通 `SendRequest` 错误一概视为连接级故障：HTTP/2 stream reset 不应自动导致整个 per-host client pool 被清除；也不能盲目重放请求，尤其是 POST。
+
+用户 2026-11-24 的同一轮日志还显示：`hosts.gitcdn.top` 在 response headers 阶段耗尽 20 秒请求预算；DoH 对三个域名分别耗尽 4 秒预算；一个 `api.github.com` TCP 候选连接耗尽 10 秒候选期限。这些是三条独立链路，不能合并归因。
+
+本轮只增加 HTTP/1.1/HTTP/2 诊断标识，没有本地 Cargo 工具链可执行 fmt/build/test，也没有触发 GitHub Actions/CI。
+
 ## 原生 DoH 明文回退策略配置化（2026-11-24）
 
 根据用户实测，Cloudflare DoH 对部分域名偶发超过当前 4 秒查询预算；此前实现会自动将这些查询发送到 `FastGithub.FallbackDns` 中的普通 DNS。为避免加密查询失败时无提示地泄漏查询名称，本轮将该行为改为显式配置：
