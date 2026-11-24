@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
             let config = config::AppConfig::load(&config_path)?;
             let (host, port) = endpoint.rsplit_once(':').context("endpoint must be host:port")?;
             let port: u16 = port.parse().context("invalid endpoint port")?;
-            let (dns, proxy) = build_dns_client(config.fast_github.fallback_dns).await;
+            let (dns, proxy) = build_dns_client(config.fast_github.fallback_dns, config.fast_github.allow_plain_dns_fallback).await;
             let persistence = persistence::Persistence::new("dnsendpoints.json");
             let resolver = resolver::DomainResolver::new(dns, persistence).await?;
             for address in resolver.resolve(host, port).await? { println!("{address}"); }
@@ -104,7 +104,7 @@ async fn main() -> Result<()> {
         }
         Some(Command::TestDns) => {
             let config = config::AppConfig::load(&config_path)?;
-            let (dns, proxy) = build_dns_client(config.fast_github.fallback_dns).await;
+            let (dns, proxy) = build_dns_client(config.fast_github.fallback_dns, config.fast_github.allow_plain_dns_fallback).await;
             let persistence = persistence::Persistence::new("dnsendpoints.json");
             let resolver = resolver::DomainResolver::new(dns, persistence).await?;
             resolver.test_speed().await?;
@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
         }
         Some(Command::WatchDns) => {
             let config = config::AppConfig::load(&config_path)?;
-            let (dns, proxy) = build_dns_client(config.fast_github.fallback_dns).await;
+            let (dns, proxy) = build_dns_client(config.fast_github.fallback_dns, config.fast_github.allow_plain_dns_fallback).await;
             let persistence = persistence::Persistence::new("dnsendpoints.json");
             let resolver = resolver::DomainResolver::new(dns, persistence).await?;
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -154,7 +154,7 @@ async fn main() -> Result<()> {
             );
             tracing::info!(version = env!("CARGO_PKG_VERSION"), proxy_port = config.fast_github.http_proxy_port,
                 domains = config.fast_github.domain_configs.len(), "FastGithub Rust Linux configuration loaded");
-            let (dns, proxy) = build_dns_client(config.fast_github.fallback_dns.iter().copied().collect()).await;
+            let (dns, proxy) = build_dns_client(config.fast_github.fallback_dns.iter().copied().collect(), config.fast_github.allow_plain_dns_fallback).await;
             let result = http_proxy::run(config, config_path.clone(), dns, certificates).await;
             if let Some(proxy) = proxy {
                 proxy.stop().await;
@@ -166,19 +166,27 @@ async fn main() -> Result<()> {
 }
 
 
-async fn build_dns_client(fallback_dns: Vec<std::net::SocketAddr>) -> (dns::DnsClient, Option<dnscrypt::DnscryptProxy>) {
+async fn build_dns_client(
+    fallback_dns: Vec<std::net::SocketAddr>,
+    allow_plain_dns_fallback: bool,
+) -> (dns::DnsClient, Option<dnscrypt::DnscryptProxy>) {
     #[cfg(feature = "native-doh")]
     {
         use hickory_resolver::{config::ResolverConfig, name_server::TokioConnectionProvider, TokioResolver};
-        tracing::info!("using in-process Cloudflare DNS-over-HTTPS; plain DNS servers are fallback only");
+        if allow_plain_dns_fallback {
+            tracing::warn!("native DoH enabled; configured plaintext DNS fallback is explicitly allowed");
+        } else {
+            tracing::info!("native DoH enabled in strict mode; plaintext DNS fallback is disabled");
+        }
         let resolver = TokioResolver::builder_with_config(
             ResolverConfig::cloudflare_https(),
             TokioConnectionProvider::default(),
         ).build();
-        (dns::DnsClient::with_doh(fallback_dns, resolver), None)
+        (dns::DnsClient::with_doh(fallback_dns, resolver, allow_plain_dns_fallback), None)
     }
     #[cfg(not(feature = "native-doh"))]
     {
+        let _ = allow_plain_dns_fallback;
         let proxy = dnscrypt::DnscryptProxy::discover().ok();
         let mut upstreams = Vec::new();
         if let Some(proxy) = proxy.as_ref() {
