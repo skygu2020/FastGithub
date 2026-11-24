@@ -970,7 +970,7 @@ async fn forward_upgrade_request(
         let mut failures = Vec::new();
         let mut connected: Option<Box<dyn AsyncIo>> = None;
         for _ in 0..8 {
-            let (stream, upstream_ip) = match crate::http_proxy::connect_target_excluding(
+            let (stream, upstream_ip, candidate_deadline) = match crate::http_proxy::connect_target_excluding_with_deadline(
                 host, port, resolver, domains, config, domain.as_ref(), &attempted,
             ).await {
                 Ok(value) => value,
@@ -980,7 +980,9 @@ async fn forward_upgrade_request(
                 }
             };
             attempted.push(upstream_ip);
-            match tls_proxy.connect_upstream(stream, host, upstream_ip, domain.as_ref(), false).await {
+            match tls_proxy.connect_upstream(
+                stream, host, upstream_ip, domain.as_ref(), false, candidate_deadline,
+            ).await {
                 Ok(tls) => {
                     connected = Some(Box::new(tls));
                     break;
