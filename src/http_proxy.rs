@@ -62,9 +62,9 @@ trait ProxyIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> ProxyIo for T {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct UpstreamPeerInfo {
-    peer_ip: IpAddr,
-    connection_id: u64,
+pub(crate) struct UpstreamPeerInfo {
+    pub(crate) peer_ip: IpAddr,
+    pub(crate) connection_id: u64,
 }
 
 struct ConnectedUpstreamIo {
