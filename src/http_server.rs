@@ -1074,6 +1074,35 @@ mod header_tests {
     }
 
     #[tokio::test]
+    async fn pooled_response_body_can_continue_past_request_timeout_window() {
+        use super::{TimeoutBody, UpstreamBodyTrace};
+        use bytes::Bytes;
+        use http_body_util::{BodyExt, Full};
+        use std::time::Duration;
+
+        let inner = Full::new(Bytes::from_static(b"still streaming"))
+            .map_err(|never| -> super::BoxError { match never {} })
+            .boxed_unsync();
+        let trace = UpstreamBodyTrace {
+            method: http::Method::GET,
+            original_host: "example.test".to_owned(),
+            request_target: "/large".to_owned(),
+            peer: None,
+        };
+        let mut body = TimeoutBody::new_pooled(inner, None, trace);
+
+        // The C# timeout token ends when SendAsync returns response headers.
+        // Waiting longer than a hypothetical request-header budget must not
+        // terminate the subsequent response-body stream.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            body.frame().await.unwrap().unwrap().into_data().unwrap(),
+            Bytes::from_static(b"still streaming"),
+        );
+        assert!(body.frame().await.is_none());
+    }
+
+    #[tokio::test]
     async fn completed_response_body_releases_upstream_driver() {
         use super::TimeoutBody;
         use bytes::Bytes;
