@@ -102,17 +102,21 @@ impl DomainResolver {
             endpoints
                 .get(&endpoint)
                 .map(|state| (state.addresses.clone(), state.refreshed_at))
-                .unwrap_or_default()
         };
-        let previous_addresses = previous.0;
-        if !previous_addresses.is_empty()
-            && previous.1.elapsed() < ENDPOINT_REFRESH_TTL
-        {
+        let previous_addresses = previous
+            .as_ref()
+            .map(|(addresses, _)| addresses.clone())
+            .unwrap_or_default();
+        if let Some((_, refreshed_at)) = previous.as_ref() {
+            if !previous_addresses.is_empty()
+                && refreshed_at.elapsed() < ENDPOINT_REFRESH_TTL
+            {
             let usable = self
                 .exclude_failed(&endpoint.host, endpoint.port, &previous_addresses)
                 .await;
-            if !usable.is_empty() {
-                return Ok(usable);
+                if !usable.is_empty() {
+                    return Ok(usable);
+                }
             }
         }
 
