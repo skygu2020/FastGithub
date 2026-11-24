@@ -42,7 +42,7 @@ impl DnsClient {
 
  
     /// Create a DNS client backed by an in-process DNS-over-HTTPS resolver.
-    /// Plain DNS upstreams are only used if the encrypted lookup fails.
+    /// Plain DNS upstreams are used after encrypted lookup failure only when explicitly allowed.
     #[cfg(feature = "native-doh")]
     pub fn with_doh(
         upstreams: Vec<SocketAddr>,
