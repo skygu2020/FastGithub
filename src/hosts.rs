@@ -226,6 +226,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn merging_sources_keeps_failed_source_snapshot_when_another_source_updates() {
+        let first_url = "https://raw.hellogithub.com/hosts.json".to_owned();
+        let second_url = "https://hosts.gitcdn.top/hosts.txt".to_owned();
+        let mut sources = HashMap::new();
+        sources.insert(
+            first_url.clone(),
+            parse_hosts("192.0.2.10 shared.example\\n192.0.2.11 first-only.example"),
+        );
+        sources.insert(
+            second_url.clone(),
+            parse_hosts("192.0.2.20 second-only.example\\n192.0.2.10 shared.example"),
+        );
+
+        // The first source succeeds with a newer snapshot. The second source
+        // is absent from this refresh and therefore keeps its previous snapshot.
+        sources.insert(
+            first_url,
+            parse_hosts("192.0.2.12 shared.example\\n192.0.2.13 first-new.example"),
+        );
+
+        let merged = merge_source_mappings(&sources);
+        assert_eq!(
+            merged.get("shared.example").unwrap().len(),
+            2,
+            "addresses from both current and retained source snapshots should merge"
+        );
+        assert!(merged.contains_key("first-new.example"));
+        assert!(!merged.contains_key("first-only.example"));
+        assert!(merged.contains_key("second-only.example"));
+    }
+
+    #[test]
     fn parses_json_hosts_and_deduplicates_addresses() {
         let parsed = parse_hosts(
             r#"[["192.0.2.1","Example.com"],["192.0.2.1","example.com"],["2001:db8::1","example.com"]]"#,
