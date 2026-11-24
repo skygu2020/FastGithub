@@ -17,6 +17,8 @@ struct StateEntry { available: bool, expires_at: Instant }
 #[derive(Clone)]
 pub struct DnsClient {
     upstreams: Arc<Vec<SocketAddr>>,
+    #[cfg(feature = "native-dnscrypt")]
+    encrypted: Option<dnscrypt::Client>,
     cache: Arc<Mutex<HashMap<(SocketAddr, String), CacheEntry>>>,
     state_cache: Arc<Mutex<HashMap<SocketAddr, StateEntry>>>,
     failure_counts: Arc<Mutex<HashMap<SocketAddr, u8>>>,
@@ -26,6 +28,22 @@ impl DnsClient {
     pub fn new(upstreams: Vec<SocketAddr>) -> Self {
         Self {
             upstreams: Arc::new(upstreams),
+            #[cfg(feature = "native-dnscrypt")]
+            encrypted: None,
+            cache: Arc::new(Mutex::new(HashMap::new())),
+            state_cache: Arc::new(Mutex::new(HashMap::new())),
+            failure_counts: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+
+    /// Create a DNS client with an in-process DNSCrypt v2 backend.
+    /// Plain DNS upstreams remain available as the existing fallback path.
+    #[cfg(feature = "native-dnscrypt")]
+    pub fn with_dnscrypt(upstreams: Vec<SocketAddr>, encrypted: dnscrypt::Client) -> Self {
+        Self {
+            upstreams: Arc::new(upstreams),
+            encrypted: Some(encrypted),
             cache: Arc::new(Mutex::new(HashMap::new())),
             state_cache: Arc::new(Mutex::new(HashMap::new())),
             failure_counts: Arc::new(Mutex::new(HashMap::new())),
@@ -46,6 +64,23 @@ impl DnsClient {
         if host == "localhost" { return Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)]); }
 
         let mut addresses = Vec::new();
+        #[cfg(feature = "native-dnscrypt")]
+        if let Some(encrypted) = self.encrypted.as_ref() {
+            match timeout(DNS_TIMEOUT, encrypted.lookup(&host)).await {
+                Ok(Ok(found)) => {
+                    tracing::debug!(%host, addresses = found.len(), "DNSCrypt v2 lookup succeeded");
+                    for ip in found {
+                        if !ip.is_loopback() && !addresses.contains(&ip) { addresses.push(ip); }
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%host, %error, "DNSCrypt v2 lookup failed; trying configured fallback DNS");
+                }
+                Err(_) => {
+                    tracing::warn!(%host, timeout_ms = DNS_TIMEOUT.as_millis(), "DNSCrypt v2 lookup timed out; trying configured fallback DNS");
+                }
+            }
+        }
         for upstream in self.upstreams.iter().copied() {
             // The reference implementation probes TCP only for port 53; custom ports are UDP.
             if upstream.port() == 53 && !self.upstream_available(upstream).await { continue; }
