@@ -223,10 +223,10 @@ pub(crate) fn negotiated_http2(selected_alpn: Option<&[u8]>) -> bool {
 
 const BAD_REQUEST_RESPONSE: &[u8] = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
 
-pub async fn run(config: AppConfig, config_path: PathBuf, upstreams: Vec<SocketAddr>, certificates: Arc<CertificateService>) -> Result<()> {
+pub async fn run(config: AppConfig, config_path: PathBuf, dns: DnsClient, certificates: Arc<CertificateService>) -> Result<()> {
     let parent_pid = unsafe { libc::getppid() as u32 };
     let port = config.fast_github.http_proxy_port;
-    let resolver = DomainResolver::new(DnsClient::new(upstreams), Persistence::new("dnsendpoints.json")).await?;
+    let resolver = DomainResolver::new(dns, Persistence::new("dnsendpoints.json")).await?;
     let config = Arc::new(ArcSwap::from_pointee(config));
     let tls_proxy = Arc::new(TlsProxy::new(
         certificates,
