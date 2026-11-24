@@ -666,8 +666,8 @@ impl TlsProxy {
         upstream_ip: IpAddr,
         domain_config: Option<&crate::config::DomainConfig>,
         allow_http2: bool,
+        candidate_deadline: tokio::time::Instant,
     ) -> Result<SslStream<TcpStream>> {
-        let candidate_deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
         connect_upstream_tls(
             &self.connector,
             upstream,
