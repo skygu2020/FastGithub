@@ -158,3 +158,10 @@
 - 该用例补足了此前仅取消等待中 stream 的覆盖：现在分别覆盖请求 future 被取消，以及响应体阶段发生 stream 级失败两种不同路径。测试断言只要求失败 stream 返回 body error，不把 Hyper 的底层错误类型推断为某个精确的 RST_STREAM code，也不据此改变连接池淘汰策略。
 - 这是 Hyper HTTP/2 client/server loopback 回归，不是 TLS 代理端到端测试。当前环境没有本地 Rust 工具链，尚未运行 fmt/build/test；没有触发 GitHub Actions/CI。用户手动构建时应重点确认 body error 确实只终止该 stream，且 sibling 与 follow-up 均通过。
 
+## HTTP/2 GOAWAY 后连接池重建回归（2026-11-24）
+
+- 新增 `pooled_client_reconnects_after_http2_goaway`：mock HTTP/2 上游在处理首个请求时发起 graceful shutdown，由 Hyper server 发送 GOAWAY 并排空活动 stream；首个响应消费完成后，再通过同一个 Hyper legacy Client 发起第二个请求。
+- 测试要求第二个请求成功、捕获到不同的 `connection_id`，且 connector 总连接数为 2，以验证连接池不继续向已收到 GOAWAY 的 HTTP/2 连接分配新请求。
+- 该用例针对连接级 graceful shutdown/GOAWAY，与单 stream body error 隔离测试互补。它不触发主动连接池清空，也不改变 `send_pooled_request` 的错误分类/淘汰策略；连接可用性由 Hyper pool 管理。
+- 这是 mock connector + Hyper HTTP/2 loopback 测试。当前没有本地 Rust 工具链，未运行 fmt/build/test；没有触发 GitHub Actions/CI。需由用户手动验证 Hyper 当前解析版本下 GOAWAY 时序及第二次请求确实建立新连接。
+
