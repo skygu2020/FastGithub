@@ -201,6 +201,7 @@ Rust 普通 HTTP 转发现已引入共享 `ActivityTimeout`：100 秒 deadline �
 - 收到非 101 响应时，响应体 `TimeoutBody` 继续使用同一活动时钟，并保留上游连接 driver guard。
 - 收到合法 101 后，等待下游和上游 `OnUpgrade` handoff 的阶段受同一活动 deadline 保护；双向隧道的两端 IO 都通过 `ActivityIo` 包装，任一方向有实际字节读写都会刷新 deadline。隧道复制 future 由同一个活动时钟包围；连续无数据活动达到 100 秒时终止隧道并输出 host、request-target 和超时值。
 - 新增 `upgraded_io_activity_resets_shared_idle_timeout`，使用 loopback duplex IO 验证跨越单个 40ms deadline 的连续字节读取仍能完成（每个字节间隔 25ms），避免将总连接时长误当作 idle timeout。
+- 新增 `upgraded_tunnel_idle_timeout_expires_without_io_progress`，验证隧道两端没有任何读写活动时共享 10ms 测试 deadline 会终止等待；上游响应头阶段超时也会输出 host、request-target 和 100 秒活动期限。
 
 限制：Upgrade 分支的 DNS/TCP 建连和 OpenSSL TLS 握手发生在可包装的隧道 IO 建立之前，目前仍依赖各自底层连接/握手超时机制，不由共享 ActivityTimeout 的读写活动刷新。该差异需要后续单独检查连接超时配置；没有宣称此处已完全复刻 YARP 的所有阶段。
 
