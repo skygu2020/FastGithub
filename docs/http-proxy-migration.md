@@ -165,3 +165,23 @@
 - 该用例针对连接级 graceful shutdown/GOAWAY，与单 stream body error 隔离测试互补。它不触发主动连接池清空，也不改变 `send_pooled_request` 的错误分类/淘汰策略；连接可用性由 Hyper pool 管理。
 - 这是 mock connector + Hyper HTTP/2 loopback 测试。当前没有本地 Rust 工具链，未运行 fmt/build/test；没有触发 GitHub Actions/CI。需由用户手动验证 Hyper 当前解析版本下 GOAWAY 时序及第二次请求确实建立新连接。
 
+## C# 超时语义对照与长响应断线修正（2026-11-24）
+
+对照当前 `master` 的原始 C# 源码：
+
+- `FastGithub.Configuration/DomainConfig.cs` 中 `Timeout` 类型为 `TimeSpan?`，默认值为 null。
+- `FastGithub.Http/HttpClientHandler.cs` 仅在 `domainConfig.Timeout != null` 时创建 timeout token，并将其与调用方 token 链接后传给 `base.SendAsync`；没有设置默认 100 秒。
+- 自定义 `FastGithub.Http.HttpClient` 继承 `HttpMessageInvoker`，不是带默认 100 秒超时的 `System.Net.Http.HttpClient`。
+- `FastGithub.HttpServer/HttpMiddlewares/HttpReverseProxyMiddleware.cs` 使用 YARP `IHttpForwarder.SendAsync`。自定义 timeout token 属于上游 SendAsync 阶段；C# 代码没有在响应体流式复制阶段继续套用该 token。
+
+Rust 之前存在两处不兼容行为：
+1. 未配置 `DomainConfig.Timeout` 时，`src/http_server.rs` 强行使用 100 秒默认期限。
+2. 收到上游响应头后，又把剩余期限传入 `TimeoutBody::new_pooled`，导致长响应体下载在期限到达时被主动截断。
+
+本次修正：
+- 提取 `configured_request_timeout`：只有显式配置 Timeout 才返回期限；未配置时返回 `None`。
+- 普通 pooled HTTP 响应体使用无期限的 `TimeoutBody`，保留原有流式传输、背压和响应体错误日志；显式 Timeout 仍由外层 forwarding timeout 限制请求发送、DNS/连接/TLS 和等待响应头阶段。
+- 增加两个单元测试，覆盖未配置时不产生默认期限，以及显式 7 秒配置被正确保留。
+
+注意：该修复只对齐 C# 的普通 HTTP 请求/响应流语义。HTTP Upgrade/WebSocket 路径需要单独对照 YARP 的隧道生命周期行为；不能把普通响应体结论直接套用到 Upgrade。当前环境没有本地 Rust 工具链，未运行 fmt/build/test；没有触发 GitHub Actions/CI。
+
