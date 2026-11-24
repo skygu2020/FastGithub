@@ -192,7 +192,7 @@ Rust 之前将默认 100 秒 ActivityTimeout 错误实现成从请求开始计�
 - `StreamCopier.CopyAsync` 在每次成功读取输入数据、每次成功写入输出数据后重置活动计时器；请求体和响应体都覆盖。
 - `ForwarderRequestConfig.Empty` 默认请求版本为 HTTP/2.0，版本策略为 `RequestVersionOrLower`。因此不能仅凭 FastGithub 的 URI scheme 被改写成 http，就断言 C# 上游固定使用 HTTP/1.1；最终协议由 SocketsHttpHandler 的版本协商行为决定。
 
-Rust 普通 HTTP 转发现已引入共享 `ActivityTimeout`：100 秒 deadline 同时覆盖等待连接/响应头与请求上传；请求体 frame/EOF 会刷新共享时钟；收到响应头时重置；响应体 wrapper 继续使用同一时钟，并在成功 frame 后刷新。这样持续有数据的普通上传/下载不会因总耗时超过 100 秒而被硬切断。新增测试分别覆盖上传 frame 刷新共享 deadline、响应 frame 刷新 idle timeout。仍有边界差异：YARP 在成功 read 和 write 两侧均刷新，Hyper Body wrapper 只能在 frame 产出时刷新，无法直接观察 socket write 完成；HTTP Upgrade/WebSocket 双向复制也尚未接入共享活动时钟。显式 `DomainConfig.Timeout` 仍单独限制 forwarding/SendAsync 阶段，普通响应体阶段不继续使用该配置期限。
+Rust 普通 HTTP 转发现已引入共享 `ActivityTimeout`：100 秒 deadline 同时覆盖等待连接/响应头与请求上传；请求体 frame/EOF 会刷新共享时钟；收到响应头时重置；响应体 wrapper 继续使用同一时钟，并在成功 frame 后刷新。这样持续有数据的普通上传/下载不会因总耗时超过 100 秒而被硬切断。新增测试分别覆盖上传 frame 刷新共享 deadline、响应 frame 刷新 idle timeout。仍有边界差异：YARP 在成功 read 和 write 两侧均刷新，Hyper Body wrapper 只能在 frame 产出时刷新，无法直接观察 socket write 完成。HTTP Upgrade/WebSocket 隧道已单独接入共享活动时钟，详见后文；其 DNS/TCP/TLS 建连阶段仍需进一步对齐连接超时。显式 `DomainConfig.Timeout` 仍单独限制 forwarding/SendAsync 阶段，普通响应体阶段不继续使用该配置期限。
 
 ## HTTP Upgrade / WebSocket 活动超时（2026-11-24）
 
@@ -203,4 +203,12 @@ Rust 普通 HTTP 转发现已引入共享 `ActivityTimeout`：100 秒 deadline �
 - 新增 `upgraded_io_activity_resets_shared_idle_timeout`，使用 loopback duplex IO 验证跨越单个 40ms deadline 的连续字节读取仍能完成（每个字节间隔 25ms），避免将总连接时长误当作 idle timeout。
 
 限制：Upgrade 分支的 DNS/TCP 建连和 OpenSSL TLS 握手发生在可包装的隧道 IO 建立之前，目前仍依赖各自底层连接/握手超时机制，不由共享 ActivityTimeout 的读写活动刷新。该差异需要后续单独检查连接超时配置；没有宣称此处已完全复刻 YARP 的所有阶段。
+
+## C# 与 Rust 上游连接超时边界（2026-11-24）
+
+对照 `FastGithub.Http.HttpClientHandler.ConnectCallback`：
+- C# 对每个 IP 候选创建一个 10 秒 CancellationTokenSource，并将同一个 token 传给 `ConnectAsync`；该 10 秒预算同时覆盖 TCP connect 和 HTTPS TLS Authenticate。
+- Rust 的 `connect_target_excluding` 对每个 TCP 候选使用 10 秒 `CONNECT_TIMEOUT`；`connect_upstream_tls` 又对 TLS handshake 单独使用 10 秒。因此 Rust 在 TCP 与 TLS 都接近超时时，单个候选的累计等待可能接近 20 秒，和 C# 的单个 10 秒候选预算不完全相同。
+- 两边都在 TCP/TLS 候选失败后继续尝试后续 IP；Rust pooled HTTPS connector 会排除已尝试 IP，Upgrade 分支也会继续尝试下一个 TLS 候选。
+- 这是连接建立延迟边界差异，不应与 HTTP 响应头到达后的长时间无活动混为一谈。后续可将 Rust 的 TCP+TLS 候选预算合并为单个 10 秒 deadline，同时保持每个 IP 都有独立预算；当前没有改变连接重试策略。
 
