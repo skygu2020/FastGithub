@@ -18,6 +18,9 @@ pub struct HostsRefreshResult {
 #[derive(Clone)]
 pub struct HostsService {
     client: Client,
+    // Keep each source's last-known-good snapshot independently. A partial
+    // refresh must not erase entries contributed only by a failed source.
+    source_mappings: Arc<RwLock<HashMap<String, HashMap<String, Vec<IpAddr>>>>>,
     mapping: Arc<RwLock<HashMap<String, Vec<IpAddr>>>>,
 }
 
@@ -29,6 +32,7 @@ impl HostsService {
             .build()?;
         Ok(Self {
             client,
+            source_mappings: Arc::new(RwLock::new(HashMap::new())),
             mapping: Arc::new(RwLock::new(HashMap::new())),
         })
     }
@@ -57,7 +61,7 @@ impl HostsService {
             });
         }
 
-        let mut merged: HashMap<String, Vec<IpAddr>> = HashMap::new();
+        let mut successful_sources = Vec::new();
         let mut errors = Vec::new();
         let mut success_count = 0usize;
 
@@ -70,14 +74,7 @@ impl HostsService {
                         continue;
                     }
                     success_count += 1;
-                    for (host, addresses) in parsed {
-                        let target = merged.entry(host).or_default();
-                        for address in addresses {
-                            if !target.contains(&address) {
-                                target.push(address);
-                            }
-                        }
-                    }
+                    successful_sources.push((url, parsed));
                 }
                 Ok((url, Err(error))) => {
                     let detail = format!(
@@ -109,10 +106,23 @@ impl HostsService {
             };
         }
 
-        let domain_count = merged.len();
-        *self.mapping.write().await = merged;
+        // Replace only snapshots from sources that returned a valid mapping.
+        // Failed/empty sources retain their own last-known-good data, while a
+        // source that succeeds can still remove entries it no longer publishes.
+        let (domain_count, cached_source_count) = {
+            let mut source_mappings = self.source_mappings.write().await;
+            for (url, parsed) in successful_sources {
+                source_mappings.insert(url, parsed);
+            }
+            let merged = merge_source_mappings(&source_mappings);
+            let domain_count = merged.len();
+            let cached_source_count = source_mappings.len();
+            *self.mapping.write().await = merged;
+            (domain_count, cached_source_count)
+        };
         tracing::info!(
             sources = success_count,
+            cached_sources = cached_source_count,
             total_sources = HOSTS_URLS.len(),
             domains = domain_count,
             "online hosts mapping refreshed"
@@ -136,6 +146,23 @@ impl HostsService {
     pub async fn domain_count(&self) -> usize {
         self.mapping.read().await.len()
     }
+}
+
+fn merge_source_mappings(
+    sources: &HashMap<String, HashMap<String, Vec<IpAddr>>>,
+) -> HashMap<String, Vec<IpAddr>> {
+    let mut merged: HashMap<String, Vec<IpAddr>> = HashMap::new();
+    for source in sources.values() {
+        for (host, addresses) in source {
+            let target = merged.entry(host.clone()).or_default();
+            for address in addresses {
+                if !target.contains(address) {
+                    target.push(*address);
+                }
+            }
+        }
+    }
+    merged
 }
 
 fn parse_hosts(content: &str) -> HashMap<String, Vec<IpAddr>> {
