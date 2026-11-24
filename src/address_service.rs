@@ -19,7 +19,9 @@ use tokio_openssl::SslStream;
 const DOMAIN_IP_TTL: Duration = Duration::from_secs(10 * 60);
 const GOOD_LATENCY_TTL: Duration = Duration::from_secs(5 * 60);
 const FAILED_LOCAL_TTL: Duration = Duration::from_secs(60);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+// Match the original IPAddressService 5-second probe budget. Unlike C#, this
+// probe also completes TLS, so keep it bounded but avoid a 2-second false negative.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 struct Timed<T> {
