@@ -311,6 +311,7 @@ where
                     request_target = %trace.request_target,
                     peer_ip = ?trace.peer.map(|peer| peer.peer_ip),
                     connection_id = ?trace.peer.map(|peer| peer.connection_id),
+                    http2 = ?trace.peer.map(|peer| peer.http2),
                     "upstream HTTP body stalled until activity timeout"
                 );
             } else {
@@ -362,6 +363,7 @@ where
                         request_target = %trace.request_target,
                         peer_ip = ?trace.peer.map(|peer| peer.peer_ip),
                         connection_id = ?trace.peer.map(|peer| peer.connection_id),
+                    http2 = ?trace.peer.map(|peer| peer.http2),
                         "upstream response body stream failed"
                     );
                 } else {
