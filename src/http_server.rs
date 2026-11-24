@@ -17,7 +17,7 @@ use hyper::{
 };
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use anyhow::Context;
-use std::{convert::Infallible, error::Error, future::Future, io, pin::Pin, sync::Arc, task::{Context as TaskContext, Poll}, time::Duration};
+use std::{convert::Infallible, error::Error, future::Future, io, pin::Pin, sync::{Arc, Mutex}, task::{Context as TaskContext, Poll}, time::Duration};
 use tokio::{io::{AsyncRead, AsyncWrite, ReadBuf}, sync::oneshot, time::Sleep};
 
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -88,7 +88,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingIo<S> {
 struct TimeoutBody<B> {
     inner: Option<Pin<Box<B>>>,
     sleep: Option<Pin<Box<Sleep>>>,
-    activity_timeout: Option<Duration>,
+    activity: Option<ActivityTimeout>,
     connection: Option<UpstreamConnectionGuard>,
     trace: Option<UpstreamBodyTrace>,
     terminated: bool,
@@ -100,6 +100,51 @@ struct UpstreamBodyTrace {
     original_host: String,
     request_target: String,
     peer: Option<crate::http_proxy::UpstreamPeerInfo>,
+}
+
+/// Shared YARP-style idle timer. Body progress refreshes the same deadline
+/// that guards connection setup, request upload and response-header wait.
+#[derive(Clone)]
+struct ActivityTimeout {
+    last_activity: Arc<Mutex<tokio::time::Instant>>,
+    duration: Duration,
+}
+
+impl ActivityTimeout {
+    fn new(duration: Duration) -> Self {
+        Self {
+            last_activity: Arc::new(Mutex::new(tokio::time::Instant::now())),
+            duration,
+        }
+    }
+
+    fn reset(&self) {
+        *self.last_activity.lock().unwrap_or_else(|error| error.into_inner()) =
+            tokio::time::Instant::now();
+    }
+
+    fn deadline(&self) -> tokio::time::Instant {
+        *self.last_activity.lock().unwrap_or_else(|error| error.into_inner()) + self.duration
+    }
+
+    fn is_expired(&self) -> bool {
+        tokio::time::Instant::now() >= self.deadline()
+    }
+
+    async fn run<F: Future>(&self, future: F) -> Result<F::Output, ()> {
+        tokio::pin!(future);
+        loop {
+            let deadline = self.deadline();
+            tokio::select! {
+                result = &mut future => return Ok(result),
+                _ = tokio::time::sleep_until(deadline) => {
+                    if self.is_expired() {
+                        return Err(());
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Owns the upstream driver task for as long as its response body is usable.
@@ -127,10 +172,32 @@ impl<B> TimeoutBody<B> {
         connection: Option<UpstreamConnectionGuard>,
         trace: Option<UpstreamBodyTrace>,
     ) -> Self {
+        let activity = duration.map(ActivityTimeout::new);
+        Self::with_activity(inner, activity, connection, trace)
+    }
+
+    fn new_shared(
+        inner: B,
+        activity: ActivityTimeout,
+        connection: Option<UpstreamConnectionGuard>,
+        trace: Option<UpstreamBodyTrace>,
+    ) -> Self {
+        Self::with_activity(inner, Some(activity), connection, trace)
+    }
+
+    fn with_activity(
+        inner: B,
+        activity: Option<ActivityTimeout>,
+        connection: Option<UpstreamConnectionGuard>,
+        trace: Option<UpstreamBodyTrace>,
+    ) -> Self {
+        let sleep = activity.as_ref().map(|activity| {
+            Box::pin(tokio::time::sleep_until(activity.deadline()))
+        });
         Self {
             inner: Some(Box::pin(inner)),
-            sleep: duration.map(|duration| Box::pin(tokio::time::sleep(duration))),
-            activity_timeout: duration,
+            sleep,
+            activity,
             connection,
             trace,
             terminated: false,
@@ -153,7 +220,25 @@ where
         if this.terminated {
             return Poll::Ready(None);
         }
-        if this.sleep.as_mut().is_some_and(|sleep| sleep.as_mut().poll(cx).is_ready()) {
+        let activity_expired = if let Some(sleep) = this.sleep.as_mut() {
+            if sleep.as_mut().poll(cx).is_ready() {
+                if let Some(activity) = &this.activity {
+                    if activity.is_expired() {
+                        true
+                    } else {
+                        sleep.as_mut().reset(activity.deadline());
+                        false
+                    }
+                } else {
+                    true
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if activity_expired {
             this.terminated = true;
             if let Some(trace) = &this.trace {
                 tracing::warn!(
@@ -165,7 +250,7 @@ where
                     "upstream response body stalled until activity timeout"
                 );
             } else {
-                tracing::warn!("upstream response body stalled until request timeout");
+                tracing::warn!("upstream body stalled until activity timeout");
             }
             // Dropping Incoming cancels the upstream HTTP/2 stream or makes an
             // incomplete HTTP/1 connection ineligible for keep-alive reuse.
@@ -183,6 +268,9 @@ where
         match frame {
             Poll::Ready(None) => {
                 this.terminated = true;
+                if let Some(activity) = &this.activity {
+                    activity.reset();
+                }
                 drop(this.inner.take());
                 drop(this.connection.take());
                 Poll::Ready(None)
@@ -192,10 +280,11 @@ where
                 // idle timer after each successful body read/write. A long,
                 // continuously progressing response must not hit a fixed
                 // wall-clock deadline.
-                if let (Some(sleep), Some(duration)) =
-                    (this.sleep.as_mut(), this.activity_timeout)
-                {
-                    sleep.as_mut().reset(tokio::time::Instant::now() + duration);
+                if let Some(activity) = &this.activity {
+                    activity.reset();
+                    if let Some(sleep) = this.sleep.as_mut() {
+                        sleep.as_mut().reset(activity.deadline());
+                    }
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -614,13 +703,26 @@ async fn forward_request(
     parts.headers.remove(header::HOST);
     tracing::debug!(%original_host, upstream = %uri, "forwarding HTTP request");
 
+    let activity = ActivityTimeout::new(DEFAULT_ACTIVITY_TIMEOUT);
     let expect_continue = should_gate_expect_continue(&parts.headers, &body);
     let (continue_tx, continue_rx) = oneshot::channel();
     let gated_body = ExpectContinueBody::new(body, expect_continue.then_some(continue_rx));
     let boxed_request_body = gated_body
         .map_err(|error| Box::new(error) as BoxError)
         .boxed_unsync();
-    let mut upstream_request = Request::from_parts(parts, boxed_request_body);
+    let request_trace = UpstreamBodyTrace {
+        method: request_method.clone(),
+        original_host: original_host.clone(),
+        request_target: request_target.clone(),
+        peer: None,
+    };
+    let activity_request_body = TimeoutBody::new_shared(
+        boxed_request_body,
+        activity.clone(),
+        None,
+        Some(request_trace),
+    ).boxed_unsync();
+    let mut upstream_request = Request::from_parts(parts, activity_request_body);
     if expect_continue {
         // Hyper's client polls the body after writing request headers. Gate it
         // until the upstream's actual 100 arrives. Polling Incoming only after
@@ -634,27 +736,33 @@ async fn forward_request(
             }
         });
     }
-    let upstream_response = tls_proxy
-        .send_pooled_request(&original_host, upstream_request)
-        .await?;
+    let upstream_response = match activity
+        .run(tls_proxy.send_pooled_request(&original_host, upstream_request))
+        .await
+    {
+        Ok(result) => result?,
+        Err(()) => anyhow::bail!("upstream request exceeded the 100-second activity idle timeout"),
+    };
+    // YARP resets its activity timer as soon as upstream response headers arrive.
+    activity.reset();
     let (mut response_parts, response_body) = upstream_response.into_parts();
     let upstream_peer = response_parts.extensions.get::<crate::http_proxy::UpstreamPeerInfo>().copied();
     response_parts.version = downstream_version;
     strip_hop_by_hop_headers(&mut response_parts.headers);
     response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
     let boxed_body = response_body.map_err(|error| Box::new(error) as BoxError).boxed_unsync();
-    // C# applies DomainConfig.Timeout while SendAsync is obtaining the
-    // upstream response, but does not impose that timeout on streamed content.
-    // Keep the pooled response body streaming without an artificial deadline.
-    let response_body = TimeoutBody::new_pooled(
+    // Share the YARP activity clock with the request upload and response-header
+    // phase. Each successful response frame refreshes this same idle deadline.
+    let response_body = TimeoutBody::new_shared(
         boxed_body,
-        Some(DEFAULT_ACTIVITY_TIMEOUT),
-        UpstreamBodyTrace {
+        activity,
+        None,
+        Some(UpstreamBodyTrace {
             method: request_method,
             original_host,
             request_target,
             peer: upstream_peer,
-        },
+        }),
     ).boxed_unsync();
     Ok(Response::from_parts(response_parts, response_body))
 }
