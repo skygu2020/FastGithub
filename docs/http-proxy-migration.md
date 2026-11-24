@@ -19,7 +19,7 @@
 - 上游使用 Hyper HTTP/1 client handshake 和 `send_request`，请求体、响应体通过 Hyper body 流转发，不把整份响应缓存到内存。
 - 请求和响应的 hop-by-hop headers，以及 `Connection` 指定的逐跳字段会被移除；请求中的端到端 `Expect` 和 `Trailer` 声明会保留（`TE` 仍按逐跳字段移除）；响应 Server 标记为 `FastGithub`。
 - 响应体包装层逐 frame 透传 data 和 trailer frame；单元测试覆盖 `TimeoutBody` 不吞掉 `x-checksum` trailer。另有 TCP loopback 测试验证 Hyper HTTP/1 client/server 对请求和响应 trailer frame 的编码、解析。该测试验证 Hyper 双端互操作，不等同于经过 `forward_request`、TLS 和真实代理入口的完整端到端验证。
-- 下游 HTTP/1 server 已启用持久连接；同一客户端连接可连续承载多个请求。Hyper 按 HTTP 版本和请求的 Connection 语义处理关闭。上游转发目前仍为每个请求独立建立 HTTP/1 client connection，不跨请求复用上游连接。
+- 下游 HTTP/1 server 已启用持久连接；同一客户端连接可连续承载多个请求。Hyper 按 HTTP 版本和请求的 Connection 语义处理关闭。上游使用 Hyper legacy Client 的 per-host 连接池；HTTP/1 keep-alive 连接可跨请求复用（已有 loopback 测试验证同源两个请求只建立一条连接）。
 - HTTP/1 server/client connection 均启用 Hyper Upgrade 交接能力；符合条件的 `101` 会在下游和上游之间建立透明双向隧道。
 
 ### DomainConfig 处理
@@ -36,7 +36,7 @@
 
 - TLS 拦截入口通过 ALPN 选择 HTTP/2 或 HTTP/1.1；未协商 ALPN 时回退 HTTP/1.1。
 - HTTPS 上游连接优先协商 HTTP/2，服务器未选择 `h2` 时回退 HTTP/1.1。HTTP/1 Upgrade/WebSocket 上游连接仅提供 `http/1.1`，避免误协商到不支持传统 Upgrade 的 HTTP/2。
-- 当前 HTTP/2 不做跨请求连接池复用；HTTP/2 只覆盖 TLS ALPN 路径，明文 h2c 和 RFC 8441 extended CONNECT 不在本轮范围内。
+- 上游 HTTP/2 使用 Hyper legacy Client 的 per-host 连接池，可跨请求复用并在同一连接上多路复用并发 stream；HTTP/2 只覆盖 TLS ALPN 路径，明文 h2c 和 RFC 8441 extended CONNECT 不在本轮范围内。
 
 ### 超时
 
