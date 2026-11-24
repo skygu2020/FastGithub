@@ -52,6 +52,12 @@ fn pool_entry_matches_request(entry_identity: &Arc<()>, request_identity: &Arc<(
     Arc::ptr_eq(entry_identity, request_identity)
 }
 
+fn captured_upstream_peer(connected: &Connected) -> Option<UpstreamPeerInfo> {
+    let mut extensions = Extensions::new();
+    connected.get_extras(&mut extensions);
+    extensions.get::<UpstreamPeerInfo>().copied()
+}
+
 trait ProxyIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> ProxyIo for T {}
 
@@ -573,13 +579,32 @@ impl TlsProxy {
         let uri = request.uri().clone();
         let started = tokio::time::Instant::now();
         tracing::debug!(%original_host, %method, %uri, "sending request through upstream connection pool");
+
+        // Capture the selected connection independently of the response future.
+        // This task also records the peer when the caller later times out waiting
+        // for response headers and cancels this request future.
+        let mut capture_for_log = captured_connection.clone();
+        let log_host = original_host.to_owned();
+        let log_method = method.clone();
+        let log_uri = uri.clone();
+        tokio::spawn(async move {
+            let metadata = capture_for_log.wait_for_connection_metadata().await;
+            if let Some(connected) = metadata.as_ref() {
+                let peer_info = captured_upstream_peer(connected);
+                tracing::debug!(
+                    original_host = %log_host,
+                    method = %log_method,
+                    uri = %log_uri,
+                    peer_ip = ?peer_info.map(|info| info.peer_ip),
+                    connection_id = ?peer_info.map(|info| info.connection_id),
+                    "upstream request assigned to connection"
+                );
+            }
+        });
+
         let result = client.request(request).await;
         let connection_metadata = captured_connection.connection_metadata();
-        let peer_info = connection_metadata.as_ref().and_then(|connected| {
-            let mut extensions = Extensions::new();
-            connected.get_extras(&mut extensions);
-            extensions.get::<UpstreamPeerInfo>().copied()
-        });
+        let peer_info = connection_metadata.as_ref().and_then(captured_upstream_peer);
         match &result {
             Ok(response) => tracing::debug!(
                 %original_host,
