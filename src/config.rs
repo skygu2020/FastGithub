@@ -26,6 +26,9 @@ pub struct FastGithubConfig {
     pub http_proxy_port: u16,
     #[serde(default = "default_fallback_dns")]
     pub fallback_dns: Vec<SocketAddr>,
+    /// Allow plaintext DNS only after the native encrypted resolver fails.
+    #[serde(default)]
+    pub allow_plain_dns_fallback: bool,
     #[serde(default)]
     pub domain_configs: BTreeMap<String, DomainConfig>,
 }
