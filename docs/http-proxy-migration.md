@@ -230,4 +230,5 @@ Rust 普通 HTTP 转发现已引入共享 `ActivityTimeout`：100 秒 deadline �
 - 修复后台 `refresh_endpoint()` 覆盖请求阶段熔断结果的竞态：测速阶段的 `exclude_failed()` 只是一个时间点快照，不能保证随后的 endpoint 写回仍排除刚刚失败的 IP。现在所有候选状态提交都经 `store_endpoint_state()`，持有失败表写锁直到 endpoint 快照提交，并在提交时重新过滤尚未过期的 host/port/IP 熔断项。
 - 锁顺序统一为 `failed_ips -> endpoints`。`resolve()` 不再反向嵌套获取这两把锁；`report_failure()` 与 `report_success()` 也按同一顺序更新两个状态。
 - 后台批量测速使用不触发单次持久化的 `store_endpoint_state()`，待所有 endpoint 刷新任务完成后再统一 `save_addresses()`；普通按需解析仍通过 `store_endpoint()` 在提交后持久化。
+- `store_endpoint_state()` 返回实际提交的过滤后候选列表，按需解析将该列表返回给调用方，避免在熔断发生于测速筛选与 endpoint 提交之间时，内存状态虽已剔除 IP、当前这次 `resolve()` 却仍返回旧列表。后台刷新遇到 DNS 错误保留旧候选时也走同一提交路径，不再直接覆盖 endpoint 状态。
 - 这些修正不改变 90 秒熔断期限、测速缓存 TTL、候选排序或请求重试策略。当前无本地 Cargo 工具链，未运行 fmt/build/test；没有触发 GitHub Actions/CI。
