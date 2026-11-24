@@ -332,3 +332,18 @@ Rust 普通 HTTP 转发现已引入共享 `ActivityTimeout`：100 秒 deadline �
 - https://docs.rs/hickory-resolver/latest/hickory_resolver/
 - https://docs.rs/odoh-rs/latest/odoh_rs/
 - https://github.com/DNSCrypt/dnscrypt-proxy/blob/master/dnscrypt-proxy/example-dnscrypt-proxy.toml
+
+
+## 原生 DNSCrypt v2 后端首轮接入（2026-11-24）
+
+- Cargo 增加可选 feature `native-dnscrypt`，通过可选依赖 `dnscrypt = 0.3` 引入进程内 DNSCrypt v2 客户端；默认 feature 集合保持为空，不改变现有默认发行行为。
+- `DnsClient` 在启用该 feature 时可持有可克隆的 `dnscrypt::Client`，新增 `with_dnscrypt()` 构造入口。查询直接调用 `Client::lookup`，不经过 loopback DNS socket，也不启动 Go 子进程。
+- `main.rs` 将 DNS 客户端创建集中到 `build_dns_client()`：默认构建仍发现并启动现有 Go `dnscrypt-proxy`；启用 `--features native-dnscrypt` 时改用 `dnscrypt::Client::default()`，不启动外部代理。
+- 原有 `resolve`、`test-dns`、`watch-dns` 和 HTTP 代理启动共用这一选择逻辑。HTTP 代理现在接收已构造的 `DnsClient`，而不是只接收 UDP/TCP 上游地址列表。
+- 原生 backend 查询受现有 4 秒 DNS 查询预算约束。成功响应（包括有效的空答案）不会再继续查询明文 fallback DNS；只有 DNSCrypt 错误或超时才进入配置的普通 DNS fallback 列表。这避免在加密查询成功时仍无条件向明文 DNS 泄漏同一域名。
+- 当前原生客户端使用 crate 内置 `DEFAULT_RESOLVERS`，尚未读取 Go TOML 中的 resolver stamps、server_names、匿名 relay、ODoH、PQDNSCrypt 或来源更新配置；因此它是可选的 DNSCrypt v2 验证后端，不是 Go 代理的功能等价替代。
+- `dnscrypt::Client::lookup` 的公开 API 返回 IP 列表，不暴露 DNS 记录 TTL；该 crate 自身维护响应缓存，当前 FastGithub 的 endpoint 缓存仍按既有机制运行。后续若要精确复用 DNS TTL，应评估 `Client::query` 的记录 API，而不是人为猜测 TTL。
+- 手动试验构建命令：`cargo build --release --features native-dnscrypt`。该 feature 是显式 opt-in；普通 `cargo build --release` 仍走 Go 子进程路径。
+- 当前环境没有本地 Cargo 工具链，未运行 fmt/build/test，也没有触发 GitHub Actions/CI。
+
+参考：`dnscrypt 0.3.0` 的 `Client::default` / `Client::lookup` API 和默认 resolver 说明见 https://docs.rs/dnscrypt/0.3.0/dnscrypt/struct.Client.html 及 https://docs.rs/dnscrypt/0.3.0/dnscrypt/。
