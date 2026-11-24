@@ -232,18 +232,18 @@ mod tests {
         let mut sources = HashMap::new();
         sources.insert(
             first_url.clone(),
-            parse_hosts("192.0.2.10 shared.example\\n192.0.2.11 first-only.example"),
+            parse_hosts("192.0.2.10 shared.example\n192.0.2.11 first-only.example"),
         );
         sources.insert(
             second_url.clone(),
-            parse_hosts("192.0.2.20 second-only.example\\n192.0.2.10 shared.example"),
+            parse_hosts("192.0.2.20 second-only.example\n192.0.2.10 shared.example"),
         );
 
         // The first source succeeds with a newer snapshot. The second source
         // is absent from this refresh and therefore keeps its previous snapshot.
         sources.insert(
             first_url,
-            parse_hosts("192.0.2.12 shared.example\\n192.0.2.13 first-new.example"),
+            parse_hosts("192.0.2.12 shared.example\n192.0.2.13 first-new.example"),
         );
 
         let merged = merge_source_mappings(&sources);
