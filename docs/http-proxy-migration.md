@@ -203,7 +203,7 @@ Rust 普通 HTTP 转发现已引入共享 `ActivityTimeout`：100 秒 deadline �
 - 新增 `upgraded_io_activity_resets_shared_idle_timeout`，使用 loopback duplex IO 验证跨越单个 40ms deadline 的连续字节读取仍能完成（每个字节间隔 25ms），避免将总连接时长误当作 idle timeout。
 - 新增 `upgraded_tunnel_idle_timeout_expires_without_io_progress`，验证隧道两端没有任何读写活动时共享 10ms 测试 deadline 会终止等待；上游响应头阶段超时也会输出 host、request-target 和 100 秒活动期限。
 
-限制：Upgrade 分支的 DNS/TCP 建连和 OpenSSL TLS 握手发生在可包装的隧道 IO 建立之前，目前仍依赖各自底层连接/握手超时机制，不由共享 ActivityTimeout 的读写活动刷新。该差异需要后续单独检查连接超时配置；没有宣称此处已完全复刻 YARP 的所有阶段。
+限制：Upgrade 分支的 DNS 解析发生在逐 IP 连接预算之外；每个 HTTPS IP 候选的 TCP 建连与 OpenSSL TLS 握手现共用 10 秒 deadline，但这属于连接候选超时，不由隧道 `ActivityTimeout` 的读写活动刷新。
 
 ## C# 与 Rust 上游连接超时边界（2026-11-24）
 
