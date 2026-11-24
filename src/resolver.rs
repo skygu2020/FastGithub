@@ -146,7 +146,9 @@ impl DomainResolver {
                     %error,
                     "DNS refresh failed; retaining previous candidates"
                 );
-                let retained = self.exclude_failed(&endpoint.host, endpoint.port, &previous_addresses).await;
+                let retained = self
+                    .exclude_failed(&endpoint.host, endpoint.port, &previous_addresses)
+                    .await;
                 let retained = self.store_endpoint(endpoint.clone(), retained).await;
                 return Ok(retained);
             }
@@ -168,7 +170,13 @@ impl DomainResolver {
             .addresses
             .order_addresses(&endpoint.host, port, candidates, &previous_addresses)
             .await;
-        let ordered = self.exclude_failed(&endpoint.host, endpoint.port, &merge_candidates(probed, &previous_addresses)).await;
+        let ordered = self
+            .exclude_failed(
+                &endpoint.host,
+                endpoint.port,
+                &merge_candidates(probed, &previous_addresses),
+            )
+            .await;
         let ordered = self.store_endpoint(endpoint, ordered).await;
         Ok(ordered)
     }
@@ -219,7 +227,11 @@ impl DomainResolver {
         usable
     }
 
-    async fn store_endpoint(&self, endpoint: EndpointRecord, addresses: Vec<IpAddr>) -> Vec<IpAddr> {
+    async fn store_endpoint(
+        &self,
+        endpoint: EndpointRecord,
+        addresses: Vec<IpAddr>,
+    ) -> Vec<IpAddr> {
         let usable = self.store_endpoint_state(endpoint, addresses).await;
         self.save_addresses().await;
         usable
