@@ -178,10 +178,20 @@ Rust 之前存在两处不兼容行为：
 1. 未配置 `DomainConfig.Timeout` 时，`src/http_server.rs` 强行使用 100 秒默认期限。
 2. 收到上游响应头后，又把剩余期限传入 `TimeoutBody::new_pooled`，导致长响应体下载在期限到达时被主动截断。
 
-本次修正：
-- 提取 `configured_request_timeout`：只有显式配置 Timeout 才返回期限；未配置时返回 `None`。
-- 普通 pooled HTTP 响应体使用无期限的 `TimeoutBody`，保留原有流式传输、背压和响应体错误日志；显式 Timeout 仍由外层 forwarding timeout 限制请求发送、DNS/连接/TLS 和等待响应头阶段。
-- 增加两个单元测试，覆盖未配置时不产生默认期限，以及显式 7 秒配置被正确保留。
+初步修正：
+- 提取 `configured_request_timeout`：只有显式配置 Timeout 才返回期限；未配置时返回 `None`。该期限对应 FastGithub 自定义 handler 的 SendAsync 超时，不等同于 YARP 的 ActivityTimeout。
+- 普通 pooled HTTP 响应体随后恢复默认活动超时，并在每个成功 body frame 后重置计时；不再使用从请求开始计算的固定总耗时期限。
+- 增加单元测试，覆盖未配置 Timeout、显式 7 秒 Timeout，以及持续有数据帧时总传输时间超过单次 idle timeout 仍能完成。
 
-注意：该修复只对齐 C# 的普通 HTTP 请求/响应流语义。HTTP Upgrade/WebSocket 路径需要单独对照 YARP 的隧道生命周期行为；不能把普通响应体结论直接套用到 Upgrade。当前环境没有本地 Rust 工具链，未运行 fmt/build/test；没有触发 GitHub Actions/CI。
+仍待补齐：YARP 的 ActivityTimeout 同样覆盖连接/等待响应头阶段和请求体上传，并在成功读写后重置；当前 Rust 的请求头/连接等待阶段尚未实现完整的共享活动计时器，请求体上传也尚未接入该活动计时器。HTTP Upgrade/WebSocket 双向复制同样需要单独接入活动重置。当前环境没有本地 Rust 工具链，未运行 fmt/build/test；没有触发 GitHub Actions/CI。
+
+## YARP 1.1.1 ActivityTimeout 语义补充（2026-11-24）
+
+进一步检查原版依赖的 `Yarp.ReverseProxy 1.1.1` 源码，确认 `ForwarderRequestConfig.Empty` 并非“无默认超时”：
+- `HttpForwarder.DefaultTimeout` 为 100 秒，创建 `ActivityCancellationTokenSource`。
+- 收到上游响应头后调用 `ResetTimeout()`。
+- `StreamCopier.CopyAsync` 在每次成功读取输入数据、每次成功写入输出数据后重置活动计时器；请求体和响应体都覆盖。
+- `ForwarderRequestConfig.Empty` 默认请求版本为 HTTP/2.0，版本策略为 `RequestVersionOrLower`。因此不能仅凭 FastGithub 的 URI scheme 被改写成 http，就断言 C# 上游固定使用 HTTP/1.1；最终协议由 SocketsHttpHandler 的版本协商行为决定。
+
+Rust 当前已将响应体的固定总耗时改为每个成功 frame 重置的 100 秒 idle timeout，但还没有完整复刻 YARP 的共享 ActivityTimeout：连接/等待响应头、请求上传 body 和 Upgrade 双向流的活动都尚未统一刷新同一 deadline。后续应实现共享活动时钟，并让 forwarding future 与 body wrappers 共用它，而不是简单把 100 秒 timeout 套在整个 forwarding future 上。
 
