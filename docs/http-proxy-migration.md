@@ -169,21 +169,20 @@
 
 对照当前 `master` 的原始 C# 源码：
 
-- `FastGithub.Configuration/DomainConfig.cs` 中 `Timeout` 类型为 `TimeSpan?`，默认值为 null。
-- `FastGithub.Http/HttpClientHandler.cs` 仅在 `domainConfig.Timeout != null` 时创建 timeout token，并将其与调用方 token 链接后传给 `base.SendAsync`；没有设置默认 100 秒。
-- 自定义 `FastGithub.Http.HttpClient` 继承 `HttpMessageInvoker`，不是带默认 100 秒超时的 `System.Net.Http.HttpClient`。
-- `FastGithub.HttpServer/HttpMiddlewares/HttpReverseProxyMiddleware.cs` 使用 YARP `IHttpForwarder.SendAsync`。自定义 timeout token 属于上游 SendAsync 阶段；C# 代码没有在响应体流式复制阶段继续套用该 token。
+- `FastGithub.Configuration/DomainConfig.cs` 中 `Timeout` 是可空 `TimeSpan?`，默认 null。
+- `FastGithub.Http/HttpClientHandler.cs` 仅在显式设置 `DomainConfig.Timeout` 时创建额外 timeout token，并将其传给 `base.SendAsync`。
+- 自定义 `FastGithub.Http.HttpClient` 继承 `HttpMessageInvoker`，不是带默认 100 秒总超时的 `System.Net.Http.HttpClient`。
+- 但 `HttpReverseProxyMiddleware` 使用 YARP 1.1.1 的 `IHttpForwarder.SendAsync`；YARP 自身另有默认 100 秒 `ActivityTimeout`。它是空闲超时，不是固定总耗时；成功的请求/响应 body 读写会刷新 deadline。
 
-Rust 之前存在两处不兼容行为：
-1. 未配置 `DomainConfig.Timeout` 时，`src/http_server.rs` 强行使用 100 秒默认期限。
-2. 收到上游响应头后，又把剩余期限传入 `TimeoutBody::new_pooled`，导致长响应体下载在期限到达时被主动截断。
+Rust 之前将默认 100 秒 ActivityTimeout 错误实现成从请求开始计算的固定总耗时，并将剩余期限继续套在响应体上。这会让一个持续有数据、但总时长超过 100 秒的上传/下载被主动中断，属于与原版不兼容的断线风险。
 
-初步修正：
-- 提取 `configured_request_timeout`：只有显式配置 Timeout 才返回期限；未配置时返回 `None`。该期限对应 FastGithub 自定义 handler 的 SendAsync 超时，不等同于 YARP 的 ActivityTimeout。
-- 普通 pooled HTTP 响应体随后恢复默认活动超时，并在每个成功 body frame 后重置计时；不再使用从请求开始计算的固定总耗时期限。
-- 增加单元测试，覆盖未配置 Timeout、显式 7 秒 Timeout，以及持续有数据帧时总传输时间超过单次 idle timeout 仍能完成。
+当前修正：
+- `configured_request_timeout` 只保留显式 `DomainConfig.Timeout`，用于限制 forwarding / 等待响应头阶段；没有配置时不额外创建该总期限。
+- 新增共享 `ActivityTimeout`，默认 100 秒，覆盖普通 HTTP 的连接/等待响应头、请求体上传和响应体下载。
+- 请求 body wrapper 的 frame/EOF 活动会刷新共享 deadline；forwarding future 等待连接/响应头时与它竞争同一活动 deadline；收到响应头后重置；response body wrapper 继续使用同一时钟并在成功 frame 后刷新。
+- 新增测试覆盖显式/缺省 DomainConfig.Timeout、持续上传 frame 刷新共享 deadline，以及响应体持续有 frame 时总耗时超过单次 idle timeout 仍可完成。
 
-仍待补齐：YARP 的 ActivityTimeout 同样覆盖连接/等待响应头阶段和请求体上传，并在成功读写后重置；当前 Rust 的请求头/连接等待阶段尚未实现完整的共享活动计时器，请求体上传也尚未接入该活动计时器。HTTP Upgrade/WebSocket 双向复制同样需要单独接入活动重置。当前环境没有本地 Rust 工具链，未运行 fmt/build/test；没有触发 GitHub Actions/CI。
+仍有边界差异：YARP 的 `StreamCopier` 在成功 read 和 write 两侧都会刷新活动时钟；Hyper Body wrapper 目前在 frame 产出时刷新，无法直接观察 socket write 完成。HTTP Upgrade/WebSocket 双向复制也尚未接入共享活动时钟。当前环境没有本地 Rust 工具链，未运行 fmt/build/test；没有触发 GitHub Actions/CI。
 
 ## YARP 1.1.1 ActivityTimeout 语义补充（2026-11-24）
 
