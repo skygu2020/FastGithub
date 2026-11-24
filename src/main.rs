@@ -96,7 +96,16 @@ async fn main() -> Result<()> {
             let config = config::AppConfig::load(&config_path)?;
             let (host, port) = endpoint.rsplit_once(':').context("endpoint must be host:port")?;
             let port: u16 = port.parse().context("invalid endpoint port")?;
-            let (dns, proxy) = build_dns_client(config.fast_github.fallback_dns).await;
+            let proxy = dnscrypt::DnscryptProxy::discover().ok();
+            let mut upstreams = Vec::new();
+            if let Some(proxy) = proxy.as_ref() {
+                match proxy.start().await {
+                    Ok(endpoint) => { upstreams.push(endpoint); }
+                    Err(error) => tracing::warn!(%error, "dnscrypt-proxy unavailable; using fallback DNS"),
+                }
+            }
+            upstreams.extend(config.fast_github.fallback_dns);
+            let dns = dns::DnsClient::new(upstreams);
             let persistence = persistence::Persistence::new("dnsendpoints.json");
             let resolver = resolver::DomainResolver::new(dns, persistence).await?;
             for address in resolver.resolve(host, port).await? { println!("{address}"); }
@@ -104,7 +113,16 @@ async fn main() -> Result<()> {
         }
         Some(Command::TestDns) => {
             let config = config::AppConfig::load(&config_path)?;
-            let (dns, proxy) = build_dns_client(config.fast_github.fallback_dns).await;
+            let proxy = dnscrypt::DnscryptProxy::discover().ok();
+            let mut upstreams = Vec::new();
+            if let Some(proxy) = proxy.as_ref() {
+                match proxy.start().await {
+                    Ok(endpoint) => { upstreams.push(endpoint); }
+                    Err(error) => tracing::warn!(%error, "dnscrypt-proxy unavailable; using fallback DNS"),
+                }
+            }
+            upstreams.extend(config.fast_github.fallback_dns);
+            let dns = dns::DnsClient::new(upstreams);
             let persistence = persistence::Persistence::new("dnsendpoints.json");
             let resolver = resolver::DomainResolver::new(dns, persistence).await?;
             resolver.test_speed().await?;
@@ -112,7 +130,16 @@ async fn main() -> Result<()> {
         }
         Some(Command::WatchDns) => {
             let config = config::AppConfig::load(&config_path)?;
-            let (dns, proxy) = build_dns_client(config.fast_github.fallback_dns).await;
+            let proxy = dnscrypt::DnscryptProxy::discover().ok();
+            let mut upstreams = Vec::new();
+            if let Some(proxy) = proxy.as_ref() {
+                match proxy.start().await {
+                    Ok(endpoint) => { upstreams.push(endpoint); }
+                    Err(error) => tracing::warn!(%error, "dnscrypt-proxy unavailable; using fallback DNS"),
+                }
+            }
+            upstreams.extend(config.fast_github.fallback_dns);
+            let dns = dns::DnsClient::new(upstreams);
             let persistence = persistence::Persistence::new("dnsendpoints.json");
             let resolver = resolver::DomainResolver::new(dns, persistence).await?;
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -154,8 +181,24 @@ async fn main() -> Result<()> {
             );
             tracing::info!(version = env!("CARGO_PKG_VERSION"), proxy_port = config.fast_github.http_proxy_port,
                 domains = config.fast_github.domain_configs.len(), "FastGithub Rust Linux configuration loaded");
-            let (dns, proxy) = build_dns_client(config.fast_github.fallback_dns.iter().copied().collect()).await;
-            let result = http_proxy::run(config, config_path.clone(), dns, certificates).await;
+            let proxy = match dnscrypt::DnscryptProxy::discover() {
+                Ok(proxy) => Some(proxy),
+                Err(error) => {
+                    tracing::warn!(%error, "DNSCrypt proxy resources unavailable; using fallback DNS");
+                    None
+                }
+            };
+            let mut upstreams = Vec::new();
+            if let Some(proxy) = proxy.as_ref() {
+                match proxy.start().await {
+                    Ok(endpoint) => {
+                        upstreams.push(endpoint);
+                    }
+                    Err(error) => tracing::warn!(%error, "DNSCrypt proxy failed to start; using fallback DNS"),
+                }
+            }
+            upstreams.extend(config.fast_github.fallback_dns.iter().copied());
+            let result = http_proxy::run(config, config_path.clone(), upstreams, certificates).await;
             if let Some(proxy) = proxy {
                 proxy.stop().await;
             }
@@ -163,29 +206,6 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
-}
-
-
-async fn build_dns_client(fallback_dns: Vec<std::net::SocketAddr>) -> (dns::DnsClient, Option<dnscrypt::DnscryptProxy>) {
-    #[cfg(feature = "native-dnscrypt")]
-    {
-        tracing::info!("using in-process DNSCrypt v2 client; configured plain DNS servers remain fallback");
-        let encrypted = dnscrypt::Client::default();
-        (dns::DnsClient::with_dnscrypt(fallback_dns, encrypted), None)
-    }
-    #[cfg(not(feature = "native-dnscrypt"))]
-    {
-        let proxy = dnscrypt::DnscryptProxy::discover().ok();
-        let mut upstreams = Vec::new();
-        if let Some(proxy) = proxy.as_ref() {
-            match proxy.start().await {
-                Ok(endpoint) => { upstreams.push(endpoint); }
-                Err(error) => tracing::warn!(%error, "dnscrypt-proxy unavailable; using fallback DNS"),
-            }
-        }
-        upstreams.extend(fallback_dns);
-        (dns::DnsClient::new(upstreams), proxy)
-    }
 }
 
 fn certificate_directory(config_path: &std::path::Path) -> PathBuf {
