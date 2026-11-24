@@ -244,6 +244,12 @@ mod tests {
     use std::net::IpAddr;
 
     #[test]
+    fn plaintext_dns_fallback_is_disabled_by_default() {
+        let config: super::FastGithubConfig = serde_json::from_str("{}").unwrap();
+        assert!(!config.allow_plain_dns_fallback);
+    }
+
+    #[test]
     fn response_config_uses_original_defaults_and_fields() {
         let response: ResponseConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(response.status_code, 200);
