@@ -193,5 +193,5 @@ Rust 之前存在两处不兼容行为：
 - `StreamCopier.CopyAsync` 在每次成功读取输入数据、每次成功写入输出数据后重置活动计时器；请求体和响应体都覆盖。
 - `ForwarderRequestConfig.Empty` 默认请求版本为 HTTP/2.0，版本策略为 `RequestVersionOrLower`。因此不能仅凭 FastGithub 的 URI scheme 被改写成 http，就断言 C# 上游固定使用 HTTP/1.1；最终协议由 SocketsHttpHandler 的版本协商行为决定。
 
-Rust 当前已将响应体的固定总耗时改为每个成功 frame 重置的 100 秒 idle timeout，但还没有完整复刻 YARP 的共享 ActivityTimeout：连接/等待响应头、请求上传 body 和 Upgrade 双向流的活动都尚未统一刷新同一 deadline。后续应实现共享活动时钟，并让 forwarding future 与 body wrappers 共用它，而不是简单把 100 秒 timeout 套在整个 forwarding future 上。
+Rust 普通 HTTP 转发现已引入共享 `ActivityTimeout`：100 秒 deadline 同时覆盖等待连接/响应头与请求上传；请求体 frame/EOF 会刷新共享时钟；收到响应头时重置；响应体 wrapper 继续使用同一时钟，并在成功 frame 后刷新。这样持续有数据的普通上传/下载不会因总耗时超过 100 秒而被硬切断。新增测试分别覆盖上传 frame 刷新共享 deadline、响应 frame 刷新 idle timeout。仍有边界差异：YARP 在成功 read 和 write 两侧均刷新，Hyper Body wrapper 只能在 frame 产出时刷新，无法直接观察 socket write 完成；HTTP Upgrade/WebSocket 双向复制也尚未接入共享活动时钟。显式 `DomainConfig.Timeout` 仍单独限制 forwarding/SendAsync 阶段，普通响应体阶段不继续使用该配置期限。
 
