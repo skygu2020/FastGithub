@@ -121,3 +121,13 @@
 - 这属于连接级观测，不等同于请求级关联。Hyper legacy client 的 HTTP/2 连接可复用并承载多个并发 stream；当前请求日志仍只有 host/method/URI，不能据此断言某条响应对应哪个 `connection_id`。后续若要建立请求到连接/IP 的准确关联，需要利用 Hyper 提供的连接扩展元数据或调整 connector/connection 驱动架构，并确认其对 HTTP/1 与 HTTP/2 均成立。
 - 不因单个 HTTP/2 stream 超时而关闭共享连接；也不在请求已经发送后盲目换 IP 重放。先用新增连接日志与用户侧代理请求日志对照，确定是否存在特定 peer IP 反复出现“TLS 成功、HTTP 无响应”。
 - 本次代码尚未由本地 Cargo 工具链格式化、编译或测试；没有触发 GitHub Actions/CI。
+
+
+## 请求级上游连接关联（2026-11-24）
+
+- 检查项目固定版本 `hyper-util = 0.1.20` 的源码后，确认 `client::legacy::connect::capture_connection` 已存在；`Client::try_send_request` 会在每次请求选定连接后，将该连接的 `Connected` 元数据写入请求携带的捕获句柄。连接池复用 HTTP/2 连接时，也会使用被选中的池连接元数据，而不是要求重新建立连接。
+- `Connected::extra<T>()` 会将连接器附加的数据复制到每个响应的 extensions；本项目现在附加 `UpstreamPeerInfo { peer_ip, connection_id }`。`send_pooled_request` 在发出请求前调用 `capture_connection`，响应头到达或请求失败后读取捕获元数据，并在请求日志中记录 peer IP 与连接编号。
+- 另启动一个轻量异步观察任务，在连接元数据一旦可用时立即输出 `upstream request assigned to connection`。这样即使外层请求超时取消了等待响应头的 future，仍能留下该请求已经分配到哪个上游连接的日志；如果连接始终未建立，请求扩展被释放后观察任务会结束。
+- 新增 `connected_metadata_preserves_upstream_peer_identity` 单元测试，覆盖 `Connected::extra` 到捕获辅助函数的 peer IP/connection ID 传递；同时更新 HTTP/2 mock connector 初始化字段。
+- 这一机制解决请求到连接的关联，不代表能够把单个 HTTP/2 stream 的超时判定为整条连接故障。后续应先采集请求分配连接、响应头延迟和 stream 错误日志；不能因一个 stream 超时而关闭仍承载其他请求的 HTTP/2 连接，也不对任意请求自动重放。
+- 代码和测试尚未由本地 Cargo 工具链编译或执行；没有触发 GitHub Actions/CI。
