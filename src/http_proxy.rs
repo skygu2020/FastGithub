@@ -934,6 +934,16 @@ mod tests {
     use std::{convert::Infallible, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
 
     #[test]
+    fn connected_metadata_preserves_upstream_peer_identity() {
+        let expected = UpstreamPeerInfo {
+            peer_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            connection_id: 42,
+        };
+        let connected = Connected::new().extra(expected);
+        assert_eq!(captured_upstream_peer(&connected), Some(expected));
+    }
+
+    #[test]
     fn failed_old_pool_entry_does_not_match_replacement_identity() {
         let old_identity = Arc::new(());
         let replacement_identity = Arc::new(());
@@ -1067,6 +1077,8 @@ mod tests {
                 });
                 Ok(TokioIo::new(ConnectedUpstreamIo {
                     inner: Box::new(client_io),
+                    peer_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    connection_id: 1,
                     http2: true,
                 }))
             })
