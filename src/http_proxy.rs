@@ -605,6 +605,10 @@ impl TlsProxy {
         let result = client.request(request).await;
         let connection_metadata = captured_connection.connection_metadata();
         let peer_info = connection_metadata.as_ref().and_then(captured_upstream_peer);
+        let error_connect_info = result.as_ref().err()
+            .and_then(|error| error.connect_info())
+            .and_then(captured_upstream_peer);
+        let connector_failed = result.as_ref().err().is_some_and(|error| error.is_connect());
         match &result {
             Ok(response) => tracing::debug!(
                 %original_host,
@@ -621,13 +625,18 @@ impl TlsProxy {
                 %method,
                 %uri,
                 %error,
-                peer_ip = ?peer_info.map(|info| info.peer_ip),
-                connection_id = ?peer_info.map(|info| info.connection_id),
+                error_class = if error.is_connect() { "connector" } else { "request_or_connection" },
+                peer_ip = ?error_connect_info.or(peer_info).map(|info| info.peer_ip),
+                connection_id = ?error_connect_info.or(peer_info).map(|info| info.connection_id),
                 elapsed_ms = started.elapsed().as_millis(),
                 "upstream pooled request failed"
             ),
         }
-        if result.is_err() {
+        // A connector failure means no usable transport was established. A
+        // generic request error can instead be an HTTP/2 stream reset or a
+        // connection-level failure already handled by Hyper's pool. Do not
+        // discard the entire per-host Client for an unclassified stream error.
+        if connector_failed {
             // Do not let a late failure from an old client evict a newer pool
             // entry installed after expiry or configuration reload.
             let key = original_host.trim_end_matches('.').to_ascii_lowercase();
@@ -637,13 +646,13 @@ impl TlsProxy {
                         .is_some_and(|entry| pool_entry_matches_request(&entry.identity, &pool_identity));
                     if is_current {
                         clients.remove(&key);
-                        tracing::debug!(%key, "invalidated failed upstream connection pool");
+                        tracing::debug!(%key, "invalidated upstream pool after connector failure");
                     } else {
-                        tracing::debug!(%key, "failed upstream request belongs to a retired pool entry; keeping replacement");
+                        tracing::debug!(%key, "connector failure belongs to a retired pool entry; keeping replacement");
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(%error, %key, "could not invalidate failed upstream connection pool");
+                    tracing::warn!(%error, %key, "could not invalidate upstream pool after connector failure");
                 }
             }
         }
