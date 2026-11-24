@@ -65,6 +65,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> ProxyIo for T {}
 pub(crate) struct UpstreamPeerInfo {
     pub(crate) peer_ip: IpAddr,
     pub(crate) connection_id: u64,
+    pub(crate) http2: bool,
 }
 
 struct ConnectedUpstreamIo {
@@ -113,6 +114,7 @@ impl Connection for ConnectedUpstreamIo {
         let connected = Connected::new().extra(UpstreamPeerInfo {
             peer_ip: self.peer_ip,
             connection_id: self.connection_id,
+            http2: self.http2,
         });
         if self.http2 { connected.negotiated_h2() } else { connected }
     }
@@ -597,6 +599,7 @@ impl TlsProxy {
                     uri = %log_uri,
                     peer_ip = ?peer_info.map(|info| info.peer_ip),
                     connection_id = ?peer_info.map(|info| info.connection_id),
+                    http2 = ?peer_info.map(|info| info.http2),
                     "upstream request assigned to connection"
                 );
             }
@@ -616,6 +619,7 @@ impl TlsProxy {
                 %uri,
                 peer_ip = ?peer_info.map(|info| info.peer_ip),
                 connection_id = ?peer_info.map(|info| info.connection_id),
+                http2 = ?peer_info.map(|info| info.http2),
                 status = response.status().as_u16(),
                 elapsed_ms = started.elapsed().as_millis(),
                 "upstream response headers received"
@@ -628,6 +632,7 @@ impl TlsProxy {
                 error_class = if error.is_connect() { "connector" } else { "request_or_connection" },
                 peer_ip = ?error_connect_info.or(peer_info).map(|info| info.peer_ip),
                 connection_id = ?error_connect_info.or(peer_info).map(|info| info.connection_id),
+                http2 = ?error_connect_info.or(peer_info).map(|info| info.http2),
                 elapsed_ms = started.elapsed().as_millis(),
                 "upstream pooled request failed"
             ),
@@ -991,6 +996,7 @@ mod tests {
         let expected = UpstreamPeerInfo {
             peer_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             connection_id: 42,
+            http2: true,
         };
         let connected = Connected::new().extra(expected);
         assert_eq!(captured_upstream_peer(&connected), Some(expected));
