@@ -61,7 +61,7 @@ fn captured_upstream_peer(connected: &Connected) -> Option<UpstreamPeerInfo> {
 trait ProxyIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> ProxyIo for T {}
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct UpstreamPeerInfo {
     peer_ip: IpAddr,
     connection_id: u64,
@@ -1115,14 +1115,31 @@ mod tests {
                 .body(body)
                 .unwrap()
         };
+        let mut first_request = make_request("/one");
+        let mut second_request = make_request("/two");
+        let first_capture = capture_connection(&mut first_request);
+        let second_capture = capture_connection(&mut second_request);
         let (first, second) = tokio::join!(
-            client.request(make_request("/one")),
-            client.request(make_request("/two")),
+            client.request(first_request),
+            client.request(second_request),
         );
         let first = first.unwrap().into_body().collect().await.unwrap().to_bytes();
         let second = second.unwrap().into_body().collect().await.unwrap().to_bytes();
         assert_eq!(first, Bytes::from_static(b"h2"));
         assert_eq!(second, Bytes::from_static(b"h2"));
+
+        let first_metadata = first_capture.connection_metadata();
+        let second_metadata = second_capture.connection_metadata();
+        let first_peer = first_metadata.as_ref()
+            .and_then(captured_upstream_peer)
+            .expect("first request should capture its HTTP/2 connection");
+        let second_peer = second_metadata.as_ref()
+            .and_then(captured_upstream_peer)
+            .expect("second request should capture its HTTP/2 connection");
+        assert_eq!(first_peer, second_peer);
+        assert_eq!(first_peer.connection_id, 1);
+        assert_eq!(first_peer.peer_ip, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+
         assert_eq!(connections.load(Ordering::Relaxed), 1);
         assert_eq!(requests.load(Ordering::Relaxed), 2);
     }
