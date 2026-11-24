@@ -209,7 +209,8 @@ Rust 普通 HTTP 转发现已引入共享 `ActivityTimeout`：100 秒 deadline �
 
 对照 `FastGithub.Http.HttpClientHandler.ConnectCallback`：
 - C# 对每个 IP 候选创建一个 10 秒 CancellationTokenSource，并将同一个 token 传给 `ConnectAsync`；该 10 秒预算同时覆盖 TCP connect 和 HTTPS TLS Authenticate。
-- Rust 的 `connect_target_excluding` 对每个 TCP 候选使用 10 秒 `CONNECT_TIMEOUT`；`connect_upstream_tls` 又对 TLS handshake 单独使用 10 秒。因此 Rust 在 TCP 与 TLS 都接近超时时，单个候选的累计等待可能接近 20 秒，和 C# 的单个 10 秒候选预算不完全相同。
-- 两边都在 TCP/TLS 候选失败后继续尝试后续 IP；Rust pooled HTTPS connector 会排除已尝试 IP，Upgrade 分支也会继续尝试下一个 TLS 候选。
-- 这是连接建立延迟边界差异，不应与 HTTP 响应头到达后的长时间无活动混为一谈。后续可将 Rust 的 TCP+TLS 候选预算合并为单个 10 秒 deadline，同时保持每个 IP 都有独立预算；当前没有改变连接重试策略。
+- Rust 现由 `connect_target_excluding_with_deadline` 在每个 IP 候选开始时创建一个 10 秒 deadline，并将同一 deadline 传递给后续 `connect_upstream_tls`；TLS 阶段使用 `timeout_at` 消费 TCP 阶段剩余的时间，不再重新获得完整 10 秒。
+- pooled HTTPS connector 和 HTTP Upgrade HTTPS 分支都使用这一共享 deadline。TCP 或 TLS 失败后仍排除/跳过该候选并尝试后续 IP；每个新候选会创建自己的 10 秒预算。
+- 新增 `tcp_and_tls_phases_share_one_candidate_deadline`，模拟 TCP 阶段消耗部分预算后，TLS 只能使用剩余期限，并验证下一个 IP 候选获得独立预算。
+- DNS 地址解析发生在逐 IP 连接预算之外；该预算只对齐 C# 的每候选 TCP/TLS 阶段，不代表 DNS 查询也被限制在这 10 秒内。
 
