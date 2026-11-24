@@ -513,8 +513,8 @@ async fn handle_request_inner(request: Request<Incoming>, scheme: &str, config: 
             // default 100-second timeout. An absent DomainConfig.Timeout is
             // therefore unbounded; an explicit timeout covers forwarding through
             // response headers, not the subsequent streamed response body.
-            let timeout_duration = match domain.as_ref().map(|rule| rule.request_timeout()).transpose() {
-                Ok(value) => value.flatten(),
+            let timeout_duration = match configured_request_timeout(domain.as_ref()) {
+                Ok(value) => value,
                 Err(error) => {
                     tracing::warn!(%error, "invalid configured request timeout");
                     return empty_response(StatusCode::BAD_GATEWAY);
@@ -642,6 +642,17 @@ async fn forward_request(
         },
     ).boxed_unsync();
     Ok(Response::from_parts(response_parts, response_body))
+}
+
+/// Match C# HttpClientHandler: only an explicitly configured DomainConfig.Timeout
+/// bounds forwarding while the upstream response headers are being obtained.
+fn configured_request_timeout(
+    domain: Option<&crate::config::DomainConfig>,
+) -> anyhow::Result<Option<Duration>> {
+    domain
+        .map(|rule| rule.request_timeout())
+        .transpose()
+        .map(Option::flatten)
 }
 
 /// HTTP/2 non-CONNECT requests must use the scheme of the accepted
@@ -997,6 +1008,34 @@ fn empty_response(status: StatusCode) -> Response<ResponseBody> {
 mod header_tests {
     use super::strip_hop_by_hop_headers;
     use http::{header, HeaderMap, HeaderValue};
+
+    #[test]
+    fn absent_domain_timeout_does_not_create_a_default_deadline() {
+        use super::configured_request_timeout;
+        use crate::config::DomainConfig;
+
+        assert_eq!(configured_request_timeout(None).unwrap(), None);
+        assert_eq!(
+            configured_request_timeout(Some(&DomainConfig::default())).unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn explicit_domain_timeout_is_preserved() {
+        use super::configured_request_timeout;
+        use crate::config::DomainConfig;
+        use std::time::Duration;
+
+        let domain = DomainConfig {
+            timeout: Some("00:00:07".to_owned()),
+            ..DomainConfig::default()
+        };
+        assert_eq!(
+            configured_request_timeout(Some(&domain)).unwrap(),
+            Some(Duration::from_secs(7)),
+        );
+    }
 
     #[test]
     fn user_agent_marker_detects_proxy_loops_and_preserves_existing_agent() {
