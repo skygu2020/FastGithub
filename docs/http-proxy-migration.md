@@ -131,3 +131,5 @@
 - 新增 `connected_metadata_preserves_upstream_peer_identity` 单元测试，覆盖 `Connected::extra` 到捕获辅助函数的 peer IP/connection ID 传递；同时更新 HTTP/2 mock connector 初始化字段。
 - 这一机制解决请求到连接的关联，不代表能够把单个 HTTP/2 stream 的超时判定为整条连接故障。后续应先采集请求分配连接、响应头延迟和 stream 错误日志；不能因一个 stream 超时而关闭仍承载其他请求的 HTTP/2 连接，也不对任意请求自动重放。
 - 代码和测试尚未由本地 Cargo 工具链编译或执行；没有触发 GitHub Actions/CI。
+
+- 将既有 HTTP/2 多路复用 loopback 测试扩展为两个并发请求分别调用 `capture_connection`，验证二者捕获到同一个 peer IP 和 `connection_id`，且底层只建立一条 HTTP/2 连接。该用例直接覆盖连接池复用场景下的请求级连接关联，而不仅是单独测试 `Connected::extra`。
