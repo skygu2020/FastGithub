@@ -973,7 +973,7 @@ mod tests {
         // Simulate a TCP phase that consumes part of the candidate budget.
         sleep(Duration::from_millis(30)).await;
 
-        // TLS gets only the remainder, not a fresh 50-second/50-ms timeout.
+        // TLS gets only the remainder, not a fresh 50 ms timeout.
         assert!(
             timeout_at(deadline, sleep(Duration::from_millis(30))).await.is_err(),
             "TLS must not extend the per-IP budget after TCP has consumed it"
