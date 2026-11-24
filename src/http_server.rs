@@ -24,6 +24,7 @@ type BoxError = Box<dyn Error + Send + Sync>;
 trait AsyncIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AsyncIo for T {}
 type ResponseBody = UnsyncBoxBody<Bytes, BoxError>;
+const DEFAULT_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(100);
 
 
 /// Count bytes crossing the accepted client connection, including HTTP headers and frames.
@@ -87,6 +88,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingIo<S> {
 struct TimeoutBody<B> {
     inner: Option<Pin<Box<B>>>,
     sleep: Option<Pin<Box<Sleep>>>,
+    activity_timeout: Option<Duration>,
     connection: Option<UpstreamConnectionGuard>,
     trace: Option<UpstreamBodyTrace>,
     terminated: bool,
@@ -128,6 +130,7 @@ impl<B> TimeoutBody<B> {
         Self {
             inner: Some(Box::pin(inner)),
             sleep: duration.map(|duration| Box::pin(tokio::time::sleep(duration))),
+            activity_timeout: duration,
             connection,
             trace,
             terminated: false,
@@ -183,6 +186,18 @@ where
                 drop(this.inner.take());
                 drop(this.connection.take());
                 Poll::Ready(None)
+            }
+            Poll::Ready(Some(Ok(frame))) => {
+                // YARP's ActivityCancellationTokenSource resets its 100-second
+                // idle timer after each successful body read/write. A long,
+                // continuously progressing response must not hit a fixed
+                // wall-clock deadline.
+                if let (Some(sleep), Some(duration)) =
+                    (this.sleep.as_mut(), this.activity_timeout)
+                {
+                    sleep.as_mut().reset(tokio::time::Instant::now() + duration);
+                }
+                Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(error))) => {
                 this.terminated = true;
@@ -633,7 +648,7 @@ async fn forward_request(
     // Keep the pooled response body streaming without an artificial deadline.
     let response_body = TimeoutBody::new_pooled(
         boxed_body,
-        None,
+        Some(DEFAULT_ACTIVITY_TIMEOUT),
         UpstreamBodyTrace {
             method: request_method,
             original_host,
@@ -833,8 +848,11 @@ async fn forward_upgrade_request(
         strip_hop_by_hop_headers(&mut response_parts.headers);
         response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
         let boxed_body = response_body.map_err(|error| Box::new(error) as BoxError).boxed_unsync();
-        let remaining = body_timeout.map(|duration| duration.saturating_sub(request_started.elapsed()));
-        let response_body = TimeoutBody::new(boxed_body, remaining, connection_guard).boxed_unsync();
+        let response_body = TimeoutBody::new(
+            boxed_body,
+            Some(DEFAULT_ACTIVITY_TIMEOUT),
+            connection_guard,
+        ).boxed_unsync();
         return Ok(Response::from_parts(response_parts, response_body));
     }
 
@@ -1074,32 +1092,63 @@ mod header_tests {
     }
 
     #[tokio::test]
-    async fn pooled_response_body_can_continue_past_request_timeout_window() {
+    async fn pooled_response_body_activity_resets_idle_timeout() {
         use super::{TimeoutBody, UpstreamBodyTrace};
         use bytes::Bytes;
-        use http_body_util::{BodyExt, Full};
-        use std::time::Duration;
+        use http_body::Frame;
+        use http_body_util::BodyExt;
+        use std::{convert::Infallible, pin::Pin, task::{Context, Poll}, time::Duration};
 
-        let inner = Full::new(Bytes::from_static(b"still streaming"))
-            .map_err(|never| -> super::BoxError { match never {} })
-            .boxed_unsync();
+        struct DelayedFrames {
+            next: u8,
+            delay: Pin<Box<tokio::time::Sleep>>,
+        }
+
+        impl http_body::Body for DelayedFrames {
+            type Data = Bytes;
+            type Error = Infallible;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                if self.next >= 3 {
+                    return Poll::Ready(None);
+                }
+                if self.delay.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                let value = self.next;
+                self.next += 1;
+                self.delay.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(25));
+                Poll::Ready(Some(Ok(Frame::data(Bytes::from(vec![b'a' + value])))))
+            }
+        }
+
+        let inner = DelayedFrames {
+            next: 0,
+            delay: Box::pin(tokio::time::sleep(Duration::from_millis(25))),
+        }
+        .map_err(|never| -> super::BoxError { match never {} })
+        .boxed_unsync();
         let trace = UpstreamBodyTrace {
             method: http::Method::GET,
             original_host: "example.test".to_owned(),
             request_target: "/large".to_owned(),
             peer: None,
         };
-        let mut body = TimeoutBody::new_pooled(inner, None, trace);
-
-        // The C# timeout token ends when SendAsync returns response headers.
-        // Waiting longer than a hypothetical request-header budget must not
-        // terminate the subsequent response-body stream.
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        assert_eq!(
-            body.frame().await.unwrap().unwrap().into_data().unwrap(),
-            Bytes::from_static(b"still streaming"),
+        let body = TimeoutBody::new_pooled(
+            inner,
+            Some(Duration::from_millis(40)),
+            trace,
         );
-        assert!(body.frame().await.is_none());
+
+        let bytes = tokio::time::timeout(
+            Duration::from_millis(250),
+            body.collect(),
+        ).await.expect("active body must not hit a total-duration timeout")
+            .unwrap().to_bytes();
+        assert_eq!(bytes, Bytes::from_static(b"abc"));
     }
 
     #[tokio::test]
