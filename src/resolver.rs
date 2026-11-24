@@ -161,7 +161,7 @@ impl DomainResolver {
         };
 
         let candidates = merge_candidates(hosts_candidates, &dns_candidates);
-        if candidates.is_empty() && previous.is_empty() {
+        if candidates.is_empty() && previous_addresses.is_empty() {
             anyhow::bail!("DNS and online hosts returned no addresses for {}", endpoint.host);
         }
         let probed = self
@@ -193,7 +193,7 @@ impl DomainResolver {
     }
 
     async fn store_endpoint(&self, endpoint: EndpointRecord, addresses: Vec<IpAddr>) {
-        // Keep the failure-table read guard until the endpoint snapshot is
+        // Keep the failure-table write guard until the endpoint snapshot is
         // committed. report_failure takes these locks in the same order, so a
         // concurrent failure is either observed here or removes the address
         // immediately after this write; it cannot be overwritten by a stale refresh.
