@@ -147,7 +147,7 @@ impl DomainResolver {
                     "DNS refresh failed; retaining previous candidates"
                 );
                 let retained = self.exclude_failed(&endpoint.host, endpoint.port, &previous_addresses).await;
-                self.store_endpoint(endpoint.clone(), retained.clone()).await;
+                let retained = self.store_endpoint(endpoint.clone(), retained).await;
                 return Ok(retained);
             }
             Err(error) => {
@@ -169,7 +169,7 @@ impl DomainResolver {
             .order_addresses(&endpoint.host, port, candidates, &previous_addresses)
             .await;
         let ordered = self.exclude_failed(&endpoint.host, endpoint.port, &merge_candidates(probed, &previous_addresses)).await;
-        self.store_endpoint(endpoint, ordered.clone()).await;
+        let ordered = self.store_endpoint(endpoint, ordered).await;
         Ok(ordered)
     }
 
@@ -192,7 +192,11 @@ impl DomainResolver {
         }
     }
 
-    async fn store_endpoint_state(&self, endpoint: EndpointRecord, addresses: Vec<IpAddr>) {
+    async fn store_endpoint_state(
+        &self,
+        endpoint: EndpointRecord,
+        addresses: Vec<IpAddr>,
+    ) -> Vec<IpAddr> {
         // Keep the failure-table write guard until the endpoint snapshot is
         // committed. report_failure takes these locks in the same order, so a
         // concurrent failure is either observed here or removes the address
@@ -208,15 +212,17 @@ impl DomainResolver {
         self.endpoints.write().await.insert(
             endpoint,
             EndpointState {
-                addresses: usable,
+                addresses: usable.clone(),
                 refreshed_at: now,
             },
         );
+        usable
     }
 
-    async fn store_endpoint(&self, endpoint: EndpointRecord, addresses: Vec<IpAddr>) {
-        self.store_endpoint_state(endpoint, addresses).await;
+    async fn store_endpoint(&self, endpoint: EndpointRecord, addresses: Vec<IpAddr>) -> Vec<IpAddr> {
+        let usable = self.store_endpoint_state(endpoint, addresses).await;
         self.save_addresses().await;
+        usable
     }
 
     /// Force a full refresh: invalidate DNS/probe caches, update online hosts,
@@ -292,13 +298,7 @@ impl DomainResolver {
                     "DNS refresh failed; retaining old candidates"
                 );
                 if !old.is_empty() {
-                    self.endpoints.write().await.insert(
-                        endpoint,
-                        EndpointState {
-                            addresses: old,
-                            refreshed_at: Instant::now(),
-                        },
-                    );
+                    self.store_endpoint_state(endpoint, old).await;
                 }
                 return;
             }
@@ -336,7 +336,7 @@ impl DomainResolver {
         let next = if ordered.is_empty() { old } else { ordered };
         // Re-check the circuit-breaker table while committing the refreshed list;
         // the earlier exclude_failed() is only a ranking-stage snapshot.
-        self.store_endpoint_state(endpoint, next).await;
+        let _ = self.store_endpoint_state(endpoint, next).await;
     }
 
     /// Mark an IP as failed for this host/port for 90 seconds and remove it from that endpoint's candidates.
