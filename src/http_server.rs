@@ -88,7 +88,16 @@ struct TimeoutBody<B> {
     inner: Option<Pin<Box<B>>>,
     sleep: Option<Pin<Box<Sleep>>>,
     connection: Option<UpstreamConnectionGuard>,
+    trace: Option<UpstreamBodyTrace>,
     terminated: bool,
+}
+
+#[derive(Clone)]
+struct UpstreamBodyTrace {
+    method: Method,
+    original_host: String,
+    request_target: String,
+    peer: Option<crate::http_proxy::UpstreamPeerInfo>,
 }
 
 /// Owns the upstream driver task for as long as its response body is usable.
@@ -103,22 +112,24 @@ impl Drop for UpstreamConnectionGuard {
 
 impl<B> TimeoutBody<B> {
     fn new(inner: B, duration: Option<Duration>, connection: UpstreamConnectionGuard) -> Self {
-        Self::with_connection(inner, duration, Some(connection))
+        Self::with_connection(inner, duration, Some(connection), None)
     }
 
-    fn new_pooled(inner: B, duration: Option<Duration>) -> Self {
-        Self::with_connection(inner, duration, None)
+    fn new_pooled(inner: B, duration: Option<Duration>, trace: UpstreamBodyTrace) -> Self {
+        Self::with_connection(inner, duration, None, Some(trace))
     }
 
     fn with_connection(
         inner: B,
         duration: Option<Duration>,
         connection: Option<UpstreamConnectionGuard>,
+        trace: Option<UpstreamBodyTrace>,
     ) -> Self {
         Self {
             inner: Some(Box::pin(inner)),
             sleep: duration.map(|duration| Box::pin(tokio::time::sleep(duration))),
             connection,
+            trace,
             terminated: false,
         }
     }
@@ -141,7 +152,18 @@ where
         }
         if this.sleep.as_mut().is_some_and(|sleep| sleep.as_mut().poll(cx).is_ready()) {
             this.terminated = true;
-            tracing::warn!("upstream response body stalled until request timeout");
+            if let Some(trace) = &this.trace {
+                tracing::warn!(
+                    method = %trace.method,
+                    original_host = %trace.original_host,
+                    request_target = %trace.request_target,
+                    peer_ip = ?trace.peer.map(|peer| peer.peer_ip),
+                    connection_id = ?trace.peer.map(|peer| peer.connection_id),
+                    "upstream response body stalled until request timeout"
+                );
+            } else {
+                tracing::warn!("upstream response body stalled until request timeout");
+            }
             // Dropping Incoming cancels the upstream HTTP/2 stream or makes an
             // incomplete HTTP/1 connection ineligible for keep-alive reuse.
             drop(this.inner.take());
@@ -164,7 +186,19 @@ where
             }
             Poll::Ready(Some(Err(error))) => {
                 this.terminated = true;
-                tracing::warn!(%error, "upstream response body stream failed");
+                if let Some(trace) = &this.trace {
+                    tracing::warn!(
+                        %error,
+                        method = %trace.method,
+                        original_host = %trace.original_host,
+                        request_target = %trace.request_target,
+                        peer_ip = ?trace.peer.map(|peer| peer.peer_ip),
+                        connection_id = ?trace.peer.map(|peer| peer.connection_id),
+                        "upstream response body stream failed"
+                    );
+                } else {
+                    tracing::warn!(%error, "upstream response body stream failed");
+                }
                 drop(this.inner.take());
                 drop(this.connection.take());
                 Poll::Ready(Some(Err(error)))
@@ -549,6 +583,7 @@ async fn forward_request(
         anyhow::bail!("request already contains FastGithub/1.0 User-Agent marker; refusing proxy loop");
     }
     let downstream_version = request.version();
+    let request_method = request.method().clone();
     let (mut parts, body) = request.into_parts();
     // Let the pooled client negotiate HTTP/1.1 or HTTP/2 independently of
     // the downstream protocol version.
@@ -586,12 +621,22 @@ async fn forward_request(
         .send_pooled_request(&original_host, upstream_request)
         .await?;
     let (mut response_parts, response_body) = upstream_response.into_parts();
+    let upstream_peer = response_parts.extensions.get::<crate::http_proxy::UpstreamPeerInfo>().copied();
     response_parts.version = downstream_version;
     strip_hop_by_hop_headers(&mut response_parts.headers);
     response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
     let boxed_body = response_body.map_err(|error| Box::new(error) as BoxError).boxed_unsync();
     let remaining = body_timeout.map(|duration| duration.saturating_sub(request_started.elapsed()));
-    let response_body = TimeoutBody::new_pooled(boxed_body, remaining).boxed_unsync();
+    let response_body = TimeoutBody::new_pooled(
+        boxed_body,
+        remaining,
+        UpstreamBodyTrace {
+            method: request_method,
+            original_host,
+            request_target,
+            peer: upstream_peer,
+        },
+    ).boxed_unsync();
     Ok(Response::from_parts(response_parts, response_body))
 }
 
