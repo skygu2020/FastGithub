@@ -347,3 +347,29 @@ Rust 普通 HTTP 转发现已引入共享 `ActivityTimeout`：100 秒 deadline �
 - 当前环境没有本地 Cargo 工具链，未运行 fmt/build/test，也没有触发 GitHub Actions/CI。
 
 参考：`dnscrypt 0.3.0` 的 `Client::default` / `Client::lookup` API 和默认 resolver 说明见 https://docs.rs/dnscrypt/0.3.0/dnscrypt/struct.Client.html 及 https://docs.rs/dnscrypt/0.3.0/dnscrypt/。
+
+
+## DNSCrypt crate 的 MSRV 阻断（2026-11-24）
+
+继续核对候选 `dnscrypt 0.3.0` 的实际发布依赖后，发现它不满足项目声明的 Rust 1.78：
+
+- `dnscrypt 0.3.0` 依赖 `ed25519-dalek ^3` 与 `x25519-dalek ^3`。
+- 这两个 3.x 版本将 edition 更新为 2024，MSRV 提高到 Rust 1.85；其中 `ed25519-dalek 3.0.0` 的 Cargo 元数据明确声明 `rust-version = "1.85"`。
+- `dnscrypt 0.1.1` 也已使用 edition 2024，并在其 Cargo.toml 中明确声明 Rust 1.87。因此回退到该 crate 的较早版本不能解决兼容问题。
+- 项目 `Cargo.toml` 仍声明 `rust-version = "1.78"`。在未获准提高项目 MSRV 前，不应把该 crate 加入依赖，即使它是 optional feature，也会增加旧 Cargo 解析和锁文件解析风险。
+
+因此撤回了刚才试接的 `dnscrypt` optional dependency、feature 和调用代码，恢复原有 Go 子进程 DNSCrypt 路径；没有留下一个在声明 MSRV 下不可构建的可选功能。
+
+### 下一步选择
+
+1. **保持 Rust 1.78**：评估将 DNSCrypt v2 协议实现移植/内嵌到项目，并选择明确支持 Rust 1.78 的密码学依赖版本；需要审计协议证书验证、会话密钥、nonce 和加密封包，工作量明显大于接一个 crate。
+2. **允许将 MSRV 提高到至少 1.87**：可以重新接入 `dnscrypt 0.3`，但必须同步更新项目最低 Rust 版本要求，并确认部署环境工具链。
+3. **先内嵌 DoH/DoT/DoQ/DoH3**：Hickory Resolver 0.25.2 的发布元数据显示 MSRV 1.71.1，支持以 `https-ring`、`tls-ring`、`quic-ring`、`h3-ring` feature 启用对应传输；这条路线不等价于 DNSCrypt，但能先替换 Go 代理中的部分加密 DNS 能力。
+
+本轮撤回了不兼容的代码试验；只保留本节兼容性结论。没有本地 Cargo 工具链，未运行 fmt/build/test，也没有触发 GitHub Actions/CI。
+
+参考：
+- https://docs.rs/crate/dnscrypt/0.1.1/source/Cargo.toml.orig
+- https://docs.rs/crate/ed25519-dalek/3.0.0
+- https://docs.rs/crate/x25519-dalek/3.0.0
+- https://docs.rs/crate/hickory-resolver/0.25.2
