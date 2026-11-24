@@ -6,6 +6,10 @@ rust-version = "1.78"
 description = "Native Rust Linux implementation of FastGithub"
 license = "MIT"
 
+[features]
+default = []
+native-dnscrypt = ["dep:dnscrypt"]
+
 [[bin]]
 name = "fastgithub"
 path = "src/main.rs"
@@ -16,6 +20,7 @@ anyhow = "1"
 fs2 = "0.4"
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
+dnscrypt = { version = "0.3", optional = true }
 json5 = "0.4"
 openssl = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
