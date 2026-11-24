@@ -740,7 +740,16 @@ async fn forward_request(
         .await
     {
         Ok(result) => result?,
-        Err(()) => anyhow::bail!("upstream request exceeded the 100-second activity idle timeout"),
+        Err(()) => {
+            tracing::warn!(
+                method = %request_method,
+                original_host = %original_host,
+                request_target = %request_target,
+                activity_timeout_ms = DEFAULT_ACTIVITY_TIMEOUT.as_millis(),
+                "upstream forwarding made no progress before response headers"
+            );
+            anyhow::bail!("upstream request exceeded the 100-second activity idle timeout")
+        },
     };
     // YARP resets its activity timer as soon as upstream response headers arrive.
     activity.reset();
