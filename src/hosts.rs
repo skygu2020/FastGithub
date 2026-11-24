@@ -1,6 +1,6 @@
 use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 
-use reqwest::Client;
+use reqwest::{header::USER_AGENT, Client};
 use tokio::{sync::RwLock, task::JoinSet};
 
 const HOSTS_URLS: [&str; 2] = [
@@ -41,7 +41,15 @@ impl HostsService {
             let client = self.client.clone();
             jobs.spawn(async move {
                 let result = async {
-                    let response = client.get(url).send().await?.error_for_status()?;
+                    let request = client.get(url);
+                    // Try the product UA only for gitcdn; keep the other source unchanged
+                    // so a successful refresh can identify whether this header helps.
+                    let request = if url == "https://hosts.gitcdn.top/hosts.txt" {
+                        request.header(USER_AGENT, "FastGithub/1.0")
+                    } else {
+                        request
+                    };
+                    let response = request.send().await?.error_for_status()?;
                     response.text().await
                 }
                 .await;
