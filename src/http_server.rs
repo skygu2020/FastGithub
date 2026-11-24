@@ -2291,6 +2291,133 @@ mod header_tests {
     }
 
     #[tokio::test]
+    async fn hyper_http2_stream_reset_does_not_poison_sibling_or_followup_streams() {
+        use super::{client_http2, server_http2, TokioExecutor};
+        use bytes::Bytes;
+        use http::{Request, Response, StatusCode, Version};
+        use http_body::Frame;
+        use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
+        use hyper::{body::Incoming, service::service_fn};
+        use hyper_util::rt::TokioIo;
+        use std::{
+            convert::Infallible,
+            error::Error,
+            io,
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        use tokio::net::TcpListener;
+
+        struct ResetBody;
+        impl http_body::Body for ResetBody {
+            type Data = Bytes;
+            type Error = io::Error;
+
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                Poll::Ready(Some(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "intentional HTTP/2 stream failure",
+                ))))
+            }
+
+            fn is_end_stream(&self) -> bool { false }
+        }
+
+        type TestBody = UnsyncBoxBody<Bytes, Box<dyn Error + Send + Sync>>;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = service_fn(|request: Request<Incoming>| async move {
+                let body: TestBody = if request.uri().path() == "/reset" {
+                    ResetBody
+                        .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
+                        .boxed_unsync()
+                } else {
+                    Full::new(Bytes::from_static(b"healthy"))
+                        .map_err(|never| match never {})
+                        .boxed_unsync()
+                };
+                Ok::<_, Infallible>(Response::new(body))
+            });
+            server_http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (sender, connection) =
+            client_http2::handshake(TokioExecutor::new(), TokioIo::new(stream)).await.unwrap();
+        let driver = tokio::spawn(async move { connection.await.unwrap() });
+
+        let mut reset_sender = sender.clone();
+        let reset = tokio::spawn(async move {
+            let request = Request::builder()
+                .method(http::Method::GET)
+                .version(Version::HTTP_2)
+                .uri("https://localhost/reset")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            reset_sender.send_request(request).await.unwrap()
+        });
+
+        let mut sibling_sender = sender.clone();
+        let sibling_request = Request::builder()
+            .method(http::Method::GET)
+            .version(Version::HTTP_2)
+            .uri("https://localhost/healthy")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let sibling_response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            sibling_sender.send_request(sibling_request),
+        ).await.expect("sibling stream must progress beside the failing stream").unwrap();
+        assert_eq!(sibling_response.status(), StatusCode::OK);
+        assert_eq!(
+            sibling_response.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"healthy"),
+        );
+
+        let reset_response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reset,
+        ).await.expect("reset stream response headers must arrive").unwrap();
+        assert_eq!(reset_response.status(), StatusCode::OK);
+        let reset_result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reset_response.into_body().collect(),
+        ).await.expect("failed body must be terminated by an HTTP/2 stream reset");
+        assert!(reset_result.is_err(), "the failing stream must surface a body error");
+
+        let mut followup_sender = sender.clone();
+        let followup_request = Request::builder()
+            .method(http::Method::GET)
+            .version(Version::HTTP_2)
+            .uri("https://localhost/healthy")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let followup_response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            followup_sender.send_request(followup_request),
+        ).await.expect("connection must remain usable after one stream reset").unwrap();
+        assert_eq!(
+            followup_response.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"healthy"),
+        );
+
+        drop(sender);
+        drop(sibling_sender);
+        drop(followup_sender);
+        driver.await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn hyper_http2_streams_progress_independently() {
         use super::{client_http2, server_http2, TokioExecutor};
         use bytes::Bytes;
