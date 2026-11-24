@@ -214,3 +214,12 @@ Rust 普通 HTTP 转发现已引入共享 `ActivityTimeout`：100 秒 deadline �
 - 新增 `tcp_and_tls_phases_share_one_candidate_deadline`，模拟 TCP 阶段消耗部分预算后，TLS 只能使用剩余期限，并验证下一个 IP 候选获得独立预算。
 - DNS 地址解析发生在逐 IP 连接预算之外；该预算只对齐 C# 的每候选 TCP/TLS 阶段，不代表 DNS 查询也被限制在这 10 秒内。
 
+
+
+## DNS/IP 候选测速超时对照（2026-11-24）
+
+- 原版 `IPAddressService.GetAddressElapsedAsync` 对每个候选 TCP connect 使用 5 秒超时；成功结果按连接耗时排序，失败地址不进入测速结果。成功测速缓存 5 分钟，本机网络不可达/断网错误缓存 1 分钟。
+- Rust `AddressService::measure` 除 TCP connect 外还执行 TLS 握手与证书链验证（关闭 hostname matching，但仍使用原始 host 作为 SNI），因此测速比原版更严格。此前 Rust 将 TCP+TLS 整体限制为 2 秒；在其他候选探测成功时，超过 2 秒的慢候选会被排序阶段剔除，并把失败结果缓存 5 分钟，可能把暂时慢的可用节点误判为不可用。
+- 现将 Rust 单候选测速预算调整为 5 秒，与原版超时上限对齐。该预算仍覆盖 TCP+TLS 两阶段；真实请求连接仍使用独立的每 IP 10 秒 TCP+TLS deadline。候选测速任务并行执行，不会按候选数量累加 5 秒。
+- 若所有候选测速均失败，Rust 仍保留候选地址交由真实请求路径验证；这比原版 `GetAddressesAsync` 返回空列表更保守，避免一次测速故障清空 DNS/hosts 候选。请求阶段明确失败的 IP 仍按 host/port 熔断 90 秒。
+- 本次只调整探测预算，不改变候选排序、TLS 验证、失败缓存 TTL 或请求阶段熔断策略。没有本地 Cargo 工具链，未运行 fmt/build/test；没有触发 GitHub Actions/CI。
