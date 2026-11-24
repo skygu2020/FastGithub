@@ -111,9 +111,9 @@ impl DomainResolver {
             if !previous_addresses.is_empty()
                 && refreshed_at.elapsed() < ENDPOINT_REFRESH_TTL
             {
-            let usable = self
-                .exclude_failed(&endpoint.host, endpoint.port, &previous_addresses)
-                .await;
+                let usable = self
+                    .exclude_failed(&endpoint.host, endpoint.port, &previous_addresses)
+                    .await;
                 if !usable.is_empty() {
                     return Ok(usable);
                 }
