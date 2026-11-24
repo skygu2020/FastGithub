@@ -75,7 +75,7 @@ impl DnsClient {
         let mut encrypted_resolved = false;
         #[cfg(feature = "native-doh")]
         if let Some(resolver) = self.doh.as_ref() {
-            match timeout(DNS_TIMEOUT, resolver.lookup_ip(&host)).await {
+            match timeout(DNS_TIMEOUT, resolver.lookup_ip(host.as_str())).await {
                 Ok(Ok(lookup)) => {
                     encrypted_resolved = true;
                     let found = lookup.iter().collect::<Vec<_>>();
