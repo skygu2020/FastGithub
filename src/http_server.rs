@@ -194,6 +194,9 @@ impl ActivityTimeout {
     async fn run<F: Future>(&self, future: F) -> Result<F::Output, ()> {
         tokio::pin!(future);
         loop {
+            if self.is_expired() {
+                return Err(());
+            }
             let deadline = self.deadline();
             tokio::select! {
                 biased;
