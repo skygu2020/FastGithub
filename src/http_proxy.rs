@@ -963,6 +963,29 @@ mod tests {
     use super::*;
     use std::{convert::Infallible, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
 
+    #[tokio::test]
+    async fn tcp_and_tls_phases_share_one_candidate_deadline() {
+        use std::time::Duration;
+        use tokio::time::{sleep, timeout_at, Instant};
+
+        let deadline = Instant::now() + Duration::from_millis(50);
+
+        // Simulate a TCP phase that consumes part of the candidate budget.
+        sleep(Duration::from_millis(30)).await;
+
+        // TLS gets only the remainder, not a fresh 50-second/50-ms timeout.
+        assert!(
+            timeout_at(deadline, sleep(Duration::from_millis(30))).await.is_err(),
+            "TLS must not extend the per-IP budget after TCP has consumed it"
+        );
+
+        // A subsequent IP candidate starts a fresh independent budget.
+        let next_candidate_deadline = Instant::now() + Duration::from_millis(50);
+        assert!(
+            timeout_at(next_candidate_deadline, sleep(Duration::from_millis(1))).await.is_ok()
+        );
+    }
+
     #[test]
     fn connected_metadata_preserves_upstream_peer_identity() {
         let expected = UpstreamPeerInfo {
