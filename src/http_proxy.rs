@@ -1094,6 +1094,123 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct MockH2GoAwayConnector {
+        connections: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Service<Uri> for MockH2GoAwayConnector {
+        type Response = TokioIo<ConnectedUpstreamIo>;
+        type Error = io::Error;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _uri: Uri) -> Self::Future {
+            let connection_id = self.connections.fetch_add(1, Ordering::Relaxed) as u64 + 1;
+            Box::pin(async move {
+                let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+                tokio::spawn(async move {
+                    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+                    let shutdown_tx = std::sync::Mutex::new(Some(shutdown_tx));
+                    let service = service_fn(move |_request: Request<hyper::body::Incoming>| {
+                        if let Some(sender) = shutdown_tx.lock().unwrap().take() {
+                            let _ = sender.send(());
+                        }
+                        async move {
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"h2"))))
+                        }
+                    });
+                    let mut connection = Box::pin(
+                        hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                            .serve_connection(TokioIo::new(server_io), service),
+                    );
+                    tokio::select! {
+                        result = &mut connection => {
+                            let _ = result;
+                        }
+                        _ = shutdown_rx => {
+                            connection.as_mut().graceful_shutdown();
+                            let _ = connection.await;
+                        }
+                    }
+                });
+                Ok(TokioIo::new(ConnectedUpstreamIo {
+                    inner: Box::new(client_io),
+                    peer_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    connection_id,
+                    http2: true,
+                }))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn pooled_client_reconnects_after_http2_goaway() {
+        use bytes::Bytes;
+        use http::Version;
+        use http_body_util::{BodyExt, Full};
+        use hyper_util::rt::TokioExecutor;
+
+        let connections = Arc::new(AtomicUsize::new(0));
+        let connector = MockH2GoAwayConnector {
+            connections: Arc::clone(&connections),
+        };
+        let mut builder = Client::builder(TokioExecutor::new());
+        builder
+            .pool_idle_timeout(Duration::from_secs(30))
+            .pool_timer(TokioTimer::new())
+            .pool_max_idle_per_host(4);
+        let client: UpstreamClient = builder.build(connector);
+
+        let make_request = |path: &'static str| {
+            let body: UpstreamBody = Full::new(Bytes::new())
+                .map_err(|never| -> UpstreamError { match never {} })
+                .boxed_unsync();
+            Request::builder()
+                .version(Version::HTTP_11)
+                .uri(format!("https://goaway.example{path}"))
+                .body(body)
+                .unwrap()
+        };
+
+        let mut first_request = make_request("/first");
+        let first_capture = capture_connection(&mut first_request);
+        let first_response = client.request(first_request).await.unwrap();
+        assert_eq!(
+            first_response.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"h2"),
+        );
+        let first_peer = first_capture.connection_metadata()
+            .as_ref()
+            .and_then(captured_upstream_peer)
+            .expect("first request should capture its HTTP/2 connection");
+
+        // The mock peer sends GOAWAY after the first request and drains the
+        // active stream. A later request must not be pinned to that connection.
+        let mut second_request = make_request("/second");
+        let second_capture = capture_connection(&mut second_request);
+        let second_response = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.request(second_request),
+        ).await.expect("pooled client must reconnect after GOAWAY").unwrap();
+        assert_eq!(
+            second_response.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"h2"),
+        );
+        let second_peer = second_capture.connection_metadata()
+            .as_ref()
+            .and_then(captured_upstream_peer)
+            .expect("second request should capture its replacement HTTP/2 connection");
+
+        assert_ne!(first_peer.connection_id, second_peer.connection_id);
+        assert_eq!(connections.load(Ordering::Relaxed), 2);
+
+        drop(client);
+    }
+
     #[tokio::test]
     async fn pooled_client_multiplexes_http2_requests_on_one_connection() {
         use bytes::Bytes;
