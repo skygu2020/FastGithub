@@ -232,3 +232,11 @@ Rust 普通 HTTP 转发现已引入共享 `ActivityTimeout`：100 秒 deadline �
 - 后台批量测速使用不触发单次持久化的 `store_endpoint_state()`，待所有 endpoint 刷新任务完成后再统一 `save_addresses()`；普通按需解析仍通过 `store_endpoint()` 在提交后持久化。
 - `store_endpoint_state()` 返回实际提交的过滤后候选列表，按需解析将该列表返回给调用方，避免在熔断发生于测速筛选与 endpoint 提交之间时，内存状态虽已剔除 IP、当前这次 `resolve()` 却仍返回旧列表。后台刷新遇到 DNS 错误保留旧候选时也走同一提交路径，不再直接覆盖 endpoint 状态。
 - 这些修正不改变 90 秒熔断期限、测速缓存 TTL、候选排序或请求重试策略。当前无本地 Cargo 工具链，未运行 fmt/build/test；没有触发 GitHub Actions/CI。
+
+
+## Hosts 源 User-Agent 试验（2026-11-24）
+
+- 针对 `https://hosts.gitcdn.top/hosts.txt` 的请求单独添加 `User-Agent: FastGithub/1.0`，用于验证该站点是否因默认客户端标识而拒绝或延迟响应。
+- 只对 gitcdn 源设置该头；`raw.hellogithub.com` 请求保持原样，便于通过同一次并发刷新对照两个来源，避免把试验变量扩散到所有 hosts 服务。
+- 这只是诊断性尝试，不代表已经确认 gitcdn 要求该 User-Agent。下一次启动/刷新重点观察 gitcdn 是否仍出现 timeout，以及是否取得有效 hosts 内容；若仍超时，应继续检查 DNS、TCP、TLS 或响应头阶段，不能仅凭结果归因于 UA。
+- 未改变 20 秒请求超时、禁用系统代理或来源合并/回退逻辑。当前环境没有本地 Cargo 工具链，未运行 fmt/build/test；没有触发 GitHub Actions/CI。
