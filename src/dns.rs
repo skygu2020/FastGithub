@@ -57,6 +57,10 @@ impl DnsClient {
     pub async fn clear_cache(&self) {
         self.cache.lock().await.clear();
         self.state_cache.lock().await.clear();
+        #[cfg(feature = "native-doh")]
+        if let Some(resolver) = self.doh.as_ref() {
+            resolver.clear_cache();
+        }
     }
 
     /// Query configured DNS upstreams, merging unique A and AAAA answers.
