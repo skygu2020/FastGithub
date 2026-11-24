@@ -182,7 +182,7 @@ Rust 之前将默认 100 秒 ActivityTimeout 错误实现成从请求开始计�
 - 请求 body wrapper 的 frame/EOF 活动会刷新共享 deadline；forwarding future 等待连接/响应头时与它竞争同一活动 deadline；收到响应头后重置；response body wrapper 继续使用同一时钟并在成功 frame 后刷新。
 - 新增测试覆盖显式/缺省 DomainConfig.Timeout、持续上传 frame 刷新共享 deadline，以及响应体持续有 frame 时总耗时超过单次 idle timeout 仍可完成。
 
-仍有边界差异：YARP 的 `StreamCopier` 在成功 read 和 write 两侧都会刷新活动时钟；Hyper Body wrapper 目前在 frame 产出时刷新，无法直接观察 socket write 完成。HTTP Upgrade/WebSocket 双向复制也尚未接入共享活动时钟。当前环境没有本地 Rust 工具链，未运行 fmt/build/test；没有触发 GitHub Actions/CI。
+仍有边界差异：YARP 的 `StreamCopier` 在成功 read 和 write 两侧都会刷新活动时钟；Hyper Body wrapper 目前在 frame 产出时刷新，无法直接观察 socket write 完成。当前环境没有本地 Rust 工具链，未运行 fmt/build/test；没有触发 GitHub Actions/CI。
 
 ## YARP 1.1.1 ActivityTimeout 语义补充（2026-11-24）
 
@@ -193,4 +193,14 @@ Rust 之前将默认 100 秒 ActivityTimeout 错误实现成从请求开始计�
 - `ForwarderRequestConfig.Empty` 默认请求版本为 HTTP/2.0，版本策略为 `RequestVersionOrLower`。因此不能仅凭 FastGithub 的 URI scheme 被改写成 http，就断言 C# 上游固定使用 HTTP/1.1；最终协议由 SocketsHttpHandler 的版本协商行为决定。
 
 Rust 普通 HTTP 转发现已引入共享 `ActivityTimeout`：100 秒 deadline 同时覆盖等待连接/响应头与请求上传；请求体 frame/EOF 会刷新共享时钟；收到响应头时重置；响应体 wrapper 继续使用同一时钟，并在成功 frame 后刷新。这样持续有数据的普通上传/下载不会因总耗时超过 100 秒而被硬切断。新增测试分别覆盖上传 frame 刷新共享 deadline、响应 frame 刷新 idle timeout。仍有边界差异：YARP 在成功 read 和 write 两侧均刷新，Hyper Body wrapper 只能在 frame 产出时刷新，无法直接观察 socket write 完成；HTTP Upgrade/WebSocket 双向复制也尚未接入共享活动时钟。显式 `DomainConfig.Timeout` 仍单独限制 forwarding/SendAsync 阶段，普通响应体阶段不继续使用该配置期限。
+
+## HTTP Upgrade / WebSocket 活动超时（2026-11-24）
+
+- Upgrade 独立 HTTP/1.1 连接分支现创建自己的共享 `ActivityTimeout`，默认 100 秒。
+- 上游 IO 在 HTTP/1 handshake 前后通过 `ActivityIo` 包装；成功读取或写入非零字节时刷新活动时钟。发出 Upgrade 请求并等待上游响应头时，使用同一个 deadline。
+- 收到非 101 响应时，响应体 `TimeoutBody` 继续使用同一活动时钟，并保留上游连接 driver guard。
+- 收到合法 101 后，等待下游和上游 `OnUpgrade` handoff 的阶段受同一活动 deadline 保护；双向隧道的两端 IO 都通过 `ActivityIo` 包装，任一方向有实际字节读写都会刷新 deadline。隧道复制 future 由同一个活动时钟包围；连续无数据活动达到 100 秒时终止隧道并输出 host、request-target 和超时值。
+- 新增 `upgraded_io_activity_resets_shared_idle_timeout`，使用 loopback duplex IO 验证跨越单个 40ms deadline 的连续字节读取仍能完成（每个字节间隔 25ms），避免将总连接时长误当作 idle timeout。
+
+限制：Upgrade 分支的 DNS/TCP 建连和 OpenSSL TLS 握手发生在可包装的隧道 IO 建立之前，目前仍依赖各自底层连接/握手超时机制，不由共享 ActivityTimeout 的读写活动刷新。该差异需要后续单独检查连接超时配置；没有宣称此处已完全复刻 YARP 的所有阶段。
 
