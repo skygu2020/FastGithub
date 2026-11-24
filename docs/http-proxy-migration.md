@@ -373,3 +373,21 @@ Rust 普通 HTTP 转发现已引入共享 `ActivityTimeout`：100 秒 deadline �
 - https://docs.rs/crate/ed25519-dalek/3.0.0
 - https://docs.rs/crate/x25519-dalek/3.0.0
 - https://docs.rs/crate/hickory-resolver/0.25.2
+
+
+## 原生 DoH 后端（Hickory）首轮接入（2026-11-24）
+
+由于纯 Rust `dnscrypt` crate 的依赖链要求 Rust 1.85/1.87，与项目 Rust 1.78 声明冲突，本轮先采用兼容项目 MSRV 的 Hickory Resolver 0.25.2，接入一个独立的 DoH 验证 backend；这不是 DNSCrypt v2 的替代实现。
+
+- Cargo 增加 opt-in feature `native-doh`，精确固定 `hickory-resolver = 0.25.2`，关闭默认 feature，只启用 `tokio`、`https-ring`、`webpki-roots`。该版本文档声明 MSRV 1.70，低于项目的 1.78。
+- `DnsClient` 在启用 feature 时可持有 `Arc<TokioResolver>`，新增 `with_doh()` 构造入口；使用 Hickory 的 `ResolverConfig::cloudflare_https()` 创建 Cloudflare DoH-only resolver，不读取系统 DNS 配置，也不把 UDP/TCP 53 作为该 resolver 的 transport。
+- `DnsClient::resolve` 先执行 DoH A/AAAA lookup，成功后使用 Hickory 返回的 IP 集合；有效空答案也视为加密查询成功，不会继续向明文 fallback DNS 发送同一查询。仅 DoH 错误或超时才使用现有 `FastGithub.FallbackDns` 列表。
+- `main.rs` 把 DNS client 创建集中到 `build_dns_client()`：默认构建继续使用原 Go `dnscrypt-proxy`；使用 `--features native-doh` 时不启动 Go 子进程，改为进程内 DoH。HTTP 代理入口改为接收已构造的 `DnsClient`，三个 DNS CLI 命令也共用该选择逻辑。
+- Hickory 自己维护 DNS 响应缓存，并在 `LookupIp` 暴露 `valid_until()`；当前上层尚未把该过期时间映射到 FastGithub 的地址缓存，后续应检查 resolver 层是否会重复缓存旧候选，以及显式刷新是否能清理 Hickory 缓存。
+- 该 feature 只实现 Cloudflare DoH。它不提供 DNSCrypt、匿名 DNSCrypt relay、ODoH 或 PQDNSCrypt；Go 配置的 resolver catalog、server selection、测速、负载均衡和远程来源更新尚未迁移。
+- 手动试验构建命令：`cargo build --release --features native-doh`。默认构建行为不变。当前没有本地 Cargo 工具链，未运行 fmt/build/test，也没有触发 GitHub Actions/CI。
+
+参考：
+- Hickory 0.25.2 MSRV 与 DoH feature：https://docs.rs/crate/hickory-resolver/0.25.2
+- 0.25.2 feature 列表：https://docs.rs/crate/hickory-resolver/0.25.2/features
+- 0.25.2 DoH 测试使用 `ResolverConfig::cloudflare_https()`：https://docs.rs/crate/hickory-resolver/0.25.2/source/src/h2.rs
