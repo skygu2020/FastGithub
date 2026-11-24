@@ -151,3 +151,10 @@
 - 错误日志优先从 `Error::connect_info()` 读取 peer IP 和 connection ID；没有连接信息时回退到 `capture_connection` 已记录的元数据。连接信息缺失时保留空值。
 - 该分类是保守的淘汰策略，不声称已从 `hyper::Error` 精确区分 HTTP/2 RST_STREAM、GOAWAY 和 socket EOF。下一阶段应在不改动 Hyper driver 管理权的前提下，补充可验证的连接关闭/stream reset loopback 场景，观察各自错误类别与 pool 后续请求行为。
 - 本轮没有更改请求重放策略；没有本地 Cargo 工具链，未运行 fmt/build/test，也未触发 GitHub Actions/CI。
+
+## HTTP/2 单 stream reset 隔离回归（2026-11-24）
+
+- 新增 `hyper_http2_stream_reset_does_not_poison_sibling_or_followup_streams`：同一条 HTTP/2 loopback 连接上，一个响应体在发送响应头后主动返回 body error，触发该 stream 的失败/reset；并发 sibling stream 仍应完整返回，失败 stream 结束后同一连接上的 follow-up 请求也应成功。
+- 该用例补足了此前仅取消等待中 stream 的覆盖：现在分别覆盖请求 future 被取消，以及响应体阶段发生 stream 级失败两种不同路径。测试断言只要求失败 stream 返回 body error，不把 Hyper 的底层错误类型推断为某个精确的 RST_STREAM code，也不据此改变连接池淘汰策略。
+- 这是 Hyper HTTP/2 client/server loopback 回归，不是 TLS 代理端到端测试。当前环境没有本地 Rust 工具链，尚未运行 fmt/build/test；没有触发 GitHub Actions/CI。用户手动构建时应重点确认 body error 确实只终止该 stream，且 sibling 与 follow-up 均通过。
+
