@@ -614,10 +614,9 @@ async fn handle_request_inner(request: Request<Incoming>, scheme: &str, config: 
             if http2_expect_continue_unsupported(request.version(), request.headers()) {
                 return empty_response(StatusCode::EXPECTATION_FAILED);
             }
-            // The C# implementation uses HttpMessageInvoker, not HttpClient's
-            // default 100-second timeout. An absent DomainConfig.Timeout is
-            // therefore unbounded; an explicit timeout covers forwarding through
-            // response headers, not the subsequent streamed response body.
+            // DomainConfig.Timeout is an additional explicit SendAsync deadline.
+            // YARP's separate default 100-second ActivityTimeout is enforced by
+            // forward_request's shared activity clock and resets on body progress.
             let timeout_duration = match configured_request_timeout(domain.as_ref()) {
                 Ok(value) => value,
                 Err(error) => {
@@ -625,9 +624,8 @@ async fn handle_request_inner(request: Request<Incoming>, scheme: &str, config: 
                     return empty_response(StatusCode::BAD_GATEWAY);
                 }
             };
-            // Keep one clock for the complete request. If the response body starts
-            // after a slow DNS/connect/TLS/header phase, only the remaining budget
-            // is available for streaming it.
+            // Used only for timeout diagnostics; the YARP activity deadline is
+            // refreshed by request/response body progress rather than wall time.
             let request_started = tokio::time::Instant::now();
             // Each async fn has a distinct opaque Future type. Await both
             // branches inside one async block so the timeout wrapper receives
