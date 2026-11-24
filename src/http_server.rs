@@ -83,6 +83,66 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingIo<S> {
     }
 }
 
+/// Refresh the shared idle deadline whenever upgraded tunnel bytes make
+/// forward progress in either direction.
+struct ActivityIo<S> {
+    inner: S,
+    activity: ActivityTimeout,
+}
+
+impl<S> ActivityIo<S> {
+    fn new(inner: S, activity: ActivityTimeout) -> Self {
+        Self { inner, activity }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for ActivityIo<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buffer.filled().len();
+        match Pin::new(&mut this.inner).poll_read(cx, buffer) {
+            Poll::Ready(Ok(())) => {
+                if buffer.filled().len() > before {
+                    this.activity.reset();
+                }
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for ActivityIo<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_write(cx, bytes) {
+            Poll::Ready(Ok(written)) => {
+                if written > 0 {
+                    this.activity.reset();
+                }
+                Poll::Ready(Ok(written))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 /// Enforce an idle activity timeout while a request or response body is streamed.
 /// Successful body frames reset the deadline; this is not a total transfer timeout.
 struct TimeoutBody<B> {
@@ -891,6 +951,7 @@ async fn forward_upgrade_request(
     config: &AppConfig,
     tls_proxy: &crate::http_proxy::TlsProxy,
 ) -> anyhow::Result<Response<ResponseBody>> {
+    let activity = ActivityTimeout::new(DEFAULT_ACTIVITY_TIMEOUT);
     if has_fastgithub_user_agent(request.headers()) {
         anyhow::bail!("request already contains FastGithub/1.0 User-Agent marker; refusing proxy loop");
     }
@@ -939,6 +1000,7 @@ async fn forward_upgrade_request(
     } else {
         anyhow::bail!("unsupported upstream URI scheme '{}'", uri.scheme());
     };
+    let io = ActivityIo::new(io, activity.clone());
     let (mut sender, connection) = client_http1::handshake(TokioIo::new(io)).await?;
     let connection_task = tokio::spawn(async move {
         if let Err(error) = connection.with_upgrades().await {
@@ -956,16 +1018,20 @@ async fn forward_upgrade_request(
     let upstream_request = Request::from_parts(parts, body);
     tracing::debug!(%original_host, upstream = %uri, "forwarding HTTP protocol upgrade");
 
-    let mut upstream_response = sender.send_request(upstream_request).await?;
+    let mut upstream_response = match activity.run(sender.send_request(upstream_request)).await {
+        Ok(result) => result?,
+        Err(()) => anyhow::bail!("upstream protocol upgrade exceeded the 100-second activity idle timeout"),
+    };
     if upstream_response.status() != StatusCode::SWITCHING_PROTOCOLS {
         let (mut response_parts, response_body) = upstream_response.into_parts();
         strip_hop_by_hop_headers(&mut response_parts.headers);
         response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
         let boxed_body = response_body.map_err(|error| Box::new(error) as BoxError).boxed_unsync();
-        let response_body = TimeoutBody::new(
+        let response_body = TimeoutBody::new_shared(
             boxed_body,
-            Some(DEFAULT_ACTIVITY_TIMEOUT),
-            connection_guard,
+            activity,
+            Some(connection_guard),
+            None,
         ).boxed_unsync();
         return Ok(Response::from_parts(response_parts, response_body));
     }
@@ -980,20 +1046,45 @@ async fn forward_upgrade_request(
     response_parts.headers.insert(header::SERVER, HeaderValue::from_static("FastGithub"));
 
     tokio::spawn(async move {
-        match tokio::try_join!(downstream_upgrade, upstream_upgrade) {
-            Ok((downstream, upstream)) => {
+        let upgraded = activity.run(async {
+            tokio::try_join!(downstream_upgrade, upstream_upgrade)
+        }).await;
+        match upgraded {
+            Ok(Ok((downstream, upstream))) => {
                 // Both HTTP connections have handed off their IO. The driver is
                 // no longer needed; the upgraded byte streams now own the tunnel.
                 drop(connection_guard);
-                let mut downstream = TokioIo::new(downstream);
-                let mut upstream = TokioIo::new(upstream);
-                if let Err(error) = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await {
-                    tracing::debug!(%error, "upgraded protocol tunnel ended");
+                let mut downstream = ActivityIo::new(TokioIo::new(downstream), activity.clone());
+                let mut upstream = ActivityIo::new(TokioIo::new(upstream), activity.clone());
+                match activity.run(tokio::io::copy_bidirectional(&mut downstream, &mut upstream)).await {
+                    Ok(Ok((downstream_bytes, upstream_bytes))) => {
+                        tracing::debug!(downstream_bytes, upstream_bytes, "upgraded protocol tunnel ended");
+                    }
+                    Ok(Err(error)) => {
+                        tracing::debug!(%error, "upgraded protocol tunnel ended");
+                    }
+                    Err(()) => {
+                        tracing::warn!(
+                            original_host = %original_host,
+                            request_target = %request_target,
+                            activity_timeout_ms = DEFAULT_ACTIVITY_TIMEOUT.as_millis(),
+                            "upgraded protocol tunnel stalled until activity timeout"
+                        );
+                    }
                 }
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 drop(connection_guard);
                 tracing::debug!(%error, "HTTP protocol upgrade failed");
+            }
+            Err(()) => {
+                drop(connection_guard);
+                tracing::warn!(
+                    original_host = %original_host,
+                    request_target = %request_target,
+                    activity_timeout_ms = DEFAULT_ACTIVITY_TIMEOUT.as_millis(),
+                    "HTTP protocol upgrade handoff stalled until activity timeout"
+                );
             }
         }
     });
