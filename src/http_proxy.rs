@@ -152,7 +152,7 @@ impl UpstreamConnector {
                 // A TCP connection is not proof that the endpoint can complete TLS.
                 // Try the next candidate when the TLS handshake or certificate check fails.
                 for _ in 0..8 {
-                    let (stream, ip) = match connect_target_excluding(
+                    let (stream, ip, candidate_deadline) = match connect_target_excluding_with_deadline(
                         host, port, &self.resolver, &domains, &config,
                         self.inherited_rule.as_ref(), &attempted,
                     ).await {
@@ -163,7 +163,7 @@ impl UpstreamConnector {
                         }
                     };
                     attempted.push(ip);
-                    match connect_upstream_tls(&self.tls_connector, stream, host, ip, rule, true).await {
+                    match connect_upstream_tls(&self.tls_connector, stream, host, ip, rule, true, candidate_deadline).await {
                         Ok((tls, http2)) => {
                             connected = Some((Box::new(tls) as Box<dyn ProxyIo>, ip, http2));
                             break;
@@ -667,6 +667,7 @@ impl TlsProxy {
         domain_config: Option<&crate::config::DomainConfig>,
         allow_http2: bool,
     ) -> Result<SslStream<TcpStream>> {
+        let candidate_deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
         connect_upstream_tls(
             &self.connector,
             upstream,
@@ -674,6 +675,7 @@ impl TlsProxy {
             upstream_ip,
             domain_config,
             allow_http2,
+            candidate_deadline,
         ).await.map(|(tls, _)| tls)
     }
 
@@ -708,6 +710,7 @@ async fn connect_upstream_tls(
     upstream_ip: IpAddr,
     domain_config: Option<&crate::config::DomainConfig>,
     allow_http2: bool,
+    candidate_deadline: tokio::time::Instant,
 ) -> Result<(SslStream<TcpStream>, bool)> {
     let tls_started = tokio::time::Instant::now();
     tracing::debug!(host = %upstream_host, %upstream_ip, "starting upstream TLS handshake");
@@ -728,8 +731,8 @@ async fn connect_upstream_tls(
         ssl.set_hostname(sni)?;
     }
     let mut tls = SslStream::new(ssl, upstream).context("wrapping upstream TLS stream")?;
-    timeout(CONNECT_TIMEOUT, Pin::new(&mut tls).connect())
-        .await.context("upstream TLS handshake timed out")??;
+    tokio::time::timeout_at(candidate_deadline, Pin::new(&mut tls).connect())
+        .await.context("upstream TCP/TLS candidate deadline expired during TLS handshake")??;
     let http2 = negotiated_http2(tls.ssl().selected_alpn_protocol());
     tracing::debug!(
         host = %upstream_host,
@@ -821,6 +824,23 @@ pub(crate) async fn connect_target_excluding(
     inherited_rule: Option<&crate::config::DomainConfig>,
     excluded: &[IpAddr],
 ) -> Result<(TcpStream, IpAddr)> {
+    let (stream, ip, _) = connect_target_excluding_with_deadline(
+        host, port, resolver, domains, config, inherited_rule, excluded,
+    ).await?;
+    Ok((stream, ip))
+}
+
+/// Connect one TCP candidate and return the deadline shared with its TLS handshake.
+/// The budget starts separately for each IP candidate, matching .NET ConnectCallback.
+pub(crate) async fn connect_target_excluding_with_deadline(
+    host: &str,
+    port: u16,
+    resolver: &DomainResolver,
+    domains: &[String],
+    config: &AppConfig,
+    inherited_rule: Option<&crate::config::DomainConfig>,
+    excluded: &[IpAddr],
+) -> Result<(TcpStream, IpAddr, tokio::time::Instant)> {
     // Destination changes the upstream host, but the original request's DomainConfig
     // remains authoritative for IPAddress and TLS policy (matching .NET HttpClientHandler).
     let domain_config = inherited_rule.or_else(|| config.domain_config(host));
@@ -878,26 +898,27 @@ pub(crate) async fn connect_target_excluding(
     let mut failures = Vec::new();
     for ip in unique_addresses {
         let endpoint = SocketAddr::new(ip, port);
-        let tcp_started = tokio::time::Instant::now();
-        tracing::debug!(%host, %endpoint, "starting upstream TCP connection");
-        match timeout(connect_timeout, TcpStream::connect(endpoint)).await {
+        let candidate_started = tokio::time::Instant::now();
+        let candidate_deadline = candidate_started + connect_timeout;
+        tracing::debug!(%host, %endpoint, "starting upstream TCP/TLS candidate");
+        match tokio::time::timeout_at(candidate_deadline, TcpStream::connect(endpoint)).await {
             Ok(Ok(stream)) => {
                 tracing::debug!(
                     %host,
                     %endpoint,
-                    elapsed_ms = tcp_started.elapsed().as_millis(),
+                    elapsed_ms = candidate_started.elapsed().as_millis(),
                     "upstream TCP connection established"
                 );
                 stream.set_nodelay(true)?;
                 resolver.report_success(host, port, ip).await;
-                return Ok((stream, ip));
+                return Ok((stream, ip, candidate_deadline));
             }
             Ok(Err(error)) => {
                 tracing::warn!(
                     %host,
                     %endpoint,
                     %error,
-                    elapsed_ms = tcp_started.elapsed().as_millis(),
+                    elapsed_ms = candidate_started.elapsed().as_millis(),
                     "upstream TCP connection failed"
                 );
                 resolver.report_failure(host, port, ip).await;
@@ -907,8 +928,8 @@ pub(crate) async fn connect_target_excluding(
                 tracing::warn!(
                     %host,
                     %endpoint,
-                    elapsed_ms = tcp_started.elapsed().as_millis(),
-                    "upstream TCP connection timed out"
+                    elapsed_ms = candidate_started.elapsed().as_millis(),
+                    "upstream TCP/TLS candidate deadline expired during TCP connect"
                 );
                 resolver.report_failure(host, port, ip).await;
                 failures.push(format!("{endpoint}: connection timed out"));
